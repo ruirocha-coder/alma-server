@@ -3,6 +3,17 @@ import uvicorn, os, requests
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # ou mete o domínio que quiseres
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 XAI_API_KEY = os.getenv("xai-bxIlniRJBI1kWaX1fQ7kjOzXwz33N6ZuKCxE3l9jvguMRiqD0zNhQNtlmtNQHix0IlMWxhGnBEptNu3P")
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 
