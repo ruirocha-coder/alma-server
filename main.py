@@ -3,7 +3,7 @@ import uvicorn, os, requests
 
 app = FastAPI()
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")
+XAI_API_KEY = os.getenv("xai-bxIlniRJBI1kWaX1fQ7kjOzXwz33N6ZuKCxE3l9jvguMRiqD0zNhQNtlmtNQHix0IlMWxhGnBEptNu3P")
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 
 @app.post("/ask")
@@ -32,6 +32,10 @@ async def ask(request: Request):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Alma server ativo. Use POST /ask para enviar perguntas."}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
