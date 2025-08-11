@@ -74,6 +74,22 @@ async def ask(request: Request):
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
+@app.get("/ping_grok")
+def ping_grok():
+    key = os.getenv("XAI_API_KEY")
+    if not key:
+        return {"ok": False, "reason": "XAI_API_KEY ausente"}
+    try:
+        r = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model":"grok-4","messages":[{"role":"user","content":"ping"}]},
+            timeout=10
+        )
+        return {"ok": r.ok, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # ── Local run (não usado no Railway, mas útil em dev) ────────────────────────
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
