@@ -29,5 +29,9 @@ async def ask(request: Request):
     answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
     return {"answer": answer}
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
