@@ -1,51 +1,79 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn, os, requests
+import os
+import requests
+import logging
+import uvicorn
 
+# ── App & CORS ─────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],      # podes restringir ao teu domínio depois
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")  # ← ler das Variables
-XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("alma")
 
+# ── Config ────────────────────────────────────────────────────────────────────
+XAI_API_KEY = os.getenv("XAI_API_KEY")  # DEFINE NAS VARIABLES DO RAILWAY
+XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+MODEL = "grok-4"
+
+# ── Rotas básicas ─────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"status": "ok",
+            "message": "Alma server ativo. Use POST /ask com JSON {\"question\":\"...\"}."}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/echo")
+async def echo(request: Request):
+    """Ajuda a testar POST/JSON sem chamar a x.ai."""
+    data = await request.json()
+    return {"echo": data}
+
+# ── IA: Pergunta → Resposta (Grok-4) ─────────────────────────────────────────
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
     question = data.get("question", "")
+    log.info(f"[/ask] question={question!r}")
 
     if not XAI_API_KEY:
+        log.error("XAI_API_KEY ausente nas Variables do Railway.")
         return {"answer": "⚠️ Falta XAI_API_KEY nas Variables do Railway."}
 
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "model": "grok-4",
+        "model": MODEL,
         "messages": [
-            {"role": "system", "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro e em pt-PT."},
+            {"role": "system",
+             "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."},
             {"role": "user", "content": question}
         ]
     }
 
     try:
         r = requests.post(XAI_API_URL, headers=headers, json=payload, timeout=30)
+        log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
         r.raise_for_status()
         answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         return {"answer": answer or "Sem resposta do modelo."}
     except Exception as e:
+        log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Alma server ativo. Use POST /ask (POST) com JSON {\"question\":\"...\"}."}
-
+# ── Local run (não usado no Railway, mas útil em dev) ────────────────────────
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
