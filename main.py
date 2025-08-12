@@ -128,8 +128,8 @@ def heygen_token():
                      "Content-Type": "application/json"},
             json={
                 # ajusta estes campos ao que o teu painel pedir:
-                "avatar_id": "<O_TEU_AVATAR_ID>",
-                "voice_id": "<VOICE_PT_PT_ID>",
+                "avatar_id": "ebc94c0e88534d078cf8788a01f3fba9",
+                "voice_id": "ff5719e3a6314ecea47badcbb1c0ffaa",
                 "language": "pt-PT"
             },
             timeout=15
