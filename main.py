@@ -22,7 +22,7 @@ log = logging.getLogger("alma")
 # ── Config ────────────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")  # DEFINE NAS VARIABLES DO RAILWAY
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-MODEL = "grok-4"
+MODEL = "grok-4-0709"
 
 # ── Rotas básicas ─────────────────────────────────────────────────────────────
 @app.get("/")
