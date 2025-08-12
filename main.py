@@ -112,6 +112,33 @@ def ask_get(q: str = "Olá, estás ligado?"):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY")
+
+@app.post("/heygen/token")
+def heygen_token():
+    if not HEYGEN_API_KEY:
+        return {"error":"Falta HEYGEN_API_KEY"}
+    # IMPORTANTE: os detalhes do endpoint/token podem variar conforme a versão da HeyGen.
+    # Usa o endpoint/documentação do teu plano "Realtime/Live".
+    # Abaixo fica o padrão típico de "create session" via REST:
+    try:
+        res = requests.post(
+            "https://api.heygen.com/v1/realtime/session",  # <- confirma no teu painel/docs
+            headers={"Authorization": f"Bearer {HEYGEN_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                # ajusta estes campos ao que o teu painel pedir:
+                "avatar_id": "<O_TEU_AVATAR_ID>",
+                "voice_id": "<VOICE_PT_PT_ID>",
+                "language": "pt-PT"
+            },
+            timeout=15
+        )
+        res.raise_for_status()
+        return res.json()  # costuma trazer wsUrl/rtcToken/sessionId
+    except Exception as e:
+        return {"error": str(e)}
+
 
 
 # ── Local run (não usado no Railway, mas útil em dev) ────────────────────────
