@@ -90,6 +90,30 @@ def ping_grok():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/ask_get")
+def ask_get(q: str = "Olá, estás ligado?"):
+    key = os.getenv("XAI_API_KEY")
+    if not key:
+        return {"ok": False, "reason": "XAI_API_KEY ausente nas Variables do Railway."}
+    try:
+        r = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": "grok-4",
+                  "messages": [{"role": "system",
+                                "content": "És a Alma (psicoestético). Responde claro em pt-PT."},
+                               {"role": "user", "content": q}]},
+            timeout=12
+        )
+        if not r.ok:
+            return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+        content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        return {"ok": True, "answer": content}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+
 # ── Local run (não usado no Railway, mas útil em dev) ────────────────────────
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
