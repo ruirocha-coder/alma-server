@@ -83,7 +83,7 @@ def ping_grok():
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model":"grok-4","messages":[{"role":"user","content":"ping"}]},
+            json={"model":MODEL,"messages":[{"role":"user","content":"ping"}]},
             timeout=10
         )
         return {"ok": r.ok, "status": r.status_code}
@@ -99,7 +99,7 @@ def ask_get(q: str = "Olá, estás ligado?"):
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": "grok-4",
+            json={"model":MODEL,
                   "messages": [{"role": "system",
                                 "content": "És a Alma (psicoestético). Responde claro em pt-PT."},
                                {"role": "user", "content": q}]},
