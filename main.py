@@ -10,18 +10,33 @@ import time
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
-MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
+Mem0Client = None
+
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # Pacote correto: mem0ai==0.1.0 (requirements.txt)
-        from mem0ai import MemoryClient
-        # Nota: nesta versão NÃO se passa base_url no __init__
-        mem0_client = MemoryClient(api_key=MEM0_API_KEY)
+        from mem0ai import MemoryClient as Mem0Client  # pacote correcto
     except Exception as e:
-        print("⚠️  Mem0 não inicializou:", e)
-        mem0_client = None
+        print(f"[mem0] pacote mem0ai ausente ({e}); a instalar em runtime…")
+        try:
+            import sys, subprocess, importlib
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"])
+            Mem0Client = importlib.import_module("mem0ai").MemoryClient
+        except Exception as ie:
+            print(f"[mem0] falha a instalar mem0ai: {ie}")
+            Mem0Client = None
+
+    if Mem0Client:
+        try:
+            # versões recentes: não passar base_url no __init__
+            mem0_client = Mem0Client(api_key=MEM0_API_KEY)
+        except TypeError:
+            # fallback ultra-defensivo (alguma versão antiga)
+            mem0_client = Mem0Client(api_key=MEM0_API_KEY)
+        except Exception as e:
+            print(f"[mem0] não inicializou: {e}")
+            mem0_client = None
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
