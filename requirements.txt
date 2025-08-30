@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 requests
-mem0ai
+mem0
