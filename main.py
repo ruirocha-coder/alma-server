@@ -10,6 +10,7 @@ import time
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
 import os, sys, subprocess, importlib
 
+MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "https://api.mem0.ai/v1")
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 
@@ -78,12 +79,16 @@ def did_headers():
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY")
 
 # ── Rotas básicas ─────────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "message": "Alma server ativo. Use POST /ask (Grok+Mem0) ou POST /say (D-ID).",
-        "mem0": {"enabled": MEM0_ENABLE, "base_url": MEM0_BASE_URL if MEM0_ENABLE else None},
+        "mem0": {
+            "enabled": MEM0_ENABLE,
+            "client_ready": bool(mem0_client)
+        },
         "endpoints": {
             "health": "/health",
             "ask": "POST /ask {question, user_id?}",
@@ -93,6 +98,7 @@ def root():
             "heygen_token": "POST /heygen/token"
         }
     }
+
 
 @app.get("/health")
 def health():
