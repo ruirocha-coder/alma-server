@@ -1,3 +1,4 @@
+# main.py — Alma Server com Mem0 (curto prazo) + Grok
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -5,23 +6,26 @@ import requests
 import logging
 import uvicorn
 import time
-import hashlib  # 👈 novo: para gerar user_id estável a partir de IP+UA
 
-# 👇 novo: helpers do Mem0 (ficheiro mem0.py que te enviei)
-try:
-    from mem0 import search_memories, add_memory  # search antes, add depois
-except Exception:
-    # fallback “no-op” se o mem0.py não estiver presente (não parte nada)
-    def search_memories(user_id: str, query: str, limit: int = 5, timeout_s: float = 3.5):
-        return []
-    def add_memory(user_id: str, text: str, ttl_days: int | None = None, timeout_s: float = 2.0):
-        return
+# ── Mem0 (opcional) ───────────────────────────────────────────────────────────
+MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
+MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
+
+mem0_client = None
+if MEM0_ENABLE and MEM0_API_KEY:
+    try:
+        from mem0 import MemoryClient
+        mem0_client = MemoryClient(api_key=MEM0_API_KEY, base_url=MEM0_BASE_URL)
+    except Exception as e:
+        print("⚠️  Mem0 não inicializou:", e)
+        mem0_client = None
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # podes restringir ao teu domínio depois
+    allow_origins=["*"],  # restringe depois
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,7 +38,7 @@ log = logging.getLogger("alma")
 # ── Config (Grok) ─────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")  # DEFINE NAS VARIABLES DO RAILWAY
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-MODEL = "grok-4-0709"
+MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
 # ── Config (D-ID) ─────────────────────────────────────────────────────────────
 DID_API_KEY = os.getenv("DID_API_KEY", "").strip()
@@ -43,7 +47,6 @@ DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "pt-PT-FernandaNeural").strip()
 DID_BASE = "https://api.d-id.com"
 
 def did_headers():
-    # Alguns tenants aceitam Authorization: Basic <KEY>; outros x-api-key.
     h = {"Content-Type": "application/json"}
     if DID_API_KEY:
         h["Authorization"] = f"Basic {DID_API_KEY}"
@@ -53,22 +56,16 @@ def did_headers():
 # ── Config (HeyGen token demo já existente) ───────────────────────────────────
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY")
 
-# ── Util: gerar user_id estável sem mexer no frontend ─────────────────────────
-def guess_user_id(req: Request) -> str:
-    ip = req.headers.get("x-forwarded-for") or (req.client.host if req.client else "") or ""
-    ua = req.headers.get("user-agent") or ""
-    h = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:24]
-    return f"user_{h}"
-
 # ── Rotas básicas ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "message": "Alma server ativo. Use POST /ask (Grok) ou POST /say (D-ID).",
+        "message": "Alma server ativo. Use POST /ask (Grok+Mem0) ou POST /say (D-ID).",
+        "mem0": {"enabled": MEM0_ENABLE, "base_url": MEM0_BASE_URL if MEM0_ENABLE else None},
         "endpoints": {
             "health": "/health",
-            "ask": "POST /ask {question}",
+            "ask": "POST /ask {question, user_id?}",
             "say": "POST /say {text, image_url?, voice_id?}",
             "ping_grok": "/ping_grok",
             "ask_get": "/ask_get?q=...",
@@ -78,68 +75,107 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "mem0_enabled": MEM0_ENABLE and bool(mem0_client)}
 
 @app.post("/echo")
 async def echo(request: Request):
     data = await request.json()
     return {"echo": data}
 
-# ── IA: Pergunta → Resposta (Grok-4) + Memória curta (Mem0) ───────────────────
+# ── IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo ───────────────────────
 @app.post("/ask")
 async def ask(request: Request):
+    """
+    Body JSON esperado:
+      {
+        "question": "texto",
+        "user_id": "u_abc123"   # opcional mas recomendado (frontend já envia)
+      }
+    """
     data = await request.json()
     question = (data.get("question") or "").strip()
-    log.info(f"[/ask] question={question!r}")
+    user_id = (data.get("user_id") or "").strip() or "anon"
+    log.info(f"[/ask] user_id={user_id} question={question!r}")
 
     if not XAI_API_KEY:
         log.error("XAI_API_KEY ausente nas Variables do Railway.")
         return {"answer": "⚠️ Falta XAI_API_KEY nas Variables do Railway."}
 
-    # 1) user_id estável (sem tocar no frontend)
-    user_id = guess_user_id(request)
+    # 1) Buscar memórias recentes/relevantes do utilizador (se mem0 ativo)
+    memory_context = ""
+    mem_debug = None
+    if MEM0_ENABLE and mem0_client:
+        try:
+            # Nota: limit pequeno p/ latência baixa; ajusta depois (ex.: 5..8)
+            results = mem0_client.memories.search(
+                query=question or "contexto",
+                user_id=user_id,
+                limit=3
+            )
+            # results: lista de dicts; cada item pode ter 'memory'/'text'/'score'
+            snippets = []
+            for item in results or []:
+                val = (
+                    item.get("text")
+                    or item.get("memory")
+                    or item.get("content")
+                    or ""
+                ).strip()
+                if val:
+                    snippets.append(val)
+            if snippets:
+                # pequena moldura de contexto
+                memory_context = (
+                    "Memórias recentes do utilizador (curto prazo):\n"
+                    + "\n".join(f"- {s}" for s in snippets[:3])
+                )
+            mem_debug = {"found": len(snippets)}
+        except Exception as e:
+            log.warning(f"[mem0] search falhou: {e}")
 
-    # 2) buscar memórias relevantes (timeout curto; não bloqueia a UX)
-    mems = search_memories(user_id, question, limit=5, timeout_s=3.5)
-    mem_block = "\n".join(f"- {m}" for m in mems) if mems else ""
-    memory_prefix = f"Contexto do utilizador (memória curta):\n{mem_block}\n\n" if mem_block else ""
+    # 2) Montar mensagens para o Grok
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "És a Alma, especialista em design de interiores (método psicoestético). "
+                "Responde claro, conciso e em pt-PT."
+            ),
+        }
+    ]
+    if memory_context:
+        messages.append({
+            "role": "system",
+            "content": memory_context
+        })
+    messages.append({"role": "user", "content": question})
 
-    # 3) prompts (mantido, só injeta contexto se houver)
-    system_prompt = (
-        "És a Alma, especialista em design de interiores (método psicoestético). "
-        "Responde claro, conciso e em pt-PT. Usa o contexto se existir."
-    )
-    user_prompt = memory_prefix + question
+    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": MODEL, "messages": messages}
 
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    }
-
+    # 3) Chamar Grok com timeout amigável
     try:
         r = requests.post(XAI_API_URL, headers=headers, json=payload, timeout=30)
         log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
         r.raise_for_status()
-        answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "Sem resposta do modelo."
+        answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # 4) heurística: guardar frases curtas do utilizador (fire-and-forget)
-    try:
-        if question and len(question) <= 220:
-            add_memory(user_id, question)  # TTL vem de MEM0_TTL_DAYS (padrão 7)
-    except Exception:
-        pass  # não falha a resposta por causa de memória
+    # 4) Guardar a interação como memória (curto prazo)
+    if MEM0_ENABLE and mem0_client:
+        try:
+            # Guardar a “intenção factual” do utilizador ajuda o recall do nome e preferências
+            mem0_client.memories.create(
+                content=f"User disse: {question}\nAlma respondeu: {answer}",
+                user_id=user_id,
+                metadata={"source": "alma-server", "type": "dialog"}
+            )
+        except Exception as e:
+            log.warning(f"[mem0] create falhou: {e}")
 
-    return {"answer": answer}
+    return {"answer": answer, "mem0": mem_debug}
 
 @app.get("/ping_grok")
 def ping_grok():
@@ -148,7 +184,7 @@ def ping_grok():
         return {"ok": False, "reason": "XAI_API_KEY ausente"}
     try:
         r = requests.post(
-            "https://api.x.ai/v1/chat/completions",
+            XAI_API_URL,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={"model": MODEL, "messages": [{"role": "user", "content": "ping"}]},
             timeout=10
@@ -164,7 +200,7 @@ def ask_get(q: str = "Olá, estás ligado?"):
         return {"ok": False, "reason": "XAI_API_KEY ausente nas Variables do Railway."}
     try:
         r = requests.post(
-            "https://api.x.ai/v1/chat/completions",
+            XAI_API_URL,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
                 "model": MODEL,
@@ -185,15 +221,6 @@ def ask_get(q: str = "Olá, estás ligado?"):
 # ── D-ID: Texto → Vídeo (lábios) ─────────────────────────────────────────────
 @app.post("/say")
 async def say(request: Request):
-    """
-    Body JSON:
-    {
-      "text": "Olá ...",
-      "image_url": "https://raw.githubusercontent.com/.../minha.png",  (opcional)
-      "voice_id": "pt-PT-FernandaNeural"                               (opcional)
-    }
-    -> retorna {"video_url": "..."} (MP4 gerado pelo D-ID)
-    """
     if not DID_API_KEY:
         return {"error": "Falta DID_API_KEY nas Variables do Railway"}
 
@@ -216,20 +243,18 @@ async def say(request: Request):
         "source_url": image_url,
     }
 
-    # 1) criar talk
     try:
         r = requests.post(f"{DID_BASE}/talks", headers=did_headers(), json=payload, timeout=30)
         log.info(f"[d-id] create talks -> {r.status_code} {r.text[:200]}")
         r.raise_for_status()
     except Exception as e:
-        return {"error": f"Falha a criar talk: {e}", "body": getattr(r, 'text', '')[:500]}
+        return {"error": f"Falha a criar talk: {e}"}
 
     talk = r.json()
     talk_id = talk.get("id")
     if not talk_id:
         return {"error": "Sem id do talk", "raw": talk}
 
-    # 2) poll até result_url
     result_url = None
     for _ in range(30):  # ~30s
         time.sleep(1)
