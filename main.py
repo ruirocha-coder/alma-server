@@ -1,4 +1,4 @@
-# main.py — Alma Server com Mem0 (curto prazo) + Grok
+# main.py — Alma Server com Mem0 (curto prazo) + Grok (API atual do mem0ai)
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -8,26 +8,20 @@ import uvicorn
 import time
 
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
-import logging
-log = logging.getLogger("alma")
-
-MEM0_ENABLE   = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
-MEM0_API_KEY  = os.getenv("MEM0_API_KEY", "").strip()
-# MEM0_BASE_URL existe mas NÃO é usado em mem0ai==0.1.0
+MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # pacote PyPI: mem0ai ; módulo de import: mem0
-        from mem0 import MemoryClient
-        # ✅ v0.1.0 NÃO aceita base_url
+        # Pacote correto: mem0ai==0.1.0 (requirements.txt)
+        from mem0ai import MemoryClient
+        # Nota: nesta versão NÃO se passa base_url no __init__
         mem0_client = MemoryClient(api_key=MEM0_API_KEY)
     except Exception as e:
-        log.error(f"[mem0] não inicializou: {e}")
+        print("⚠️  Mem0 não inicializou:", e)
         mem0_client = None
-
-
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -96,31 +90,30 @@ async def echo(request: Request):
 async def ask(request: Request):
     data = await request.json()
     question = (data.get("question") or "").strip()
-    user_id  = (data.get("user_id")  or "").strip() or "anon"
+    user_id = (data.get("user_id") or "").strip() or "anon"
     log.info(f"[/ask] user_id={user_id} question={question!r}")
 
     if not XAI_API_KEY:
         log.error("XAI_API_KEY ausente nas Variables do Railway.")
         return {"answer": "⚠️ Falta XAI_API_KEY nas Variables do Railway."}
 
-    # 1) Buscar memórias recentes/relevantes do utilizador
+    # 1) Buscar memórias recentes/relevantes do utilizador (API nova)
     memory_context = ""
     mem_debug = None
     if MEM0_ENABLE and mem0_client:
         try:
-            # SDK mem0ai
+            # API nova: mem0_client.memories.search(...)
             results = mem0_client.memories.search(
                 query=question or "contexto",
                 user_id=user_id,
-                limit=3
+                limit=5
             )
+            # results: lista de dicts com 'text'/'memory'/...
             snippets = []
-            # results é uma lista de dicts; campos típicos: text/memory/content
             for item in results or []:
                 val = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
                 if val:
                     snippets.append(val)
-
             if snippets:
                 memory_context = (
                     "Memórias recentes do utilizador (curto prazo):\n"
@@ -158,19 +151,23 @@ async def ask(request: Request):
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # 4) Guardar a interação como memória (curto prazo)
+    # 4) Guardar a interação como memória (API nova)
     if MEM0_ENABLE and mem0_client:
         try:
-            mem0_client.memories.add(
-                messages=[
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer}
-                ],
-                user_id=user_id
+            # podes criar duas memórias simples (user/assistant) ou uma só com o diálogo
+            mem0_client.memories.create(
+                content=f"User: {question}",
+                user_id=user_id,
+                metadata={"source": "alma-server", "type": "dialog"}
             )
-            log.info(f"[mem0] add user_id={user_id} -> stored dialog (user:'{question[:60]}', assistant:'{answer[:60]}')")
+            mem0_client.memories.create(
+                content=f"Alma: {answer}",
+                user_id=user_id,
+                metadata={"source": "alma-server", "type": "dialog"}
+            )
+            log.info(f"[mem0] create user_id={user_id} -> guardado diálogo (user:'{question[:60]}', alma:'{answer[:60]}')")
         except Exception as e:
-            log.warning(f"[mem0] add falhou: {e}")
+            log.warning(f"[mem0] create falhou: {e}")
 
     return {"answer": answer, "mem0": mem_debug}
 
