@@ -8,36 +8,26 @@ import uvicorn
 import time
 
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
-import os, sys, subprocess, logging
+import logging
 log = logging.getLogger("alma")
 
 MEM0_ENABLE   = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY  = os.getenv("MEM0_API_KEY", "").strip()
+# MEM0_BASE_URL existe mas NÃO é usado em mem0ai==0.1.0
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # ✅ o módulo certo para importar é "mem0"
+        # pacote PyPI: mem0ai ; módulo de import: mem0
         from mem0 import MemoryClient
-    except Exception as e:
-        log.warning(f"[mem0] módulo 'mem0' ausente ({e}); a instalar mem0ai…")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"]
-            )
-            # tenta novamente importar do módulo correto
-            from mem0 import MemoryClient
-        except Exception as e2:
-            log.error(f"[mem0] falha a instalar/importar: {e2}")
-            MemoryClient = None
-
-    try:
-        if 'MemoryClient' in globals() and MemoryClient:
-            mem0_client = MemoryClient(api_key=MEM0_API_KEY, base_url=MEM0_BASE_URL)
+        # ✅ v0.1.0 NÃO aceita base_url
+        mem0_client = MemoryClient(api_key=MEM0_API_KEY)
     except Exception as e:
         log.error(f"[mem0] não inicializou: {e}")
         mem0_client = None
+
+
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
