@@ -8,6 +8,8 @@ import uvicorn
 import time
 
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
+import os, sys, subprocess, importlib
+
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 
@@ -16,11 +18,11 @@ Mem0Client = None
 
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        from mem0ai import MemoryClient as Mem0Client  # pacote correcto
+        # pacote correto é mem0ai
+        from mem0ai import MemoryClient as Mem0Client
     except Exception as e:
         print(f"[mem0] pacote mem0ai ausente ({e}); a instalar em runtime…")
         try:
-            import sys, subprocess, importlib
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"])
             Mem0Client = importlib.import_module("mem0ai").MemoryClient
         except Exception as ie:
@@ -29,14 +31,20 @@ if MEM0_ENABLE and MEM0_API_KEY:
 
     if Mem0Client:
         try:
-            # versões recentes: não passar base_url no __init__
-            mem0_client = Mem0Client(api_key=MEM0_API_KEY)
-        except TypeError:
-            # fallback ultra-defensivo (alguma versão antiga)
+            # versões recentes não aceitam base_url no __init__
             mem0_client = Mem0Client(api_key=MEM0_API_KEY)
         except Exception as e:
             print(f"[mem0] não inicializou: {e}")
             mem0_client = None
+else:
+    if MEM0_ENABLE and not MEM0_API_KEY:
+        print("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+import logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("alma")
+log.info(f"[boot] mem0_enabled={MEM0_ENABLE} mem0_client_ready={bool(mem0_client)}")
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
@@ -47,11 +55,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ── Logs ──────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("alma")
-log.info(f"[boot] mem0_enabled={MEM0_ENABLE} mem0_client_ready={bool(mem0_client)} base_url={MEM0_BASE_URL}")
 
 # ── Config (Grok) ─────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")
