@@ -9,18 +9,35 @@ MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 
 mem0_client = None
+MemoryClient = None
+
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        from mem0ai import MemoryClient
+        # nome de módulo mais recente
+        from mem0ai import MemoryClient as _MC
+        MemoryClient = _MC
     except Exception as e:
         print(f"[mem0] pacote ausente ({e}); a instalar em runtime…")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"])
-            MemoryClient = importlib.import_module("mem0ai").MemoryClient
         except Exception as ie:
             print(f"[mem0] falha a instalar mem0ai: {ie}")
-            MemoryClient = None
-    if "MemoryClient" in locals():
+
+        # tentar novamente mem0ai
+        try:
+            from mem0ai import MemoryClient as _MC
+            MemoryClient = _MC
+        except Exception as e2:
+            # fallback para possíveis nomes antigos
+            try:
+                from mem0 import MemoryClient as _MC
+                MemoryClient = _MC
+            except Exception as e3:
+                print(f"[mem0] ainda não consigo importar MemoryClient: {e2} / {e3}")
+                MemoryClient = None
+
+    # >>> AQUI ESTÁ O FIX PRINCIPAL <<<
+    if MemoryClient is not None:
         try:
             mem0_client = MemoryClient(api_key=MEM0_API_KEY)
         except Exception as e:
@@ -29,7 +46,6 @@ if MEM0_ENABLE and MEM0_API_KEY:
 else:
     if MEM0_ENABLE and not MEM0_API_KEY:
         print("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
-
 # ── Logs ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
