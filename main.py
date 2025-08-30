@@ -1,4 +1,4 @@
-# main.py — Alma Server (limpo) com Mem0 (curto prazo) + Grok (x.ai) + D-ID + HeyGen
+# main.py — Alma Server (clean-1 + Memória Contextual) com Mem0 (curto prazo) + Grok (x.ai) + D-ID + HeyGen
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -6,6 +6,8 @@ import requests
 import logging
 import uvicorn
 import time
+import re
+from typing import Dict, List, Tuple
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config geral / Logging
@@ -13,7 +15,7 @@ import time
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mem0 (curto prazo) — tenta importar como 'mem0ai' OU 'mem0'
@@ -29,7 +31,6 @@ if MEM0_ENABLE:
         log.warning("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
     else:
         try:
-            # tentar 'mem0ai' primeiro, depois 'mem0'
             try:
                 import mem0ai as _mem0_pkg   # PyPI: mem0ai
                 from mem0ai import MemoryClient as _MC
@@ -52,6 +53,37 @@ if MEM0_ENABLE:
                 log.error(f"[mem0] não inicializou: {e}")
                 mem0_client = None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fallback local (se Mem0 off ou falhar) — curto prazo + FACTs
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTA: isto não é persistente; apenas vive no processo.
+LOCAL_FACTS: Dict[str, Dict[str, str]] = {}        # user_id -> {key: value}
+LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}  # user_id -> [(question, answer), ...]
+
+def local_set_fact(user_id: str, key: str, value: str):
+    LOCAL_FACTS.setdefault(user_id, {})
+    LOCAL_FACTS[user_id][key] = value.strip()
+
+def local_get_facts(user_id: str) -> Dict[str, str]:
+    return dict(LOCAL_FACTS.get(user_id, {}))
+
+def local_append_dialog(user_id: str, question: str, answer: str, cap: int = 50):
+    LOCAL_HISTORY.setdefault(user_id, [])
+    LOCAL_HISTORY[user_id].append((question, answer))
+    if len(LOCAL_HISTORY[user_id]) > cap:
+        LOCAL_HISTORY[user_id] = LOCAL_HISTORY[user_id][-cap:]
+
+def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
+    items = LOCAL_HISTORY.get(user_id, [])
+    out = []
+    for q, a in reversed(items[-limit*2:]):  # heuristic
+        if len(out) >= limit:
+            break
+        out.append(f"User: {q}")
+        if len(out) >= limit:
+            break
+        out.append(f"Alma: {a}")
+    return out[:limit]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config Grok (x.ai)
@@ -91,7 +123,7 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers: Grok
 # ─────────────────────────────────────────────────────────────────────────────
 def grok_chat(messages, timeout=30):
     if not XAI_API_KEY:
@@ -103,10 +135,14 @@ def grok_chat(messages, timeout=30):
     r.raise_for_status()
     return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
 
-def mem0_search(user_id: str, query: str, limit: int = 5):
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers: Mem0 curto prazo (search/create)
+# ─────────────────────────────────────────────────────────────────────────────
+def mem0_search(user_id: str, query: str, limit: int = 5) -> List[str]:
     """Busca memórias relevantes (curto prazo) do utilizador."""
     if not (MEM0_ENABLE and mem0_client):
-        return []
+        return local_search_snippets(user_id, limit=limit)
+
     try:
         results = mem0_client.memories.search(query=query or "contexto", user_id=user_id, limit=limit)
         snippets = []
@@ -118,10 +154,11 @@ def mem0_search(user_id: str, query: str, limit: int = 5):
         return snippets
     except Exception as e:
         log.warning(f"[mem0] search falhou: {e}")
-        return []
+        return local_search_snippets(user_id, limit=limit)
 
 def mem0_append_dialog(user_id: str, question: str, answer: str):
     """Guarda a interação atual como memórias (user/assistant)."""
+    local_append_dialog(user_id, question, answer)
     if not (MEM0_ENABLE and mem0_client):
         return
     try:
@@ -140,6 +177,124 @@ def mem0_append_dialog(user_id: str, question: str, answer: str):
         log.warning(f"[mem0] create falhou: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Memória Contextual (FACTs) — deteção, guardar e recuperar
+# ─────────────────────────────────────────────────────────────────────────────
+FACT_PREFIX = "FACT|"
+
+# Regras simples para PT-PT: nome, localização, preferências/estilo, divisão/projeto
+NAME_PATTERNS = [
+    r"\bchamo-?me\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bo\s+meu\s+nome\s+é\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bsou\s+(?:o|a)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+]
+
+CITY_PATTERNS = [
+    r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+]
+
+PREF_PATTERNS = [
+    r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
+    r"\bprefiro\s+([^\.]{3,80})",
+    r"\badoro\s+([^\.]{3,80})",
+    r"\bquero\s+([^\.]{3,80})",  # intenção
+]
+
+ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", "escritório", "hall", "entrada", "lavandaria"]
+
+def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
+    """Extrai factos simples do texto em pt-PT."""
+    facts: Dict[str, str] = {}
+    t = " " + text.strip() + " "
+    # nome
+    for pat in NAME_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            # evitar falsos positivos do tipo "sou o melhor..."
+            if len(name.split()) == 1 and name.lower() in {"melhor", "pior", "arquiteto", "cliente"}:
+                pass
+            else:
+                facts["name"] = name
+                break
+    # cidade/local
+    for pat in CITY_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            city = m.group(1).strip(" .,'\"").title()
+            # reduzir barulho
+            if 2 <= len(city) <= 60:
+                facts["location"] = city
+                break
+    # preferências/estilo
+    for pat in PREF_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            pref = m.group(1).strip(" .,'\"")
+            if 3 <= len(pref) <= 80:
+                facts.setdefault("preferences", pref)
+                break
+    # divisão/projeto (tags simples)
+    for kw in ROOM_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", t, flags=re.IGNORECASE):
+            facts["room"] = kw  # ultima ocorrência prevalece
+    return facts
+
+def mem0_set_fact(user_id: str, key: str, value: str):
+    """Guarda/atualiza um FACT (perfil). Conteúdo em formato simples 'FACT|key=value' para facilitar search."""
+    local_set_fact(user_id, key, value)
+    if not (MEM0_ENABLE and mem0_client):
+        return
+    try:
+        mem0_client.memories.create(
+            content=f"{FACT_PREFIX}{key}={value}",
+            user_id=user_id,
+            metadata={"source": "alma-server", "type": "fact", "key": key}
+        )
+        log.info(f"[mem0] fact create ok user_id={user_id} {key}={value}")
+    except Exception as e:
+        log.warning(f"[mem0] fact create falhou: {e}")
+
+def mem0_get_facts(user_id: str, limit: int = 20) -> Dict[str, str]:
+    """Recupera FACTs do utilizador a partir do Mem0. Se falhar/disabled, usa local."""
+    facts = local_get_facts(user_id)
+    if not (MEM0_ENABLE and mem0_client):
+        return facts
+    try:
+        results = mem0_client.memories.search(query=FACT_PREFIX, user_id=user_id, limit=limit)
+        for item in results or []:
+            content = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
+            if content.startswith(FACT_PREFIX):
+                body = content[len(FACT_PREFIX):]
+                if "=" in body:
+                    k, v = body.split("=", 1)
+                    if k and v:
+                        facts[k.strip()] = v.strip()
+        return facts
+    except Exception as e:
+        log.warning(f"[mem0] get_facts falhou: {e}")
+        return facts
+
+def facts_to_context_block(facts: Dict[str, str]) -> str:
+    if not facts:
+        return ""
+    lines = []
+    if "name" in facts:
+        lines.append(f"- Nome: {facts['name']}")
+    if "location" in facts:
+        lines.append(f"- Localização: {facts['location']}")
+    if "room" in facts:
+        lines.append(f"- Divisão/Projeto: {facts['room']}")
+    if "preferences" in facts:
+        lines.append(f"- Preferências: {facts['preferences']}")
+    # quaisquer outros FACTs
+    for k, v in facts.items():
+        if k not in {"name", "location", "room", "preferences"}:
+            lines.append(f"- {k}: {v}")
+    return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rotas
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -155,7 +310,9 @@ def root():
             "ask_get": "/ask_get?q=...&user_id=...",
             "ping_grok": "/ping_grok",
             "say": "POST /say {text, image_url?, voice_id?}",
-            "heygen_token": "POST /heygen/token"
+            "heygen_token": "POST /heygen/token",
+            "mem_facts": "/mem/facts?user_id=...",
+            "mem_search": "/mem/search?user_id=...&q=..."
         }
     }
 
@@ -182,27 +339,68 @@ def ping_grok():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# Inspeção de memória contextual (FACTs)
+@app.get("/mem/facts")
+def mem_facts(user_id: str = "anon"):
+    facts = mem0_get_facts(user_id=user_id, limit=50)
+    return {"user_id": user_id, "facts": facts}
+
+# Search livre no Mem0/Histórico (debug)
+@app.get("/mem/search")
+def mem_search(q: str = "", user_id: str = "anon"):
+    if not q:
+        return {"user_id": user_id, "found": 0, "snippets": []}
+    snippets = mem0_search(user_id=user_id, query=q, limit=10)
+    return {"user_id": user_id, "found": len(snippets), "snippets": snippets}
+
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon"):
     # wrapper GET para testar rápido no browser
     if not q:
         return {"answer": "Falta query param ?q="}
-    # reuse do POST /ask pipeline:
-    messages = [{"role": "system",
-                 "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."}]
+
+    # 0) Deteção e armazenamento de FACTs (a partir da pergunta atual)
+    new_facts = extract_contextual_facts_pt(q)
+    for k, v in new_facts.items():
+        mem0_set_fact(user_id, k, v)
+
+    # 1) Carregar FACTs existentes (perfil contextual)
+    facts = mem0_get_facts(user_id)
+    facts_block = facts_to_context_block(facts)
+
+    # 2) Contexto de curto prazo (diálogo recente)
     snippets = mem0_search(user_id=user_id, query=q, limit=5)
+    memory_block = ""
     if snippets:
-        memory_context = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
-        messages.append({"role": "system", "content": memory_context})
+        memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
+
+    # 3) Mensagens para Grok
+    messages = [{
+        "role": "system",
+        "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
+    }]
+    if facts_block:
+        messages.append({"role": "system", "content": facts_block})
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
     messages.append({"role": "user", "content": q})
+
+    # 4) Chamada ao Grok
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
-    mem0_append_dialog(user_id=user_id, question=q, answer=answer)
-    return {"answer": answer, "mem0": {"found": len(snippets)}}
 
-# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo
+    # 5) Guardar diálogo no Mem0 e no fallback local
+    mem0_append_dialog(user_id=user_id, question=q, answer=answer)
+
+    return {
+        "answer": answer,
+        "mem0": {"facts_used": bool(facts_block), "facts": facts, "recent_found": len(snippets)},
+        "new_facts_detected": new_facts
+    }
+
+# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo + Memória Contextual
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
@@ -213,32 +411,47 @@ async def ask(request: Request):
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
 
-    # 1) contexto curto prazo do mem0
-    snippets = mem0_search(user_id=user_id, query=question, limit=5)
-    memory_context = ""
-    if snippets:
-        memory_context = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
+    # 0) Deteção e armazenamento de FACTs (do enunciado atual)
+    new_facts = extract_contextual_facts_pt(question)
+    for k, v in new_facts.items():
+        mem0_set_fact(user_id, k, v)
 
-    # 2) mensagens para Grok
+    # 1) Carregar FACTs (perfil contextual)
+    facts = mem0_get_facts(user_id)
+    facts_block = facts_to_context_block(facts)
+
+    # 2) Contexto curto prazo
+    snippets = mem0_search(user_id=user_id, query=question, limit=5)
+    memory_block = ""
+    if snippets:
+        memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
+
+    # 3) Mensagens para Grok
     messages = [{
         "role": "system",
         "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
     }]
-    if memory_context:
-        messages.append({"role": "system", "content": memory_context})
+    if facts_block:
+        messages.append({"role": "system", "content": facts_block})
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
     messages.append({"role": "user", "content": question})
 
-    # 3) chamada ao Grok
+    # 4) chamada ao Grok
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # 4) guardar diálogo
+    # 5) guardar diálogo
     mem0_append_dialog(user_id=user_id, question=question, answer=answer)
 
-    return {"answer": answer, "mem0": {"found": len(snippets)}}
+    return {
+        "answer": answer,
+        "mem0": {"facts_used": bool(facts_block), "facts": facts, "recent_found": len(snippets)},
+        "new_facts_detected": new_facts
+    }
 
 # D-ID: Texto → Vídeo (lábios)
 @app.post("/say")
