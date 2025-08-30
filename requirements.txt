@@ -2,3 +2,4 @@ fastapi
 uvicorn
 requests
 mem0ai==0.1.0
+# force-rebuild-2025-08-30
