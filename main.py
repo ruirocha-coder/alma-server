@@ -7,7 +7,7 @@ import logging
 import uvicorn
 import time
 
-# ── Mem0 (opcional) ───────────────────────────────────────────────────────────
+# ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
@@ -25,7 +25,7 @@ if MEM0_ENABLE and MEM0_API_KEY:
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restringe depois
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
 # ── Config (Grok) ─────────────────────────────────────────────────────────────
-XAI_API_KEY = os.getenv("XAI_API_KEY")  # DEFINE NAS VARIABLES DO RAILWAY
+XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
@@ -85,13 +85,6 @@ async def echo(request: Request):
 # ── IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo ───────────────────────
 @app.post("/ask")
 async def ask(request: Request):
-    """
-    Body JSON esperado:
-      {
-        "question": "texto",
-        "user_id": "u_abc123"   # opcional mas recomendado (frontend já envia)
-      }
-    """
     data = await request.json()
     question = (data.get("question") or "").strip()
     user_id = (data.get("user_id") or "").strip() or "anon"
@@ -101,20 +94,19 @@ async def ask(request: Request):
         log.error("XAI_API_KEY ausente nas Variables do Railway.")
         return {"answer": "⚠️ Falta XAI_API_KEY nas Variables do Railway."}
 
-    # 1) Buscar memórias recentes/relevantes do utilizador (se mem0 ativo)
+    # 1) Buscar memórias recentes/relevantes do utilizador
     memory_context = ""
     mem_debug = None
     if MEM0_ENABLE and mem0_client:
         try:
-            # Nota: limit pequeno p/ latência baixa; ajusta depois (ex.: 5..8)
-            results = mem0_client.memories.search(
-                query=question or "contexto",
-                user_id=user_id,
-                limit=3
+            results = mem0_client.search(
+                query=question,
+                filters={"user_id": user_id},
+                version="v2",
+                output_format="v1.1"
             )
-            # results: lista de dicts; cada item pode ter 'memory'/'text'/'score'
             snippets = []
-            for item in results or []:
+            for item in results.get("results", []):
                 val = (
                     item.get("text")
                     or item.get("memory")
@@ -124,7 +116,6 @@ async def ask(request: Request):
                 if val:
                     snippets.append(val)
             if snippets:
-                # pequena moldura de contexto
                 memory_context = (
                     "Memórias recentes do utilizador (curto prazo):\n"
                     + "\n".join(f"- {s}" for s in snippets[:3])
@@ -137,23 +128,17 @@ async def ask(request: Request):
     messages = [
         {
             "role": "system",
-            "content": (
-                "És a Alma, especialista em design de interiores (método psicoestético). "
-                "Responde claro, conciso e em pt-PT."
-            ),
+            "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT.",
         }
     ]
     if memory_context:
-        messages.append({
-            "role": "system",
-            "content": memory_context
-        })
+        messages.append({"role": "system", "content": memory_context})
     messages.append({"role": "user", "content": question})
 
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": MODEL, "messages": messages}
 
-    # 3) Chamar Grok com timeout amigável
+    # 3) Chamar Grok
     try:
         r = requests.post(XAI_API_URL, headers=headers, json=payload, timeout=30)
         log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
@@ -163,60 +148,23 @@ async def ask(request: Request):
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # 4) Guardar a interação como memória (curto prazo)
+    # 4) Guardar a interação como memória (formato oficial Mem0)
     if MEM0_ENABLE and mem0_client:
         try:
-            # Guardar a “intenção factual” do utilizador ajuda o recall do nome e preferências
-            mem0_client.memories.create(
-                content=f"User disse: {question}\nAlma respondeu: {answer}",
+            messages_to_store = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer}
+            ]
+            mem0_client.add(
+                messages_to_store,
                 user_id=user_id,
-                metadata={"source": "alma-server", "type": "dialog"}
+                version="v2",
+                output_format="v1.1"
             )
         except Exception as e:
-            log.warning(f"[mem0] create falhou: {e}")
+            log.warning(f"[mem0] add falhou: {e}")
 
     return {"answer": answer, "mem0": mem_debug}
-
-@app.get("/ping_grok")
-def ping_grok():
-    key = os.getenv("XAI_API_KEY")
-    if not key:
-        return {"ok": False, "reason": "XAI_API_KEY ausente"}
-    try:
-        r = requests.post(
-            XAI_API_URL,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": MODEL, "messages": [{"role": "user", "content": "ping"}]},
-            timeout=10
-        )
-        return {"ok": r.ok, "status": r.status_code}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/ask_get")
-def ask_get(q: str = "Olá, estás ligado?"):
-    key = os.getenv("XAI_API_KEY")
-    if not key:
-        return {"ok": False, "reason": "XAI_API_KEY ausente nas Variables do Railway."}
-    try:
-        r = requests.post(
-            XAI_API_URL,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": "És a Alma (psicoestético). Responde claro em pt-PT."},
-                    {"role": "user", "content": q}
-                ]
-            },
-            timeout=12
-        )
-        if not r.ok:
-            return {"ok": False, "status": r.status_code, "body": r.text[:300]}
-        content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {"ok": True, "answer": content}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 # ── D-ID: Texto → Vídeo (lábios) ─────────────────────────────────────────────
 @app.post("/say")
@@ -256,7 +204,7 @@ async def say(request: Request):
         return {"error": "Sem id do talk", "raw": talk}
 
     result_url = None
-    for _ in range(30):  # ~30s
+    for _ in range(30):
         time.sleep(1)
         g = requests.get(f"{DID_BASE}/talks/{talk_id}", headers=did_headers(), timeout=15)
         if not g.ok:
@@ -278,7 +226,7 @@ async def say(request: Request):
 @app.post("/heygen/token")
 def heygen_token():
     if not HEYGEN_API_KEY:
-        return {"error": "Falta HEYGEN_API_KEY"}
+        return {"error":"Falta HEYGEN_API_KEY"}
     try:
         res = requests.post(
             "https://api.heygen.com/v1/realtime/session",
