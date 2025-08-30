@@ -34,6 +34,7 @@ app.add_middleware(
 # ── Logs ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
+log.info(f"[boot] mem0_enabled={MEM0_ENABLE} mem0_client_ready={bool(mem0_client)} base_url={MEM0_BASE_URL}")
 
 # ── Config (Grok) ─────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -106,6 +107,7 @@ async def ask(request: Request):
                 output_format="v1.1"
             )
             snippets = []
+            # results é um dict v2; lista vem em "results"
             for item in results.get("results", []):
                 val = (
                     item.get("text")
@@ -115,14 +117,21 @@ async def ask(request: Request):
                 ).strip()
                 if val:
                     snippets.append(val)
+
             if snippets:
                 memory_context = (
                     "Memórias recentes do utilizador (curto prazo):\n"
                     + "\n".join(f"- {s}" for s in snippets[:3])
                 )
             mem_debug = {"found": len(snippets)}
+
+            # 🔎 LOG: o que veio da pesquisa
+            log.info(f"[mem0] search user_id={user_id} found={len(snippets)} snippets={snippets[:3]}")
         except Exception as e:
             log.warning(f"[mem0] search falhou: {e}")
+    else:
+        if MEM0_ENABLE and not mem0_client:
+            log.warning("[mem0] MEM0_ENABLE=True mas mem0_client não está pronto (chave/base_url?).")
 
     # 2) Montar mensagens para o Grok
     messages = [
@@ -161,6 +170,8 @@ async def ask(request: Request):
                 version="v2",
                 output_format="v1.1"
             )
+            # 📝 LOG: confirmação de gravação
+            log.info(f"[mem0] add user_id={user_id} -> stored dialog (user:'{question[:60]}', assistant:'{answer[:60]}')")
         except Exception as e:
             log.warning(f"[mem0] add falhou: {e}")
 
