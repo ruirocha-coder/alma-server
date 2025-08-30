@@ -8,18 +8,34 @@ import uvicorn
 import time
 
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
-MEM0_ENABLE   = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
-MEM0_API_KEY  = os.getenv("MEM0_API_KEY", "").strip()
+import os, sys, subprocess, logging
+log = logging.getLogger("alma")
+
+MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # SDK correto
-        from mem0ai import MemoryClient
-        mem0_client = MemoryClient(api_key=MEM0_API_KEY, base_url=MEM0_BASE_URL)
+        # tenta importar
+        from mem0ai import MemoryClient  # pacote correto
     except Exception as e:
-        print("⚠️  Mem0 não inicializou:", e)
+        log.warning(f"[mem0] pacote mem0ai ausente ({e}); a instalar em runtime…")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"]
+            )
+            from mem0ai import MemoryClient
+        except Exception as e2:
+            log.error(f"[mem0] falha a instalar mem0ai em runtime: {e2}")
+            MemoryClient = None  # segue sem memórias
+
+    try:
+        if 'MemoryClient' in globals() and MemoryClient:
+            mem0_client = MemoryClient(api_key=MEM0_API_KEY, base_url=MEM0_BASE_URL)
+    except Exception as e:
+        log.error(f"[mem0] não inicializou: {e}")
         mem0_client = None
 
 # ── App & CORS ────────────────────────────────────────────────────────────────
