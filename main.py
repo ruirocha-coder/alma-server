@@ -5,8 +5,19 @@ import requests
 import logging
 import uvicorn
 import time
+import hashlib  # 👈 novo: para gerar user_id estável a partir de IP+UA
 
-# ── App & CORS ─────────────────────────────────────────────────────────────────
+# 👇 novo: helpers do Mem0 (ficheiro mem0.py que te enviei)
+try:
+    from mem0 import search_memories, add_memory  # search antes, add depois
+except Exception:
+    # fallback “no-op” se o mem0.py não estiver presente (não parte nada)
+    def search_memories(user_id: str, query: str, limit: int = 5, timeout_s: float = 3.5):
+        return []
+    def add_memory(user_id: str, text: str, ttl_days: int | None = None, timeout_s: float = 2.0):
+        return
+
+# ── App & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +53,13 @@ def did_headers():
 # ── Config (HeyGen token demo já existente) ───────────────────────────────────
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY")
 
+# ── Util: gerar user_id estável sem mexer no frontend ─────────────────────────
+def guess_user_id(req: Request) -> str:
+    ip = req.headers.get("x-forwarded-for") or (req.client.host if req.client else "") or ""
+    ua = req.headers.get("user-agent") or ""
+    h = hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:24]
+    return f"user_{h}"
+
 # ── Rotas básicas ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -67,16 +85,31 @@ async def echo(request: Request):
     data = await request.json()
     return {"echo": data}
 
-# ── IA: Pergunta → Resposta (Grok-4) ─────────────────────────────────────────
+# ── IA: Pergunta → Resposta (Grok-4) + Memória curta (Mem0) ───────────────────
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
-    question = data.get("question", "")
+    question = (data.get("question") or "").strip()
     log.info(f"[/ask] question={question!r}")
 
     if not XAI_API_KEY:
         log.error("XAI_API_KEY ausente nas Variables do Railway.")
         return {"answer": "⚠️ Falta XAI_API_KEY nas Variables do Railway."}
+
+    # 1) user_id estável (sem tocar no frontend)
+    user_id = guess_user_id(request)
+
+    # 2) buscar memórias relevantes (timeout curto; não bloqueia a UX)
+    mems = search_memories(user_id, question, limit=5, timeout_s=3.5)
+    mem_block = "\n".join(f"- {m}" for m in mems) if mems else ""
+    memory_prefix = f"Contexto do utilizador (memória curta):\n{mem_block}\n\n" if mem_block else ""
+
+    # 3) prompts (mantido, só injeta contexto se houver)
+    system_prompt = (
+        "És a Alma, especialista em design de interiores (método psicoestético). "
+        "Responde claro, conciso e em pt-PT. Usa o contexto se existir."
+    )
+    user_prompt = memory_prefix + question
 
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
@@ -85,9 +118,8 @@ async def ask(request: Request):
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system",
-             "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."},
-            {"role": "user", "content": question}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ]
     }
 
@@ -95,11 +127,19 @@ async def ask(request: Request):
         r = requests.post(XAI_API_URL, headers=headers, json=payload, timeout=30)
         log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
         r.raise_for_status()
-        answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {"answer": answer or "Sem resposta do modelo."}
+        answer = r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or "Sem resposta do modelo."
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    # 4) heurística: guardar frases curtas do utilizador (fire-and-forget)
+    try:
+        if question and len(question) <= 220:
+            add_memory(user_id, question)  # TTL vem de MEM0_TTL_DAYS (padrão 7)
+    except Exception:
+        pass  # não falha a resposta por causa de memória
+
+    return {"answer": answer}
 
 @app.get("/ping_grok")
 def ping_grok():
@@ -110,7 +150,7 @@ def ping_grok():
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model":MODEL,"messages":[{"role":"user","content":"ping"}]},
+            json={"model": MODEL, "messages": [{"role": "user", "content": "ping"}]},
             timeout=10
         )
         return {"ok": r.ok, "status": r.status_code}
@@ -126,10 +166,13 @@ def ask_get(q: str = "Olá, estás ligado?"):
         r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model":MODEL,
-                  "messages": [{"role": "system",
-                                "content": "És a Alma (psicoestético). Responde claro em pt-PT."},
-                               {"role": "user", "content": q}]},
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": "És a Alma (psicoestético). Responde claro em pt-PT."},
+                    {"role": "user", "content": q}
+                ]
+            },
             timeout=12
         )
         if not r.ok:
@@ -210,7 +253,7 @@ async def say(request: Request):
 @app.post("/heygen/token")
 def heygen_token():
     if not HEYGEN_API_KEY:
-        return {"error":"Falta HEYGEN_API_KEY"}
+        return {"error": "Falta HEYGEN_API_KEY"}
     try:
         res = requests.post(
             "https://api.heygen.com/v1/realtime/session",
