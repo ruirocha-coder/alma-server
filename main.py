@@ -16,7 +16,7 @@ log = logging.getLogger("alma")
 APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mem0 (curto prazo) — SEM installs em runtime
+# Mem0 (curto prazo) — tenta importar como 'mem0ai' OU 'mem0'
 # ─────────────────────────────────────────────────────────────────────────────
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = (os.getenv("MEM0_API_KEY") or "").strip()
@@ -29,24 +29,29 @@ if MEM0_ENABLE:
         log.warning("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
     else:
         try:
-            import mem0ai as _mem0ai
-            from mem0ai import MemoryClient as _MC
+            # tentar 'mem0ai' primeiro, depois 'mem0'
+            try:
+                import mem0ai as _mem0_pkg   # PyPI: mem0ai
+                from mem0ai import MemoryClient as _MC
+                pkg_name = "mem0ai"
+            except Exception:
+                import mem0 as _mem0_pkg     # PyPI: mem0
+                from mem0 import MemoryClient as _MC
+                pkg_name = "mem0"
             MemoryClient = _MC
-            log.info(f"[mem0] import OK: file={getattr(_mem0ai,'__file__','?')} ver={getattr(_mem0ai,'__version__','?')}")
+            log.info(f"[mem0] import OK ({pkg_name}) file={getattr(_mem0_pkg,'__file__','?')}")
         except Exception as e:
             log.error(f"[mem0] import FAILED: {e}")
             MemoryClient = None
 
         if MemoryClient is not None:
             try:
-                # versões recentes do mem0ai **não** aceitam base_url no __init__
                 mem0_client = MemoryClient(api_key=MEM0_API_KEY)
                 log.info("[mem0] MemoryClient inicializado.")
             except Exception as e:
                 log.error(f"[mem0] não inicializou: {e}")
                 mem0_client = None
 
-log.info(f"[boot] {APP_VERSION} mem0_enabled={MEM0_ENABLE} mem0_client_ready={bool(mem0_client)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config Grok (x.ai)
