@@ -8,14 +8,15 @@ import uvicorn
 import time
 
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
-MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
-MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
+MEM0_ENABLE   = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY  = os.getenv("MEM0_API_KEY", "").strip()
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        from mem0 import MemoryClient
+        # SDK correto
+        from mem0ai import MemoryClient
         mem0_client = MemoryClient(api_key=MEM0_API_KEY, base_url=MEM0_BASE_URL)
     except Exception as e:
         print("⚠️  Mem0 não inicializou:", e)
@@ -88,7 +89,7 @@ async def echo(request: Request):
 async def ask(request: Request):
     data = await request.json()
     question = (data.get("question") or "").strip()
-    user_id = (data.get("user_id") or "").strip() or "anon"
+    user_id  = (data.get("user_id")  or "").strip() or "anon"
     log.info(f"[/ask] user_id={user_id} question={question!r}")
 
     if not XAI_API_KEY:
@@ -100,21 +101,16 @@ async def ask(request: Request):
     mem_debug = None
     if MEM0_ENABLE and mem0_client:
         try:
-            results = mem0_client.search(
-                query=question,
-                filters={"user_id": user_id},
-                version="v2",
-                output_format="v1.1"
+            # SDK mem0ai
+            results = mem0_client.memories.search(
+                query=question or "contexto",
+                user_id=user_id,
+                limit=3
             )
             snippets = []
-            # results é um dict v2; lista vem em "results"
-            for item in results.get("results", []):
-                val = (
-                    item.get("text")
-                    or item.get("memory")
-                    or item.get("content")
-                    or ""
-                ).strip()
+            # results é uma lista de dicts; campos típicos: text/memory/content
+            for item in results or []:
+                val = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
                 if val:
                     snippets.append(val)
 
@@ -124,8 +120,6 @@ async def ask(request: Request):
                     + "\n".join(f"- {s}" for s in snippets[:3])
                 )
             mem_debug = {"found": len(snippets)}
-
-            # 🔎 LOG: o que veio da pesquisa
             log.info(f"[mem0] search user_id={user_id} found={len(snippets)} snippets={snippets[:3]}")
         except Exception as e:
             log.warning(f"[mem0] search falhou: {e}")
@@ -157,20 +151,16 @@ async def ask(request: Request):
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # 4) Guardar a interação como memória (formato oficial Mem0)
+    # 4) Guardar a interação como memória (curto prazo)
     if MEM0_ENABLE and mem0_client:
         try:
-            messages_to_store = [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer}
-            ]
-            mem0_client.add(
-                messages_to_store,
-                user_id=user_id,
-                version="v2",
-                output_format="v1.1"
+            mem0_client.memories.add(
+                messages=[
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer}
+                ],
+                user_id=user_id
             )
-            # 📝 LOG: confirmação de gravação
             log.info(f"[mem0] add user_id={user_id} -> stored dialog (user:'{question[:60]}', assistant:'{answer[:60]}')")
         except Exception as e:
             log.warning(f"[mem0] add falhou: {e}")
