@@ -7,10 +7,11 @@ import logging
 import uvicorn
 import time
 
+
+
 # ── Mem0 (curto prazo) ────────────────────────────────────────────────────────
 import os, sys, subprocess, importlib
 
-MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "https://api.mem0.ai/v1")
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
 
@@ -19,20 +20,20 @@ Mem0Client = None
 
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # pacote correto é mem0ai
-        from mem0ai import MemoryClient as Mem0Client
+        # ⚠️ O módulo correto a importar é 'mem0' (o pacote instala-se como 'mem0ai')
+        from mem0 import MemoryClient as Mem0Client
     except Exception as e:
         print(f"[mem0] pacote mem0ai ausente ({e}); a instalar em runtime…")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"])
-            Mem0Client = importlib.import_module("mem0ai").MemoryClient
+            Mem0Client = importlib.import_module("mem0").MemoryClient  # <- NÃO 'mem0ai'
         except Exception as ie:
             print(f"[mem0] falha a instalar mem0ai: {ie}")
             Mem0Client = None
 
     if Mem0Client:
         try:
-            # versões recentes não aceitam base_url no __init__
+            # SDK atual não aceita base_url no __init__
             mem0_client = Mem0Client(api_key=MEM0_API_KEY)
         except Exception as e:
             print(f"[mem0] não inicializou: {e}")
@@ -40,6 +41,7 @@ if MEM0_ENABLE and MEM0_API_KEY:
 else:
     if MEM0_ENABLE and not MEM0_API_KEY:
         print("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
+
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 import logging
