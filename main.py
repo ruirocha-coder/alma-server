@@ -11,25 +11,26 @@ import time
 import os, sys, subprocess, logging
 log = logging.getLogger("alma")
 
-MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
-MEM0_API_KEY = os.getenv("MEM0_API_KEY", "").strip()
+MEM0_ENABLE   = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY  = os.getenv("MEM0_API_KEY", "").strip()
 MEM0_BASE_URL = os.getenv("MEM0_BASE_URL", "").strip() or "https://api.mem0.ai/v1"
 
 mem0_client = None
 if MEM0_ENABLE and MEM0_API_KEY:
     try:
-        # tenta importar
-        from mem0ai import MemoryClient  # pacote correto
+        # ✅ o módulo certo para importar é "mem0"
+        from mem0 import MemoryClient
     except Exception as e:
-        log.warning(f"[mem0] pacote mem0ai ausente ({e}); a instalar em runtime…")
+        log.warning(f"[mem0] módulo 'mem0' ausente ({e}); a instalar mem0ai…")
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "--no-cache-dir", "mem0ai==0.1.0"]
             )
-            from mem0ai import MemoryClient
+            # tenta novamente importar do módulo correto
+            from mem0 import MemoryClient
         except Exception as e2:
-            log.error(f"[mem0] falha a instalar mem0ai em runtime: {e2}")
-            MemoryClient = None  # segue sem memórias
+            log.error(f"[mem0] falha a instalar/importar: {e2}")
+            MemoryClient = None
 
     try:
         if 'MemoryClient' in globals() and MemoryClient:
