@@ -583,6 +583,71 @@ def serve_console():
     except Exception:
         return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RAG Endpoints (crawl, ingest, search)
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from rag_client import (
+        ingest_text, ingest_pdf_url, crawl_and_ingest,
+        search_chunks, build_context_block
+    )
+    RAG_READY = True
+    log.info("[rag] endpoints prontos")
+except Exception as e:
+    RAG_READY = False
+    log.warning(f"[rag] a importar falhou: {e}")
+
+@app.post("/rag/crawl")
+async def rag_crawl(request: Request):
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    data = await request.json()
+    seed_url  = (data.get("seed_url") or "").strip()
+    namespace = (data.get("namespace") or "default").strip()
+    max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "30"))
+    max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
+    if not seed_url:
+        return {"ok": False, "error": "Falta seed_url"}
+    res = crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
+    return res
+
+@app.post("/rag/ingest-text")
+async def rag_ingest_text(request: Request):
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    data = await request.json()
+    title     = (data.get("title") or "").strip()
+    text      = (data.get("text") or "").strip()
+    namespace = (data.get("namespace") or "default").strip()
+    if not title or not text:
+        return {"ok": False, "error": "Falta title ou text"}
+    return ingest_text(title=title, text=text, namespace=namespace)
+
+@app.post("/rag/ingest-pdf-url")
+async def rag_ingest_pdf_url(request: Request):
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    data = await request.json()
+    pdf_url  = (data.get("pdf_url") or "").strip()
+    title    = (data.get("title") or None)
+    namespace = (data.get("namespace") or "default").strip()
+    if not pdf_url:
+        return {"ok": False, "error": "Falta pdf_url"}
+    return ingest_pdf_url(pdf_url=pdf_url, title=title, namespace=namespace)
+
+@app.post("/rag/search")
+async def rag_search(request: Request):
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    data = await request.json()
+    query     = (data.get("query") or "").strip()
+    namespace = (data.get("namespace") or None)
+    top_k     = int(data.get("top_k") or os.getenv("RAG_TOP_K", "6"))
+    matches = search_chunks(query=query, namespace=namespace, top_k=top_k)
+    ctx = build_context_block(matches)
+    return {"ok": True, "matches": matches, "context_block": ctx}
+
+
 
 # HeyGen token demo
 @app.post("/heygen/token")
