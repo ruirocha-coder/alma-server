@@ -570,6 +570,20 @@ async def say(request: Request):
 
     return {"video_url": result_url}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Console HTML (UI para ingestão/testes RAG)
+# ─────────────────────────────────────────────────────────────────────────────
+from fastapi.responses import HTMLResponse
+
+@app.get("/console", response_class=HTMLResponse)
+def serve_console():
+    try:
+        with open("console.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
+
+
 # HeyGen token demo
 @app.post("/heygen/token")
 def heygen_token():
