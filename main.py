@@ -1,4 +1,4 @@
-# main.py — Alma Server (clean-1 + Memória Contextual) com Mem0 (curto prazo) + Grok (x.ai) + D-ID + HeyGen
+# main.py — Alma Server (clean-1 + Memória Contextual + RAG) com Mem0 (curto prazo) + Grok (x.ai) + D-ID + HeyGen
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-1")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mem0 (curto prazo) — tenta importar como 'mem0ai' OU 'mem0'
@@ -111,6 +111,23 @@ def did_headers():
 # Config HeyGen (token demo)
 # ─────────────────────────────────────────────────────────────────────────────
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAG (Qdrant) — busca e montagem de contexto externo
+# ─────────────────────────────────────────────────────────────────────────────
+# Espera-se que exista um rag_client.py no projeto com:
+#   - search_chunks(query, namespace=None, top_k=6) -> List[dict]
+#   - build_context_block(hits, token_budget=1600) -> str
+try:
+    from rag_client import search_chunks, build_context_block
+    RAG_AVAILABLE = True
+except Exception as _e:
+    log.warning(f"[rag] rag_client não disponível: {_e}")
+    RAG_AVAILABLE = False
+
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
+RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
+DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None  # ex: "almadata"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI & CORS
@@ -302,8 +319,9 @@ def root():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "message": "Alma server ativo. Use POST /ask (Grok+Mem0) ou POST /say (D-ID).",
+        "message": "Alma server ativo. Use POST /ask (Grok+Mem0+RAG) ou POST /say (D-ID).",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
+        "rag": {"available": RAG_AVAILABLE, "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE},
         "endpoints": {
             "health": "/health",
             "ask": "POST /ask {question, user_id?}",
@@ -312,7 +330,8 @@ def root():
             "say": "POST /say {text, image_url?, voice_id?}",
             "heygen_token": "POST /heygen/token",
             "mem_facts": "/mem/facts?user_id=...",
-            "mem_search": "/mem/search?user_id=...&q=..."
+            "mem_search": "/mem/search?user_id=...&q=...",
+            "rag_search": "/rag/search?q=...&namespace=..."
         }
     }
 
@@ -322,7 +341,8 @@ def health():
         "status": "ok",
         "mem0_enabled": MEM0_ENABLE,
         "mem0_client_ready": bool(mem0_client),
-        "model": MODEL
+        "model": MODEL,
+        "rag_available": RAG_AVAILABLE
     }
 
 @app.post("/echo")
@@ -353,6 +373,17 @@ def mem_search(q: str = "", user_id: str = "anon"):
     snippets = mem0_search(user_id=user_id, query=q, limit=10)
     return {"user_id": user_id, "found": len(snippets), "snippets": snippets}
 
+# RAG: debug/inspeção
+@app.get("/rag/search")
+def rag_search(q: str, namespace: str = None, top_k: int = None):
+    if not RAG_AVAILABLE:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k or RAG_TOP_K)
+        return {"ok": True, "query": q, "matches": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon"):
     # wrapper GET para testar rápido no browser
@@ -374,13 +405,27 @@ def ask_get(q: str = "", user_id: str = "anon"):
     if snippets:
         memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
 
-    # 3) Mensagens para Grok
+    # 2.5) RAG: conhecimento externo (docs internos no Qdrant)
+    rag_block = ""
+    if RAG_AVAILABLE:
+        try:
+            rag_hits = search_chunks(query=q, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K)
+        except Exception:
+            rag_hits = []
+        try:
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET)
+        except Exception:
+            rag_block = ""
+
+    # 3) Mensagens para Grok (ordem: persona -> FACTs -> RAG -> curto prazo -> user)
     messages = [{
         "role": "system",
         "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
     }]
     if facts_block:
         messages.append({"role": "system", "content": facts_block})
+    if rag_block:
+        messages.append({"role": "system", "content": rag_block})
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
     messages.append({"role": "user", "content": q})
@@ -397,10 +442,11 @@ def ask_get(q: str = "", user_id: str = "anon"):
     return {
         "answer": answer,
         "mem0": {"facts_used": bool(facts_block), "facts": facts, "recent_found": len(snippets)},
-        "new_facts_detected": new_facts
+        "new_facts_detected": new_facts,
+        "rag": {"used": bool(rag_block), "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE}
     }
 
-# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo + Memória Contextual
+# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo + Memória Contextual + RAG
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
@@ -426,13 +472,27 @@ async def ask(request: Request):
     if snippets:
         memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
 
-    # 3) Mensagens para Grok
+    # 2.5) RAG: conhecimento externo (docs internos no Qdrant)
+    rag_block = ""
+    if RAG_AVAILABLE:
+        try:
+            rag_hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K)
+        except Exception:
+            rag_hits = []
+        try:
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET)
+        except Exception:
+            rag_block = ""
+
+    # 3) Mensagens para Grok (ordem: persona -> FACTs -> RAG -> curto prazo -> user)
     messages = [{
         "role": "system",
         "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
     }]
     if facts_block:
         messages.append({"role": "system", "content": facts_block})
+    if rag_block:
+        messages.append({"role": "system", "content": rag_block})
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
     messages.append({"role": "user", "content": question})
@@ -450,7 +510,8 @@ async def ask(request: Request):
     return {
         "answer": answer,
         "mem0": {"facts_used": bool(facts_block), "facts": facts, "recent_found": len(snippets)},
-        "new_facts_detected": new_facts
+        "new_facts_detected": new_facts,
+        "rag": {"used": bool(rag_block), "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE}
     }
 
 # D-ID: Texto → Vídeo (lábios)
@@ -530,44 +591,6 @@ def heygen_token():
         return res.json()
     except Exception as e:
         return {"error": str(e)}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RAG endpoints (Qdrant + OpenAI embeddings) — tudo cloud
-# ─────────────────────────────────────────────────────────────────────────────
-from rag_client import ingest_text, ingest_pdf_url, crawl_and_ingest
-
-@app.post("/rag/text")
-async def rag_text(request: Request):
-    data = await request.json()
-    title = (data.get("title") or "nota").strip()
-    text = (data.get("text") or "").strip()
-    namespace = (data.get("namespace") or "default").strip()
-    res = ingest_text(title=title, text=text, namespace=namespace)
-    return res
-
-@app.post("/rag/pdf_url")
-async def rag_pdf_url(request: Request):
-    data = await request.json()
-    url = (data.get("url") or "").strip()
-    title = (data.get("title") or "").strip() or None
-    namespace = (data.get("namespace") or "default").strip()
-    if not url:
-        return {"ok": False, "error": "Falta 'url' para o PDF"}
-    res = ingest_pdf_url(pdf_url=url, title=title, namespace=namespace)
-    return res
-
-@app.post("/rag/crawl")
-async def rag_crawl(request: Request):
-    data = await request.json()
-    seed = (data.get("seed_url") or "").strip()
-    namespace = (data.get("namespace") or "default").strip()
-    max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", 30))
-    max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", 2))
-    if not seed:
-        return {"ok": False, "error": "Falta 'seed_url'"}
-    res = crawl_and_ingest(seed_url=seed, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
-    return res
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Local run
