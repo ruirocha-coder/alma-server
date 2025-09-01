@@ -532,6 +532,44 @@ def heygen_token():
         return {"error": str(e)}
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RAG endpoints (Qdrant + OpenAI embeddings) — tudo cloud
+# ─────────────────────────────────────────────────────────────────────────────
+from rag_client import ingest_text, ingest_pdf_url, crawl_and_ingest
+
+@app.post("/rag/text")
+async def rag_text(request: Request):
+    data = await request.json()
+    title = (data.get("title") or "nota").strip()
+    text = (data.get("text") or "").strip()
+    namespace = (data.get("namespace") or "default").strip()
+    res = ingest_text(title=title, text=text, namespace=namespace)
+    return res
+
+@app.post("/rag/pdf_url")
+async def rag_pdf_url(request: Request):
+    data = await request.json()
+    url = (data.get("url") or "").strip()
+    title = (data.get("title") or "").strip() or None
+    namespace = (data.get("namespace") or "default").strip()
+    if not url:
+        return {"ok": False, "error": "Falta 'url' para o PDF"}
+    res = ingest_pdf_url(pdf_url=url, title=title, namespace=namespace)
+    return res
+
+@app.post("/rag/crawl")
+async def rag_crawl(request: Request):
+    data = await request.json()
+    seed = (data.get("seed_url") or "").strip()
+    namespace = (data.get("namespace") or "default").strip()
+    max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", 30))
+    max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", 2))
+    if not seed:
+        return {"ok": False, "error": "Falta 'seed_url'"}
+    res = crawl_and_ingest(seed_url=seed, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Local run
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
