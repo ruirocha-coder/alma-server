@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Alma RAG Console</title>
+<style>
+  :root { --bg:#0f1115; --panel:#151922; --ink:#e6e6e6; --muted:#a9b0be; --ok:#19c37d; --warn:#ffb020; --err:#ff6b6b; --accent:#4da3ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; background:var(--bg); color:var(--ink); }
+  header { padding:18px 20px; border-bottom:1px solid #202534; display:flex; align-items:center; gap:14px; position:sticky; top:0; backdrop-filter: blur(6px); background:rgba(15,17,21,.85); z-index:2;}
+  header h1 { margin:0; font-size:18px; letter-spacing:.3px; }
+  main { max-width:1100px; margin:18px auto 64px; padding:0 18px; display:grid; gap:18px; grid-template-columns: 1fr; }
+  .grid { display:grid; gap:18px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background:var(--panel); border:1px solid #1f2433; border-radius:12px; padding:16px; }
+  .card h2 { margin:0 0 10px; font-size:16px; }
+  .row { display:flex; gap:10px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 6px; }
+  input, textarea, select { width:100%; background:#0c0f15; color:var(--ink); border:1px solid #262b3a; border-radius:10px; padding:10px 12px; outline:none; }
+  textarea { min-height:140px; resize:vertical; }
+  .actions { display:flex; gap:10px; margin-top:12px; }
+  button { background:#263248; border:1px solid #2f3a56; color:#e8f0ff; padding:10px 14px; border-radius:10px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:#357de6; color:#06132a; font-weight:600; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .log { background:#0b0e13; border:1px solid #1a2030; border-radius:10px; padding:12px; white-space:pre-wrap; max-height:260px; overflow:auto; }
+  .tag { display:inline-block; font-size:11px; padding:2px 8px; border-radius:20px; background:#0f1522; border:1px solid #22304a; color:#a9c6ff; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
+  .small { font-size:12px; color:var(--muted); }
+  a { color:#9ec4ff; text-decoration:none; }
+  .result { padding:10px; border:1px solid #22304a; border-radius:10px; margin:10px 0; background:#0d1119; }
+  .result .head { display:flex; gap:8px; align-items:center; }
+  .kpi { display:flex; gap:10px; flex-wrap:wrap; }
+  .kpi .chip { background:#0f1522; border:1px solid #22304a; border-radius:8px; padding:6px 10px; font-size:12px; color:#c4cbe0;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Alma — RAG Console</h1>
+  <span class="tag">Qdrant Cloud</span>
+  <span class="tag">OpenAI Embeddings</span>
+</header>
+
+<main>
+
+  <div class="card">
+    <h2>Config API</h2>
+    <div class="grid">
+      <div>
+        <label>Base URL do alma-server</label>
+        <input id="baseUrl" placeholder="https://...railway.app" />
+        <div class="small">Por omissão usa o mesmo domínio desta página. Guarda-se em localStorage.</div>
+      </div>
+      <div>
+        <label>Namespace por omissão</label>
+        <input id="defaultNamespace" placeholder="p.ex. alma" />
+      </div>
+    </div>
+    <div class="actions">
+      <button onclick="saveConfig()">Guardar</button>
+      <button onclick="pingHealth()">Testar /health</button>
+      <div id="healthMsg" class="small"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Ingestão — Texto</h2>
+      <label>Título</label>
+      <input id="txtTitle" placeholder="Manual / Política / Nota Interna" />
+      <label>Namespace</label>
+      <input id="txtNs" placeholder="(vazio = default)" />
+      <label>Texto</label>
+      <textarea id="txtBody" placeholder="Cola aqui o texto a indexar..."></textarea>
+      <div class="actions">
+        <button class="primary" id="btnText" onclick="ingestText()">Ingerir Texto</button>
+      </div>
+      <div id="txtLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <h2>Ingestão — PDF por URL</h2>
+      <label>URL do PDF (tem de ser público)</label>
+      <input id="pdfUrl" placeholder="https://site.com/fich.pdf" />
+      <label>Título (opcional)</label>
+      <input id="pdfTitle" placeholder="Será usado o nome do ficheiro se vazio" />
+      <label>Namespace</label>
+      <input id="pdfNs" placeholder="(vazio = default)" />
+      <div class="actions">
+        <button class="primary" id="btnPdf" onclick="ingestPdf()">Ingerir PDF</button>
+      </div>
+      <div id="pdfLog" class="log"></div>
+    </div>
+
+    <div class="card">
+      <h2>Crawler — Site</h2>
+      <label>Seed URL (mesmo domínio)</label>
+      <input id="crawlUrl" placeholder="https://www.seusite.com" />
+      <div class="row">
+        <div style="flex:1">
+          <label>Namespace</label>
+          <input id="crawlNs" placeholder="(vazio = default)" />
+        </div>
+        <div style="width:120px">
+          <label>Max páginas</label>
+          <input id="crawlMaxPages" type="number" min="1" value="20" />
+        </div>
+        <div style="width:120px">
+          <label>Profundidade</label>
+          <input id="crawlMaxDepth" type="number" min="1" value="2" />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="btnCrawl" onclick="crawl()">Crawl & Ingest</button>
+      </div>
+      <div id="crawlLog" class="log"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Pesquisa — RAG</h2>
+    <div class="row">
+      <input id="q" placeholder="Escreve a tua pergunta / query..." />
+      <input id="searchNs" placeholder="namespace (opcional)" style="max-width:240px" />
+      <input id="topK" type="number" min="1" max="20" value="6" style="max-width:120px" />
+      <button class="primary" onclick="doSearch()">Buscar</button>
+    </div>
+    <div class="kpi" id="searchKpi"></div>
+    <div id="searchResults"></div>
+  </div>
+
+</main>
+
+<script>
+  // ----------------- Config -----------------
+  const $ = (id) => document.getElementById(id);
+
+  function loadConfig() {
+    const savedBase = localStorage.getItem('alma_base_url');
+    const savedNs   = localStorage.getItem('alma_default_ns');
+    $('baseUrl').value = savedBase || window.location.origin;
+    $('defaultNamespace').value = savedNs || 'alma';
+  }
+  function currentBase() {
+    return ($('baseUrl').value || window.location.origin).replace(/\/+$/,'');
+  }
+  function defaultNs() {
+    return $('defaultNamespace').value.trim();
+  }
+  function saveConfig() {
+    localStorage.setItem('alma_base_url', $('baseUrl').value.trim());
+    localStorage.setItem('alma_default_ns', $('defaultNamespace').value.trim());
+  }
+
+  async function pingHealth() {
+    const url = currentBase() + '/health';
+    $('healthMsg').textContent = 'a verificar...';
+    try {
+      const r = await fetch(url);
+      const j = await r.json();
+      $('healthMsg').innerHTML = `<span class="ok">OK</span> model=${j.model} mem0=${j.mem0_enabled ? 'on':'off'}`;
+    } catch (e) {
+      $('healthMsg').innerHTML = `<span class="err">Falhou</span> ${e}`;
+    }
+  }
+
+  // ----------------- Helpers -----------------
+  async function postJSON(path, body) {
+    const url = currentBase() + path;
+    const res = await fetch(url, {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body || {})
+    });
+    const json = await res.json().catch(()=> ({}));
+    if(!res.ok) throw new Error(json.error || res.statusText || 'HTTP error');
+    return json;
+  }
+  async function getJSON(pathWithQuery) {
+    const url = currentBase() + pathWithQuery;
+    const res = await fetch(url);
+    const json = await res.json().catch(()=> ({}));
+    if(!res.ok) throw new Error(json.error || res.statusText || 'HTTP error');
+    return json;
+  }
+  function nsOrDefault(inputId) {
+    const v = ($(inputId).value || '').trim();
+    return v || defaultNs();
+  }
+  function setBusy(btnId, busy) {
+    const b = $(btnId);
+    if(!b) return;
+    b.disabled = !!busy;
+    b.textContent = busy ? 'A processar...' : b.dataset.label || b.textContent;
+  }
+  // preserve original labels
+  ['btnText','btnPdf','btnCrawl'].forEach(id => {
+    const el = $(id); if(el) el.dataset.label = el.textContent;
+  });
+
+  // ----------------- Actions -----------------
+  async function ingestText() {
+    const title = $('txtTitle').value.trim();
+    const text  = $('txtBody').value.trim();
+    const namespace = nsOrDefault('txtNs');
+    const log = $('txtLog');
+    if(!title || !text){ log.textContent = '⚠️ Preenche título e texto.'; return; }
+    setBusy('btnText', true); log.textContent = 'A enviar...';
+    try {
+      const j = await postJSON('/rag/ingest_text', { title, text, namespace });
+      log.textContent = '✅ Ingerido: ' + JSON.stringify(j, null, 2);
+    } catch(e) {
+      log.textContent = '❌ Erro: ' + e.message;
+    } finally {
+      setBusy('btnText', false);
+    }
+  }
+
+  async function ingestPdf() {
+    const pdf_url = $('pdfUrl').value.trim();
+    const title   = $('pdfTitle').value.trim() || null;
+    const namespace = nsOrDefault('pdfNs');
+    const log = $('pdfLog');
+    if(!pdf_url){ log.textContent = '⚠️ Indica o URL do PDF.'; return; }
+    setBusy('btnPdf', true); log.textContent = 'A descarregar e indexar...';
+    try {
+      const j = await postJSON('/rag/ingest_pdf', { pdf_url, title, namespace });
+      log.textContent = '✅ Ingerido: ' + JSON.stringify(j, null, 2);
+    } catch(e) {
+      log.textContent = '❌ Erro: ' + e.message;
+    } finally {
+      setBusy('btnPdf', false);
+    }
+  }
+
+  async function crawl() {
+    const seed_url = $('crawlUrl').value.trim();
+    const namespace = nsOrDefault('crawlNs');
+    const max_pages = parseInt($('crawlMaxPages').value || '20',10);
+    const max_depth = parseInt($('crawlMaxDepth').value || '2',10);
+    const log = $('crawlLog');
+    if(!seed_url){ log.textContent = '⚠️ Indica a seed URL.'; return; }
+    setBusy('btnCrawl', true); log.textContent = 'A rastrear...';
+    try {
+      const j = await postJSON('/rag/crawl', { seed_url, namespace, max_pages, max_depth });
+      log.textContent = '✅ Concluído: ' + JSON.stringify(j, null, 2);
+    } catch(e) {
+      log.textContent = '❌ Erro: ' + e.message;
+    } finally {
+      setBusy('btnCrawl', false);
+    }
+  }
+
+  async function doSearch() {
+    const q = $('q').value.trim();
+    const ns = $('searchNs').value.trim() || defaultNs();
+    const top_k = parseInt($('topK').value || '6', 10);
+    const kpi = $('searchKpi');
+    const out = $('searchResults');
+    if(!q){ out.innerHTML = '<div class="small">Escreve uma query.</div>'; return; }
+    kpi.textContent = 'A procurar...'; out.innerHTML = '';
+    try {
+      // Preferimos GET para maior compatibilidade
+      const qp = new URLSearchParams({ q, namespace: ns, top_k: String(top_k) }).toString();
+      const j = await getJSON('/rag/search?' + qp);
+      const hits = j.matches || j.hits || j || [];
+      kpi.innerHTML = `<span class="chip">Top-K: ${top_k}</span><span class="chip">Devolvidos: ${hits.length}</span><span class="chip">Namespace: ${ns}</span>`;
+      if(!hits.length){ out.innerHTML = '<div class="small">Sem resultados.</div>'; return; }
+      out.innerHTML = hits.map(h => {
+        const t = (h.title || h.url || h.type || 'doc');
+        const u = h.url ? `<a href="${h.url}" target="_blank">abrir</a>` : '';
+        const s = (typeof h.score === 'number') ? `score ${h.score.toFixed(3)}` : '';
+        const text = (h.text || '').slice(0, 600);
+        return `<div class="result">
+          <div class="head"><strong>${t}</strong><span class="small">${u}</span><span class="small">${s}</span></div>
+          <div class="small">${h.type || ''} • ${h.namespace || ''}</div>
+          <div style="margin-top:6px">${escapeHtml(text)}${(h.text||'').length>600?'…':''}</div>
+        </div>`;
+      }).join('');
+    } catch(e) {
+      kpi.innerHTML = ''; out.innerHTML = `<div class="err">Erro: ${e.message}</div>`;
+    }
+  }
+
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
+
+  loadConfig();
+  // auto-fill children namespaces when empty
+  ['txtNs','pdfNs','crawlNs','searchNs'].forEach(id=>{
+    const el=$(id); if(!el) return;
+    if(!el.value) el.value = defaultNs();
+  });
+</script>
+</body>
+</html>
