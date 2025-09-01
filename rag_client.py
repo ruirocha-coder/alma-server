@@ -1,42 +1,56 @@
 # rag_client.py
-import os, re, math, time, hashlib, io
+import os, re, math, time, hashlib, io, random
 import requests
-from typing import List, Dict, Iterable, Tuple, Optional
-from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Tuple, Optional
+from urllib.parse import urljoin, urlparse, quote_plus
 
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 import tiktoken
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.http.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue
+)
 
 from openai import OpenAI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
-QDRANT_URL        = os.getenv("QDRANT_URL", "").strip()
-QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY", "").strip()
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs").strip()
+def _getint(env: str, default: str) -> int:
+    try:
+        return int((os.getenv(env, default) or default).strip())
+    except Exception:
+        return int(default)
 
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small").strip()
-EMBED_DIM         = 1536  # text-embedding-3-* -> 1536
+QDRANT_URL         = (os.getenv("QDRANT_URL", "") or "").strip()
+QDRANT_API_KEY     = (os.getenv("QDRANT_API_KEY", "") or "").strip()
+QDRANT_COLLECTION  = (os.getenv("QDRANT_COLLECTION", "alma_docs") or "alma_docs").strip()
+
+EMBEDDING_MODEL    = (os.getenv("EMBEDDING_MODEL", "text-embedding-3-small") or "text-embedding-3-small").strip()
+EMBED_DIM          = _getint("EMBED_DIM", "1536")  # text-embedding-3-* -> 1536
 
 # chunking
-MAX_TOKENS      = int(os.getenv("RAG_MAX_TOKENS_PER_CHUNK", "800"))
-OVERLAP_TOKENS  = int(os.getenv("RAG_OVERLAP_TOKENS", "80"))
+MAX_TOKENS         = _getint("RAG_MAX_TOKENS_PER_CHUNK", "800")
+OVERLAP_TOKENS     = _getint("RAG_OVERLAP_TOKENS", "80")
+MIN_TOKENS_PAGE    = _getint("RAG_MIN_TOKENS_PER_PAGE", "50")
 
 # crawling
-CRAWL_MAX_PAGES = int(os.getenv("CRAWL_MAX_PAGES", "30"))
-CRAWL_MAX_DEPTH = int(os.getenv("CRAWL_MAX_DEPTH", "2"))
+CRAWL_MAX_PAGES    = _getint("CRAWL_MAX_PAGES", "30")
+CRAWL_MAX_DEPTH    = _getint("CRAWL_MAX_DEPTH", "2")
+SAME_DOMAIN_ONLY   = (os.getenv("RAG_SAME_DOMAIN_ONLY", "true").strip().lower() in ("1","true","yes"))
 
 # retrieval
-RAG_TOP_K              = int(os.getenv("RAG_TOP_K", "6"))
-RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
-RAG_DEFAULT_NAMESPACE  = os.getenv("RAG_DEFAULT_NAMESPACE", "default").strip() or "default"
+RAG_TOP_K                 = _getint("RAG_TOP_K", "6")
+RAG_CONTEXT_TOKEN_BUDGET  = _getint("RAG_CONTEXT_TOKEN_BUDGET", "1600")
+RAG_DEFAULT_NAMESPACE     = (os.getenv("RAG_DEFAULT_NAMESPACE", "default") or "default").strip()
 
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT     = _getint("RAG_REQUEST_TIMEOUT", "30")
+
+# HTTP proxy opcional (ex.: "https://app.scrapingbee.com/api/v1?api_key=XXX&url=")
+HTTP_PROXY_BASE     = (os.getenv("HTTP_PROXY_BASE", "") or "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clients
@@ -48,7 +62,7 @@ qdr = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=REQUEST_TIMEO
 # Utils
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_collection() -> None:
-    """Garante que a coleção existe com 1536 dims + cosine (não recria se já existir)."""
+    """Garante que a coleção existe (não recria se já existir)."""
     try:
         qdr.get_collection(QDRANT_COLLECTION)
         return
@@ -63,12 +77,12 @@ def tokenize_len(text: str) -> int:
     enc = tiktoken.get_encoding("cl100k_base")
     return len(enc.encode(text or ""))
 
-def chunk_text(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP_TOKENS) -> List[str]:
+def chunk_text(text: str, max_tokens: int = MAX_TOKENS, overlap: int = OVERLAP_TOKENS) -> List[str]:
     enc = tiktoken.get_encoding("cl100k_base")
     ids = enc.encode(text or "")
     if not ids:
         return []
-    chunks = []
+    chunks: List[str] = []
     step = max(1, max_tokens - overlap)
     for start in range(0, len(ids), step):
         end = min(start + max_tokens, len(ids))
@@ -79,7 +93,7 @@ def chunk_text(text: str, max_tokens=MAX_TOKENS, overlap=OVERLAP_TOKENS) -> List
     return chunks
 
 def embed_texts(texts: List[str], batch_size: int = 96) -> List[List[float]]:
-    """OpenAI embeddings com batching seguro."""
+    """OpenAI embeddings com batching."""
     out: List[List[float]] = []
     if not texts:
         return out
@@ -124,6 +138,107 @@ def delete_by_source_id(source_id: str, namespace: Optional[str] = None) -> int:
     return int(getattr(res, "status", 0) == "acknowledged")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HTTP fetcher (anti-403 básico + proxy opcional)
+# ─────────────────────────────────────────────────────────────────────────────
+_UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+]
+
+def _proxied_url(url: str) -> str:
+    if not HTTP_PROXY_BASE:
+        return url
+    # Se a base já incluir "url=" no fim, apenas anexamos a URL codificada
+    if HTTP_PROXY_BASE.endswith("="):
+        return HTTP_PROXY_BASE + quote_plus(url)
+    # Caso contrário, tentamos o padrão ?url=
+    joiner = "&" if "?" in HTTP_PROXY_BASE else "?"
+    return f"{HTTP_PROXY_BASE}{joiner}url={quote_plus(url)}"
+
+def http_get(url: str, timeout: int = REQUEST_TIMEOUT, expect: str = "html") -> requests.Response:
+    """
+    GET com headers de browser, retries e proxy opcional.
+    expect: "html" | "pdf" (apenas para checks simples de Content-Type)
+    """
+    headers = {
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" if expect=="html" else "*/*",
+        "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+    }
+    last_exc = None
+    for i in range(4):
+        try:
+            tgt = _proxied_url(url)
+            r = requests.get(tgt, headers=headers, timeout=timeout, allow_redirects=True)
+            # Checks leves por tipo
+            ctype = r.headers.get("Content-Type", "").lower()
+            if r.status_code in (403, 429, 503):
+                time.sleep(1.0 + i * 0.8)
+                continue
+            if expect == "html" and ("text/html" not in ctype and "application/xhtml+xml" not in ctype):
+                # alguns CDNs omitem; deixamos passar se body tem tags básicas
+                if "<html" not in r.text.lower():
+                    r.raise_for_status()
+            if expect == "pdf" and ("application/pdf" not in ctype) and not r.url.lower().endswith(".pdf"):
+                r.raise_for_status()
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.8 + i * 0.7)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Falha HTTP sem exceção explícita")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de parsing HTML
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_same_domain(seed: str, url: str) -> bool:
+    a = urlparse(seed)
+    b = urlparse(url)
+    return a.netloc == b.netloc
+
+def _clean_url(u: str) -> str:
+    # remove fragmentos e normaliza espaços
+    return (u or "").split("#")[0].strip()
+
+def _extract_links(base_url: str, html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        absu = urljoin(base_url, href)
+        out.append(_clean_url(absu))
+    # dedup simples
+    seen = set()
+    uniq = []
+    for x in out:
+        if x and x not in seen:
+            uniq.append(x); seen.add(x)
+    return uniq
+
+def _guess_title(url: str, html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    t = (soup.title.string if soup.title else "") or ""
+    t = " ".join((t or "").split())
+    return t or url
+
+def _extract_main_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "form", "noscript"]):
+        tag.decompose()
+    # remove menus repetidos por classes comuns
+    for sel in [".navbar", ".menu", ".breadcrumbs", ".cookie", ".cookies", ".newsletter"]:
+        for el in soup.select(sel):
+            el.decompose()
+    text = " ".join(soup.get_text(separator=" ").split())
+    return text
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Ingest: TEXT
 # ─────────────────────────────────────────────────────────────────────────────
 def ingest_text(title: str, text: str, namespace: str = RAG_DEFAULT_NAMESPACE, source_id: str = None) -> Dict:
@@ -136,11 +251,10 @@ def ingest_text(title: str, text: str, namespace: str = RAG_DEFAULT_NAMESPACE, s
     return {"ok": True, "chunks": len(chunks), "source_id": src_id}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ingest: PDF por URL / bytes (uploads)
+# Ingest: PDF (URL / bytes)
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_pdf_text(pdf_url: str) -> Tuple[str, int]:
-    r = requests.get(pdf_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "alma-rag/1.0"})
-    r.raise_for_status()
+    r = http_get(pdf_url, timeout=REQUEST_TIMEOUT, expect="pdf")
     reader = PdfReader(io.BytesIO(r.content))
     pages = [(p.extract_text() or "") for p in reader.pages]
     text = "\n\n".join(pages)
@@ -164,38 +278,32 @@ def ingest_pdf_bytes(data: bytes, title: str, namespace: str = RAG_DEFAULT_NAMES
     return {"ok": True, "chunks": len(chunks), "pages": len(pages), "source_id": src_id}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ingest: Crawl website (mesmo domínio)
+# Ingest: Single URL (HTML)
 # ─────────────────────────────────────────────────────────────────────────────
-def _is_same_domain(seed: str, url: str) -> bool:
-    a = urlparse(seed)
-    b = urlparse(url)
-    return a.netloc == b.netloc
+def ingest_url(page_url: str, namespace: str = RAG_DEFAULT_NAMESPACE) -> Dict:
+    u = _clean_url(page_url)
+    r = http_get(u, timeout=REQUEST_TIMEOUT, expect="html")
+    html = r.text
+    text = _extract_main_text(html)
+    if tokenize_len(text) < MIN_TOKENS_PAGE:
+        return {"ok": False, "error": "Página sem conteúdo útil suficiente", "url": u}
+    title = _guess_title(u, html)
+    src_id = hashlib.sha1(u.encode("utf-8")).hexdigest()
+    chunks = chunk_text(text)
+    upsert_chunks(namespace, {"type": "web", "title": title, "url": u, "domain": urlparse(u).netloc, "source_id": src_id}, chunks)
+    return {"ok": True, "chunks": len(chunks), "source_id": src_id, "url": u, "title": title}
 
-def _clean_url(u: str) -> str:
-    return u.split("#")[0]
-
-def _extract_links(base_url: str, html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        absu = urljoin(base_url, href)
-        out.append(_clean_url(absu))
-    return out
-
-def _extract_main_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "form"]):
-        tag.decompose()
-    text = " ".join(soup.get_text(separator=" ").split())
-    return text
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingest: Crawl website (BFS, mesmo domínio opcional)
+# ─────────────────────────────────────────────────────────────────────────────
 def crawl_and_ingest(seed_url: str, namespace: str = RAG_DEFAULT_NAMESPACE,
                      max_pages: int = CRAWL_MAX_PAGES, max_depth: int = CRAWL_MAX_DEPTH) -> Dict:
+    seed_url = _clean_url(seed_url)
     seen = set()
-    queue = [(seed_url, 0)]
+    queue: List[Tuple[str, int]] = [(seed_url, 0)]
     n_ingested = 0
     src_host = urlparse(seed_url).netloc
+
     while queue and n_ingested < max_pages:
         url, depth = queue.pop(0)
         url = _clean_url(url)
@@ -203,28 +311,111 @@ def crawl_and_ingest(seed_url: str, namespace: str = RAG_DEFAULT_NAMESPACE,
             continue
         seen.add(url)
         try:
-            r = requests.get(url, timeout=20, headers={"User-Agent": "alma-rag/1.0"})
-            if "text/html" not in r.headers.get("Content-Type", ""):
-                continue
+            r = http_get(url, timeout=REQUEST_TIMEOUT, expect="html")
             html = r.text
-            text = _extract_main_text(html)
-            if tokenize_len(text) >= 50:
-                title = url
-                src_id = hashlib.sha1(url.encode("utf-8")).hexdigest()
-                chunks = chunk_text(text)
-                upsert_chunks(
-                    namespace,
-                    {"type": "web", "title": title, "url": url, "domain": src_host, "source_id": src_id},
-                    chunks,
-                )
-                n_ingested += 1
-            if depth < max_depth:
-                for link in _extract_links(url, html):
-                    if _is_same_domain(seed_url, link):
+            ctype = r.headers.get("Content-Type", "").lower()
+            if "text/html" not in ctype and "<html" not in html.lower():
+                # ignora tipos não HTML
+                pass
+            else:
+                text = _extract_main_text(html)
+                if tokenize_len(text) >= MIN_TOKENS_PAGE:
+                    title = _guess_title(url, html)
+                    src_id = hashlib.sha1(url.encode("utf-8")).hexdigest()
+                    chunks = chunk_text(text)
+                    upsert_chunks(
+                        namespace,
+                        {"type": "web", "title": title, "url": url, "domain": src_host, "source_id": src_id},
+                        chunks,
+                    )
+                    n_ingested += 1
+                # expande links
+                if depth < max_depth:
+                    for link in _extract_links(url, html):
+                        if not link or link in seen:
+                            continue
+                        if SAME_DOMAIN_ONLY and not _is_same_domain(seed_url, link):
+                            continue
                         queue.append((link, depth + 1))
         except Exception:
+            # falhas de rede/bloqueios são normais — continuamos
             continue
+
     return {"ok": True, "pages_ingested": n_ingested, "visited": len(seen), "domain": src_host}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingest: Sitemap (urlset e sitemapindex)
+# ─────────────────────────────────────────────────────────────────────────────
+def ingest_sitemap(sitemap_or_site_url: str, namespace: str = RAG_DEFAULT_NAMESPACE,
+                   max_urls: int = 200) -> Dict:
+    """
+    Aceita:
+      - URL do sitemap (ex.: https://site.tld/sitemap.xml)
+      - OU a homepage (tentamos /sitemap.xml).
+    Percorre sitemapindex/urlset e chama ingest_url por cada URL (até max_urls).
+    """
+    start = sitemap_or_site_url.strip()
+    # tenta autodetectar /sitemap.xml se parecer homepage
+    if not start.endswith(".xml"):
+        base = start.rstrip("/")
+        start = base + "/sitemap.xml"
+
+    r = http_get(start, timeout=REQUEST_TIMEOUT, expect="html")  # XML vem como text/xml
+    soup = BeautifulSoup(r.text, "xml")
+
+    urls: List[str] = []
+    # sitemapindex de sub-sitemaps
+    for loc in soup.find_all("loc"):
+        val = (loc.text or "").strip()
+        if not val:
+            continue
+        urls.append(val)
+
+    collected: List[str] = []
+    def _harvest(url: str):
+        try:
+            rr = http_get(url, timeout=REQUEST_TIMEOUT, expect="html")
+            ss = BeautifulSoup(rr.text, "xml")
+            # se for um sitemap de URLs finais
+            for loc2 in ss.find_all("loc"):
+                u = (loc2.text or "").strip()
+                if u:
+                    collected.append(u)
+                    if len(collected) >= max_urls:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    # se o primeiro já era um urlset, collected enche direto
+    if collected or soup.find("urlset"):
+        for loc in soup.find_all("loc"):
+            u = (loc.text or "").strip()
+            if u:
+                collected.append(u)
+                if len(collected) >= max_urls:
+                    break
+    else:
+        # era um sitemapindex -> abre cada sub-sitemap
+        for sm in urls:
+            if _harvest(sm):
+                break
+
+    # dedup e ingest
+    seen = set()
+    ok_count = 0
+    for u in collected:
+        if u in seen:
+            continue
+        seen.add(u)
+        try:
+            res = ingest_url(u, namespace=namespace)
+            if res.get("ok"):
+                ok_count += 1
+        except Exception:
+            continue
+
+    return {"ok": True, "found": len(collected), "ingested": ok_count}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Retrieval (search) no Qdrant
@@ -265,7 +456,7 @@ def build_context_block(matches: List[Dict], token_budget: int = None) -> str:
     """Empilha os melhores trechos até ao orçamento de tokens."""
     budget = token_budget or RAG_CONTEXT_TOKEN_BUDGET
     enc = tiktoken.get_encoding("cl100k_base")
-    chosen = []
+    chosen: List[str] = []
     total = 0
     for m in matches:
         head = m.get("title") or m.get("url") or m.get("type") or "doc"
