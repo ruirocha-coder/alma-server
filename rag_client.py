@@ -193,3 +193,59 @@ def crawl_and_ingest(seed_url: str, namespace: str="default", max_pages: int=CRA
         except Exception:
             continue
     return {"ok": True, "pages_ingested": n_ingested, "visited": len(seen), "domain": src_host}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Retrieval (search) no Qdrant
+# ─────────────────────────────────────────────────────────────────────────────
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue, NamedVector
+
+def search_chunks(query: str, namespace: str=None, top_k: int=6) -> List[Dict]:
+    if not query.strip():
+        return []
+    ensure_collection()
+    qvec = embed_texts([query])[0]
+    flt = None
+    if namespace:
+        flt = Filter(
+            must=[FieldCondition(key="namespace", match=MatchValue(value=namespace))]
+        )
+    hits = qdr.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=qvec,
+        limit=top_k,
+        query_filter=flt,
+        with_payload=True,
+        with_vectors=False,
+        score_threshold=None
+    )
+    out = []
+    for h in hits:
+        pl = h.payload or {}
+        out.append({
+            "text": pl.get("text",""),
+            "score": float(h.score),
+            "title": pl.get("title",""),
+            "url": pl.get("url"),
+            "type": pl.get("type"),
+            "namespace": pl.get("namespace"),
+            "source_id": pl.get("source_id")
+        })
+    return out
+
+def build_context_block(matches: List[Dict], token_budget: int=1600) -> str:
+    """Empilha os melhores trechos até ao orçamento de tokens."""
+    enc = tiktoken.get_encoding("cl100k_base")
+    chosen = []
+    total = 0
+    for m in matches:
+        # formata com metadados úteis
+        head = m.get("title") or m.get("url") or m.get("type") or "doc"
+        chunk = f"[{head}] {m['text']}".strip()
+        cost = len(enc.encode(chunk))
+        if total + cost > token_budget:
+            break
+        chosen.append(chunk)
+        total += cost
+    if not chosen:
+        return ""
+    return "Contexto de conhecimento interno (RAG):\n" + "\n\n".join(chosen)
