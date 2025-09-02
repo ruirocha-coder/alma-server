@@ -8,12 +8,10 @@ trafilatura==1.12.2
 tldextract==5.1.2
 pymupdf==1.24.9
 python-docx==1.1.2
-beautifulsoup4
-pypdf
-qdrant-client>=1.7.0
-tiktoken
-openai>=1.33.0
-sentence-transformers
+beautifulsoup4==4.12.3
+pypdf==4.3.1
+tiktoken==0.7.0
+sentence-transformers==2.7.0
 
 
 
