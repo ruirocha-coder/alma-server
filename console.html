@@ -408,6 +408,14 @@
     // arranca painel Live em modo parado; se quiseres auto-start:
     // toggleLive();
   })();
+
+  // Função auxiliar para ir acrescentando linhas ao log
+function appendLog(el, msg) {
+  if (!el) return;
+  const time = new Date().toLocaleTimeString();
+  el.textContent += `[${time}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight; // faz scroll automático para o fim
+}
 </script>
 </body>
 </html>
