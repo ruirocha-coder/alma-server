@@ -613,9 +613,10 @@ def heygen_token():
 # -----------------------------------------------------------------------------
 # RAG Endpoints (crawl, sitemap, url, text, pdf, search POST)
 # -----------------------------------------------------------------------------
+
+
 @app.post("/rag/crawl")
 async def rag_crawl(request: Request):
-    """Crawl básico (BFS) a partir de uma seed_url (sem 500 — devolve erro no JSON)."""
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
     try:
@@ -624,15 +625,17 @@ async def rag_crawl(request: Request):
         namespace = (data.get("namespace") or "default").strip()
         max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
         max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
+        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
         if not seed_url:
             return {"ok": False, "error": "Falta seed_url"}
-        return crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
+        return crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages,
+                                max_depth=max_depth, deadline_s=deadline_s)
     except Exception as e:
         return {"ok": False, "error": "crawl_failed", "detail": str(e)}
 
+
 @app.post("/rag/ingest-sitemap")
 async def rag_ingest_sitemap_route(request: Request):
-    """Lê sitemaps (WordPress e outros). Aceita sitemap_url ou site_url."""
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
     try:
@@ -640,24 +643,26 @@ async def rag_ingest_sitemap_route(request: Request):
         sitemap_url = (data.get("sitemap_url") or data.get("site_url") or "").strip()
         namespace   = (data.get("namespace") or "default").strip()
         max_pages   = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
+        deadline_s  = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
         if not sitemap_url:
             return {"ok": False, "error": "Falta sitemap_url/site_url"}
-        return ingest_sitemap(sitemap_url, namespace=namespace, max_pages=max_pages)
+        return ingest_sitemap(sitemap_url, namespace=namespace, max_pages=max_pages, deadline_s=deadline_s)
     except Exception as e:
         return {"ok": False, "error": "sitemap_failed", "detail": str(e)}
 
+
 @app.post("/rag/ingest-url")
 async def rag_ingest_url_route(request: Request):
-    """Ingest de uma página única (URL)."""
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
     try:
         data = await request.json()
         page_url  = (data.get("page_url") or "").strip()
         namespace = (data.get("namespace") or "default").strip()
+        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
         if not page_url:
             return {"ok": False, "error": "Falta page_url"}
-        return ingest_url(page_url, namespace=namespace)
+        return ingest_url(page_url, namespace=namespace, deadline_s=deadline_s)
     except Exception as e:
         return {"ok": False, "error": "ingest_url_failed", "detail": str(e)}
 
