@@ -13,3 +13,8 @@ pypdf
 qdrant-client>=1.7.0
 tiktoken
 openai>=1.33.0
+sentence-transformers
+
+
+
+
