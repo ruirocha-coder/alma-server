@@ -7,7 +7,7 @@
 <style>
   :root { --bg:#0f1115; --panel:#151922; --ink:#e6e6e6; --muted:#a9b0be; --ok:#19c37d; --warn:#ffb020; --err:#ff6b6b; --accent:#4da3ff; }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Helvetica Neue,Arial; }
   header { padding:16px 18px; border-bottom:1px solid #202534; display:flex; gap:12px; align-items:center; position:sticky; top:0; background:rgba(15,17,21,.9); backdrop-filter: blur(4px); z-index:2;}
   header h1 { margin:0; font-size:18px; }
   main { max-width:1100px; margin:18px auto 64px; padding:0 18px; display:grid; gap:16px; }
@@ -27,6 +27,9 @@
   .kpi { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
   .chip { background:#0f1522; border:1px solid #22304a; border-radius:8px; padding:6px 10px; font-size:12px; color:#c4cbe0;}
   .ok { color:var(--ok); } .err { color:var(--err); } .warn { color:var(--warn); }
+  a { color:#9ec4ff; }
+  .kv { display:grid; grid-template-columns: 160px 1fr; gap:6px 10px; font-size:13px; }
+  .kv div.key { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -42,6 +45,27 @@
 </header>
 
 <main>
+
+  <!-- Live System Info -->
+  <div class="card">
+    <h2>Live System Info</h2>
+    <div class="row">
+      <label class="small">Intervalo (seg)</label>
+      <input id="liveInterval" type="number" min="2" value="5" style="width:100px" />
+      <button id="btnLiveToggle" onclick="toggleLive()">Iniciar</button>
+      <button onclick="refreshLiveNow()">Atualizar agora</button>
+      <span id="liveStatus" class="small"></span>
+    </div>
+    <div class="kpi" id="liveKpi"></div>
+    <div class="kv" style="margin-top:8px">
+      <div class="key">Modelo</div><div id="liveModel">—</div>
+      <div class="key">RAG</div><div id="liveRag">—</div>
+      <div class="key">Mem0</div><div id="liveMem0">—</div>
+      <div class="key">Mem0 Client</div><div id="liveMem0Client">—</div>
+      <div class="key">Versão</div><div id="liveVersion">—</div>
+      <div class="key">Último refresh</div><div id="liveWhen">—</div>
+    </div>
+  </div>
 
   <div class="grid">
     <div class="card">
@@ -129,41 +153,43 @@
     const val = typed || saved || window.location.origin;
     return val.replace(/\/+$/,'');
   }
-  function saveConfig(){
-    localStorage.setItem('alma_base_url', $('baseUrl').value.trim());
-  }
-  function ts() {
-    const d = new Date();
-    return d.toISOString().substring(11,19); // HH:MM:SS
-  }
-  function appendLog(el, msg, cls) {
-    el.innerHTML += `<div class="${cls||''}">[${ts()}] ${escapeHtml(String(msg))}</div>`;
-    el.scrollTop = el.scrollHeight;
-  }
-  function clearLog(el) { el.textContent = ''; }
-  function setBusy(btnId, busy) {
-    const b = $(btnId); if(!b) return;
-    b.disabled = !!busy;
-    if(!b.dataset.label) b.dataset.label = b.textContent;
-    b.textContent = busy ? 'A processar…' : b.dataset.label;
-  }
+  function saveConfig(){ localStorage.setItem('alma_base_url', $('baseUrl').value.trim()); }
+  function ts(){ return new Date().toISOString().substring(11,19); } // HH:MM:SS
   function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
 
-  async function postJSON(path, body) {
+  function setBusy(btnId, busy){
+    const b=$(btnId); if(!b) return;
+    b.disabled=!!busy; if(!b.dataset.label) b.dataset.label=b.textContent;
+    b.textContent = busy ? 'A processar…' : b.dataset.label;
+  }
+
+  // POST com erros enriquecidos (detail/trace/payload)
+  async function postJSON(path, body){
     const url = baseUrl() + path;
     const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) });
-    const j = await res.json().catch(()=> ({}));
-    // nossos endpoints devolvem {ok:false,...} como "erro lógico"
-    if (j && j.ok === false) throw new Error(j.error || j.detail || 'Erro lógico');
-    if (!res.ok) throw new Error(j.error || res.statusText || 'HTTP error');
+    let j = {};
+    try { j = await res.json(); } catch(_){}
+    if (j && j.ok === false) {
+      const msg = [
+        j.error || 'Erro lógico',
+        j.detail ? `detail: ${j.detail}` : '',
+        j.reason ? `reason: ${j.reason}` : '',
+        j.where ? `where: ${j.where}` : '',
+      ].filter(Boolean).join(' | ');
+      const err = new Error(msg || 'Erro lógico'); err.payload = j; throw err;
+    }
+    if (!res.ok) {
+      const msg = (j && (j.error || j.detail)) || res.statusText || 'HTTP error';
+      const err = new Error(msg); err.payload = j; throw err;
+    }
     return j;
   }
-  async function getJSON(pathWithQuery) {
+  async function getJSON(pathWithQuery){
     const url = baseUrl() + pathWithQuery;
     const res = await fetch(url);
     const j = await res.json().catch(()=> ({}));
-    if (j && j.ok === false) throw new Error(j.error || j.detail || 'Erro lógico');
-    if (!res.ok) throw new Error(j.error || res.statusText || 'HTTP error');
+    if (j && j.ok === false){ const err = new Error(j.error || j.detail || 'Erro lógico'); err.payload=j; throw err; }
+    if (!res.ok){ const err = new Error(j.error || j.detail || res.statusText || 'HTTP error'); err.payload=j; throw err; }
     return j;
   }
 
@@ -181,7 +207,58 @@
     if (el && finalMsg !== undefined) el.textContent = finalMsg;
   }
 
-  // ————— Health —————
+  // ————— Live System Info —————
+  let liveTimer = null;
+
+  async function refreshLiveNow(){
+    const status = $('liveStatus');
+    try {
+      const h = await getJSON('/health');
+      const now = new Date();
+      $('liveModel').textContent = h.model || '—';
+      $('liveRag').textContent   = (h.rag_available ? 'on' : 'off');
+      $('liveMem0').textContent  = (h.mem0_enabled ? 'on' : 'off');
+      $('liveMem0Client').textContent = (h.mem0_client_ready ? 'ready' : 'off');
+
+      // tentar obter versão apenas uma vez
+      try {
+        const root = await getJSON('/');
+        $('liveVersion').textContent = (root && root.version) ? root.version : '—';
+      } catch(_) {}
+
+      $('liveWhen').textContent = now.toLocaleString();
+      $('liveKpi').innerHTML = `
+        <span class="chip ${h.rag_available?'':'warn'}">RAG: ${h.rag_available?'OK':'OFF'}</span>
+        <span class="chip ${h.mem0_enabled?'':'warn'}">Mem0: ${h.mem0_enabled?'ON':'OFF'}</span>
+        <span class="chip ${h.mem0_client_ready?'':'warn'}">Mem0 client: ${h.mem0_client_ready?'ready':'off'}</span>
+      `;
+      status.innerHTML = '<span class="ok">OK</span>';
+    } catch(e) {
+      $('liveKpi').innerHTML = '';
+      $('liveModel').textContent = '—';
+      $('liveRag').textContent = '—';
+      $('liveMem0').textContent = '—';
+      $('liveMem0Client').textContent = '—';
+      status.innerHTML = '<span class="err">Falhou</span> ' + escapeHtml(e.message);
+    }
+  }
+
+  function toggleLive(){
+    const btn = $('btnLiveToggle');
+    const intervalSec = Math.max(2, parseInt(($('liveInterval').value || '5'),10));
+    if (liveTimer) {
+      clearInterval(liveTimer); liveTimer = null;
+      btn.textContent = 'Iniciar';
+      $('liveStatus').innerHTML += ' (parado)';
+      return;
+    }
+    // arranca
+    btn.textContent = 'Parar';
+    refreshLiveNow();
+    liveTimer = setInterval(refreshLiveNow, intervalSec*1000);
+  }
+
+  // ————— Health (botão do header) —————
   async function pingHealth(){
     const el = $('healthMsg');
     el.textContent = 'a verificar...';
@@ -189,7 +266,7 @@
       const j = await getJSON('/health');
       el.innerHTML = `<span class="ok">OK</span> model=${j.model} rag=${j.rag_available?'on':'off'} mem0=${j.mem0_enabled?'on':'off'}`;
     } catch(e) {
-      el.innerHTML = `<span class="err">Falhou</span> ${e.message}`;
+      el.innerHTML = `<span class="err">Falhou</span> ${escapeHtml(e.message)}`;
     }
   }
 
@@ -199,13 +276,14 @@
     const text  = $('txtBody').value.trim();
     const namespace = ($('txtNs').value || '').trim();
     const log = $('txtLog');
-    if(!title || !text){ appendLog(log, '⚠️ Preenche título e texto.', 'warn'); return; }
-    clearLog(log); setBusy('btnText', true); appendLog(log, 'A enviar…');
+    if(!title || !text){ log.textContent=''; appendLog(log, '⚠️ Preenche título e texto.', 'warn'); return; }
+    log.textContent=''; setBusy('btnText', true); appendLog(log, 'A enviar…');
     try {
       const j = await postJSON('/rag/ingest-text', { title, text, namespace });
       appendLog(log, '✅ Ingerido: ' + JSON.stringify(j,null,2), 'ok');
     } catch(e) {
-      appendLog(log, '❌ Erro: ' + e.message, 'err');
+      const extra = e && e.payload ? '\n' + JSON.stringify(e.payload,null,2) : '';
+      appendLog(log, '❌ Erro: ' + e.message + extra, 'err');
     } finally {
       setBusy('btnText', false);
     }
@@ -217,14 +295,14 @@
     const title   = $('pdfTitle').value.trim() || null;
     const namespace = ($('pdfNs').value || '').trim();
     const log = $('pdfLog');
-    if(!pdf_url){ appendLog(log,'⚠️ Indica o URL do PDF.','warn'); return; }
-    clearLog(log); setBusy('btnPdf', true); appendLog(log, 'A descarregar e indexar…');
+    if(!pdf_url){ log.textContent=''; appendLog(log,'⚠️ Indica o URL do PDF.','warn'); return; }
+    log.textContent=''; setBusy('btnPdf', true); appendLog(log, 'A descarregar e indexar…');
     try {
-      // podes acrescentar deadline_s se quiseres: , deadline_s: 50
       const j = await postJSON('/rag/ingest-pdf-url', { pdf_url, title, namespace });
       appendLog(log, '✅ Ingerido: ' + JSON.stringify(j,null,2), 'ok');
     } catch(e) {
-      appendLog(log, '❌ Erro: ' + e.message, 'err');
+      const extra = e && e.payload ? '\n' + JSON.stringify(e.payload,null,2) : '';
+      appendLog(log, '❌ Erro: ' + e.message + extra, 'err');
     } finally {
       setBusy('btnPdf', false);
     }
@@ -237,11 +315,10 @@
     const max_pages   = parseInt($('sitemapMax').value || '60', 10);
     const verbose     = $('sitemapVerbose').checked;
     const log = $('sitemapLog');
-    if(!sitemap_url){ appendLog(log, '⚠️ Indica a URL do sitemap ou homepage.', 'warn'); return; }
-    clearLog(log); setBusy('btnSitemap', true); appendLog(log, 'A processar sitemap…'); startTimer('smap', log, 'a processar…');
+    if(!sitemap_url){ log.textContent=''; appendLog(log, '⚠️ Indica a URL do sitemap ou homepage.', 'warn'); return; }
+    log.textContent=''; setBusy('btnSitemap', true); appendLog(log, 'A processar sitemap…'); startTimer('smap', log, 'a processar…');
     try {
       const body = { sitemap_url, namespace, max_pages, deadline_s: 50 };
-      // o backend só usa progress_cb se implementares; se não, ignore.
       if (verbose) body.verbose = true;
       const j = await postJSON('/rag/ingest-sitemap', body);
       stopTimer('smap', log);
@@ -254,7 +331,8 @@
       appendLog(log, 'Resposta completa:\n' + JSON.stringify(j,null,2), 'small');
     } catch(e) {
       stopTimer('smap', log);
-      appendLog(log, '❌ Erro: ' + e.message, 'err');
+      const extra = e && e.payload ? '\n' + JSON.stringify(e.payload,null,2) : '';
+      appendLog(log, '❌ Erro: ' + e.message + extra, 'err');
     } finally {
       setBusy('btnSitemap', false);
     }
@@ -268,8 +346,8 @@
     const max_depth = parseInt($('crawlMaxDepth').value || '2', 10);
     const verbose   = $('crawlVerbose').checked;
     const log = $('crawlLog');
-    if(!seed_url){ appendLog(log, '⚠️ Indica a seed URL.', 'warn'); return; }
-    clearLog(log); setBusy('btnCrawl', true); appendLog(log, 'A rastrear…'); startTimer('crawl', log, 'a rastrear…');
+    if(!seed_url){ log.textContent=''; appendLog(log, '⚠️ Indica a seed URL.', 'warn'); return; }
+    log.textContent=''; setBusy('btnCrawl', true); appendLog(log, 'A rastrear…'); startTimer('crawl', log, 'a rastrear…');
     try {
       const body = { seed_url, namespace, max_pages, max_depth, deadline_s: 50 };
       if (verbose) body.verbose = true;
@@ -284,7 +362,8 @@
       appendLog(log, 'Resposta completa:\n' + JSON.stringify(j,null,2), 'small');
     } catch(e) {
       stopTimer('crawl', log);
-      appendLog(log, '❌ Erro: ' + e.message, 'err');
+      const extra = e && e.payload ? '\n' + JSON.stringify(e.payload,null,2) : '';
+      appendLog(log, '❌ Erro: ' + e.message + extra, 'err');
     } finally {
       setBusy('btnCrawl', false);
     }
@@ -297,7 +376,7 @@
     const top_k = parseInt($('topK').value || '6', 10);
     const kpi = $('searchKpi');
     const out = $('searchResults');
-    if(!q){ out.innerHTML = '<div class="small">Escreve uma query.</div>'; return; }
+    if(!q){ out.innerHTML = '<div class="small">Sem query.</div>'; return; }
     kpi.textContent = 'a procurar…'; out.innerHTML = '';
     try {
       const qp = new URLSearchParams({ q, namespace: ns, top_k: String(top_k) }).toString();
@@ -326,6 +405,8 @@
   (function init(){
     const saved = localStorage.getItem('alma_base_url');
     if(saved) $('baseUrl').value = saved;
+    // arranca painel Live em modo parado; se quiseres auto-start:
+    // toggleLive();
   })();
 </script>
 </body>
