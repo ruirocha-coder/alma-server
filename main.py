@@ -614,24 +614,48 @@ def heygen_token():
 # RAG Endpoints (crawl, sitemap, url, text, pdf, search POST)
 # -----------------------------------------------------------------------------
 
-
 @app.post("/rag/crawl")
 async def rag_crawl(request: Request):
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
     try:
         data = await request.json()
-        seed_url  = (data.get("seed_url") or "").strip()
-        namespace = (data.get("namespace") or "default").strip()
-        max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
-        max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
+        seed_url   = (data.get("seed_url") or "").strip()
+        namespace  = (data.get("namespace") or "default").strip()
+        max_pages  = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
+        max_depth  = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
         deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
+        verbose    = bool(data.get("verbose") or False)
         if not seed_url:
             return {"ok": False, "error": "Falta seed_url"}
-        return crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages,
-                                max_depth=max_depth, deadline_s=deadline_s)
+
+        events = []
+        def _progress(ev):
+            if verbose:
+                # corta payload para não rebentar a resposta
+                slim = dict(ev)
+                txt = str(slim.get("url",""))
+                if len(txt) > 160:
+                    slim["url"] = txt[:157] + "..."
+                events.append(slim)
+                # hard cap a 500 eventos
+                if len(events) > 500:
+                    events.pop(0)
+
+        res = crawl_and_ingest(
+            seed_url, namespace=namespace, max_pages=max_pages,
+            max_depth=max_depth, deadline_s=deadline_s, progress_cb=_progress
+        )
+        if verbose:
+            res["events"] = events
+        res["ok"] = True if res.get("ok", True) else False
+        return res
     except Exception as e:
-        return {"ok": False, "error": "crawl_failed", "detail": str(e)}
+        log.exception("crawl_failed")
+        tb = traceback.format_exc(limit=3)
+        return {"ok": False, "error": "crawl_failed", "detail": str(e), "trace": tb}
+
+
 
 
 @app.post("/rag/ingest-sitemap")
