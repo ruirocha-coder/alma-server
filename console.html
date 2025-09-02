@@ -92,6 +92,26 @@
     </div>
 
     <div class="card">
+      <h2>Ingestão — Sitemap</h2>
+      <label>URL do Sitemap <span class="small">(ex.: https://boasafra.pt/sitemap_index.xml ou a homepage)</span></label>
+      <input id="sitemapUrl" placeholder="https://seusite.com/sitemap.xml ou https://seusite.com" />
+      <div class="row">
+        <div style="flex:1">
+          <label>Namespace</label>
+          <input id="sitemapNs" placeholder="(vazio = default)" />
+        </div>
+        <div style="width:160px">
+          <label>Max páginas</label>
+          <input id="sitemapMax" type="number" min="1" value="60" />
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="btnSitemap" onclick="ingestSitemap()">Ingerir via Sitemap</button>
+      </div>
+      <div id="sitemapLog" class="log"></div>
+    </div>
+
+    <div class="card">
       <h2>Crawler — Site</h2>
       <label>Seed URL (mesmo domínio)</label>
       <input id="crawlUrl" placeholder="https://www.seusite.com" />
@@ -139,6 +159,11 @@
     const savedNs   = localStorage.getItem('alma_default_ns');
     $('baseUrl').value = savedBase || window.location.origin;
     $('defaultNamespace').value = savedNs || 'alma';
+    // auto-fill child fields on first load
+    ['txtNs','pdfNs','crawlNs','searchNs','sitemapNs'].forEach(id=>{
+      const el=$(id); if(!el) return;
+      if(!el.value) el.value = defaultNs();
+    });
   }
   function currentBase() {
     return ($('baseUrl').value || window.location.origin).replace(/\/+$/,'');
@@ -172,6 +197,11 @@
       body: JSON.stringify(body || {})
     });
     const json = await res.json().catch(()=> ({}));
+    // mesmo com 200, assinala erro lógico
+    if(json && json.ok === false){
+      const msg = json.error || json.detail || 'Erro lógico da API';
+      throw new Error(msg);
+    }
     if(!res.ok) throw new Error(json.error || res.statusText || 'HTTP error');
     return json;
   }
@@ -179,6 +209,10 @@
     const url = currentBase() + pathWithQuery;
     const res = await fetch(url);
     const json = await res.json().catch(()=> ({}));
+    if(json && json.ok === false){
+      const msg = json.error || json.detail || 'Erro lógico da API';
+      throw new Error(msg);
+    }
     if(!res.ok) throw new Error(json.error || res.statusText || 'HTTP error');
     return json;
   }
@@ -193,7 +227,7 @@
     b.textContent = busy ? 'A processar...' : b.dataset.label || b.textContent;
   }
   // preserve original labels
-  ['btnText','btnPdf','btnCrawl'].forEach(id => {
+  ['btnText','btnPdf','btnCrawl','btnSitemap'].forEach(id => {
     const el = $(id); if(el) el.dataset.label = el.textContent;
   });
 
@@ -206,8 +240,8 @@
     if(!title || !text){ log.textContent = '⚠️ Preenche título e texto.'; return; }
     setBusy('btnText', true); log.textContent = 'A enviar...';
     try {
-      const j = await postJSON('/rag/ingest_text', { title, text, namespace });
-      log.textContent = '✅ Ingerido: ' + JSON.stringify(j, null, 2);
+      const j = await postJSON('/rag/ingest-text', { title, text, namespace });
+      log.textContent = '✅ Ingerido:\n' + JSON.stringify(j, null, 2);
     } catch(e) {
       log.textContent = '❌ Erro: ' + e.message;
     } finally {
@@ -223,12 +257,29 @@
     if(!pdf_url){ log.textContent = '⚠️ Indica o URL do PDF.'; return; }
     setBusy('btnPdf', true); log.textContent = 'A descarregar e indexar...';
     try {
-      const j = await postJSON('/rag/ingest_pdf', { pdf_url, title, namespace });
-      log.textContent = '✅ Ingerido: ' + JSON.stringify(j, null, 2);
+      const j = await postJSON('/rag/ingest-pdf-url', { pdf_url, title, namespace });
+      log.textContent = '✅ Ingerido:\n' + JSON.stringify(j, null, 2);
     } catch(e) {
       log.textContent = '❌ Erro: ' + e.message;
     } finally {
       setBusy('btnPdf', false);
+    }
+  }
+
+  async function ingestSitemap() {
+    const sitemap_url = $('sitemapUrl').value.trim();
+    const namespace   = nsOrDefault('sitemapNs');
+    const max_pages   = parseInt($('sitemapMax').value || '60',10);
+    const log = $('sitemapLog');
+    if(!sitemap_url){ log.textContent = '⚠️ Indica o URL do sitemap (ou a homepage).'; return; }
+    setBusy('btnSitemap', true); log.textContent = 'A recolher URLs e indexar...';
+    try {
+      const j = await postJSON('/rag/ingest-sitemap', { sitemap_url, namespace, max_pages });
+      log.textContent = '✅ Concluído:\n' + JSON.stringify(j, null, 2);
+    } catch(e) {
+      log.textContent = '❌ Erro: ' + e.message;
+    } finally {
+      setBusy('btnSitemap', false);
     }
   }
 
@@ -242,7 +293,7 @@
     setBusy('btnCrawl', true); log.textContent = 'A rastrear...';
     try {
       const j = await postJSON('/rag/crawl', { seed_url, namespace, max_pages, max_depth });
-      log.textContent = '✅ Concluído: ' + JSON.stringify(j, null, 2);
+      log.textContent = '✅ Concluído:\n' + JSON.stringify(j, null, 2);
     } catch(e) {
       log.textContent = '❌ Erro: ' + e.message;
     } finally {
@@ -259,10 +310,9 @@
     if(!q){ out.innerHTML = '<div class="small">Escreve uma query.</div>'; return; }
     kpi.textContent = 'A procurar...'; out.innerHTML = '';
     try {
-      // Preferimos GET para maior compatibilidade
       const qp = new URLSearchParams({ q, namespace: ns, top_k: String(top_k) }).toString();
       const j = await getJSON('/rag/search?' + qp);
-      const hits = j.matches || j.hits || j || [];
+      const hits = j.matches || j.hits || [];
       kpi.innerHTML = `<span class="chip">Top-K: ${top_k}</span><span class="chip">Devolvidos: ${hits.length}</span><span class="chip">Namespace: ${ns}</span>`;
       if(!hits.length){ out.innerHTML = '<div class="small">Sem resultados.</div>'; return; }
       out.innerHTML = hits.map(h => {
@@ -271,24 +321,19 @@
         const s = (typeof h.score === 'number') ? `score ${h.score.toFixed(3)}` : '';
         const text = (h.text || '').slice(0, 600);
         return `<div class="result">
-          <div class="head"><strong>${t}</strong><span class="small">${u}</span><span class="small">${s}</span></div>
-          <div class="small">${h.type || ''} • ${h.namespace || ''}</div>
+          <div class="head"><strong>${escapeHtml(t)}</strong><span class="small">${u}</span><span class="small">${s}</span></div>
+          <div class="small">${escapeHtml(h.type || '')} • ${escapeHtml(h.namespace || '')}</div>
           <div style="margin-top:6px">${escapeHtml(text)}${(h.text||'').length>600?'…':''}</div>
         </div>`;
       }).join('');
     } catch(e) {
-      kpi.innerHTML = ''; out.innerHTML = `<div class="err">Erro: ${e.message}</div>`;
+      kpi.innerHTML = ''; out.innerHTML = `<div class="err">Erro: ${escapeHtml(e.message)}</div>`;
     }
   }
 
   function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
 
   loadConfig();
-  // auto-fill children namespaces when empty
-  ['txtNs','pdfNs','crawlNs','searchNs'].forEach(id=>{
-    const el=$(id); if(!el) return;
-    if(!el.value) el.value = defaultNs();
-  });
 </script>
 </body>
 </html>
