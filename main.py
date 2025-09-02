@@ -1,6 +1,9 @@
-# main.py — Alma Server (clean-1 + Memória Contextual + RAG) com Mem0 (curto prazo) + Grok (x.ai) + D-ID + HeyGen
+# main.py — Alma Server (clean-1 + Memória Contextual + RAG)
+# Grok (x.ai) + Mem0 (curto prazo) + D-ID + HeyGen + RAG/Qdrant
+# -----------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 import os
 import requests
 import logging
@@ -9,17 +12,48 @@ import time
 import re
 from typing import Dict, List, Tuple
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# FastAPI & CORS (CRIA A APP PRIMEIRO!)
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Alma Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
 # Config geral / Logging
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-2")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# RAG: imports e preparação (usa rag_client.py do projeto)
+# -----------------------------------------------------------------------------
+try:
+    from rag_client import (
+        ingest_text, ingest_pdf_url, ingest_url,
+        crawl_and_ingest, ingest_sitemap,
+        search_chunks, build_context_block
+    )
+    RAG_READY = True
+    log.info("[rag] rag_client import OK")
+except Exception as e:
+    RAG_READY = False
+    log.warning(f"[rag] a importar rag_client falhou: {e}")
+
+# Estes 3 são usados noutras rotas (GET /rag/search, /ask, /ask_get)
+RAG_AVAILABLE = RAG_READY
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
+RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
+DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None  # ex: "boasafra"
+
+# -----------------------------------------------------------------------------
 # Mem0 (curto prazo) — tenta importar como 'mem0ai' OU 'mem0'
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = (os.getenv("MEM0_API_KEY") or "").strip()
 
@@ -53,12 +87,12 @@ if MEM0_ENABLE:
                 log.error(f"[mem0] não inicializou: {e}")
                 mem0_client = None
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Fallback local (se Mem0 off ou falhar) — curto prazo + FACTs
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # NOTA: isto não é persistente; apenas vive no processo.
-LOCAL_FACTS: Dict[str, Dict[str, str]] = {}        # user_id -> {key: value}
-LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}  # user_id -> [(question, answer), ...]
+LOCAL_FACTS: Dict[str, Dict[str, str]] = {}            # user_id -> {key: value}
+LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}   # user_id -> [(question, answer), ...]
 
 def local_set_fact(user_id: str, key: str, value: str):
     LOCAL_FACTS.setdefault(user_id, {})
@@ -85,63 +119,13 @@ def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
         out.append(f"Alma: {a}")
     return out[:limit]
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Config Grok (x.ai)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config D-ID (texto→vídeo de lábios)
-# ─────────────────────────────────────────────────────────────────────────────
-DID_API_KEY = os.getenv("DID_API_KEY", "").strip()
-DEFAULT_IMAGE_URL = os.getenv("DEFAULT_IMAGE_URL", "").strip()
-DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "pt-PT-FernandaNeural").strip()
-DID_BASE = "https://api.d-id.com"
-
-def did_headers():
-    h = {"Content-Type": "application/json"}
-    if DID_API_KEY:
-        h["Authorization"] = f"Basic {DID_API_KEY}"
-        h["x-api-key"] = DID_API_KEY
-    return h
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Config HeyGen (token demo)
-# ─────────────────────────────────────────────────────────────────────────────
-HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RAG (Qdrant) — busca e montagem de contexto externo
-# ─────────────────────────────────────────────────────────────────────────────
-# Espera-se que exista um rag_client.py no projeto com:
-#   - search_chunks(query, namespace=None, top_k=6) -> List[dict]
-#   - build_context_block(hits, token_budget=1600) -> str
-try:
-    from rag_client import search_chunks, build_context_block
-    RAG_AVAILABLE = True
-except Exception as _e:
-    log.warning(f"[rag] rag_client não disponível: {_e}")
-    RAG_AVAILABLE = False
-
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
-RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
-DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None  # ex: "almadata"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI & CORS
-# ─────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Alma Server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers: Grok
-# ─────────────────────────────────────────────────────────────────────────────
 def grok_chat(messages, timeout=30):
     if not XAI_API_KEY:
         raise RuntimeError("Falta XAI_API_KEY")
@@ -152,14 +136,13 @@ def grok_chat(messages, timeout=30):
     r.raise_for_status()
     return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers: Mem0 curto prazo (search/create)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def mem0_search(user_id: str, query: str, limit: int = 5) -> List[str]:
     """Busca memórias relevantes (curto prazo) do utilizador."""
     if not (MEM0_ENABLE and mem0_client):
         return local_search_snippets(user_id, limit=limit)
-
     try:
         results = mem0_client.memories.search(query=query or "contexto", user_id=user_id, limit=limit)
         snippets = []
@@ -193,9 +176,9 @@ def mem0_append_dialog(user_id: str, question: str, answer: str):
     except Exception as e:
         log.warning(f"[mem0] create falhou: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Memória Contextual (FACTs) — deteção, guardar e recuperar
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 FACT_PREFIX = "FACT|"
 
 # Regras simples para PT-PT: nome, localização, preferências/estilo, divisão/projeto
@@ -204,20 +187,17 @@ NAME_PATTERNS = [
     r"\bo\s+meu\s+nome\s+é\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
     r"\bsou\s+(?:o|a)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
 ]
-
 CITY_PATTERNS = [
     r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
     r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
     r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
 ]
-
 PREF_PATTERNS = [
     r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
     r"\bprefiro\s+([^\.]{3,80})",
     r"\badoro\s+([^\.]{3,80})",
     r"\bquero\s+([^\.]{3,80})",  # intenção
 ]
-
 ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", "escritório", "hall", "entrada", "lavandaria"]
 
 def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
@@ -229,7 +209,6 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
             name = m.group(1).strip()
-            # evitar falsos positivos do tipo "sou o melhor..."
             if len(name.split()) == 1 and name.lower() in {"melhor", "pior", "arquiteto", "cliente"}:
                 pass
             else:
@@ -240,7 +219,6 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
             city = m.group(1).strip(" .,'\"").title()
-            # reduzir barulho
             if 2 <= len(city) <= 60:
                 facts["location"] = city
                 break
@@ -255,11 +233,11 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
     # divisão/projeto (tags simples)
     for kw in ROOM_KEYWORDS:
         if re.search(rf"\b{re.escape(kw)}\b", t, flags=re.IGNORECASE):
-            facts["room"] = kw  # ultima ocorrência prevalece
+            facts["room"] = kw
     return facts
 
 def mem0_set_fact(user_id: str, key: str, value: str):
-    """Guarda/atualiza um FACT (perfil). Conteúdo em formato simples 'FACT|key=value' para facilitar search."""
+    """Guarda/atualiza um FACT (perfil)."""
     local_set_fact(user_id, key, value)
     if not (MEM0_ENABLE and mem0_client):
         return
@@ -305,15 +283,34 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
         lines.append(f"- Divisão/Projeto: {facts['room']}")
     if "preferences" in facts:
         lines.append(f"- Preferências: {facts['preferences']}")
-    # quaisquer outros FACTs
     for k, v in facts.items():
         if k not in {"name", "location", "room", "preferences"}:
             lines.append(f"- {k}: {v}")
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rotas
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Config D-ID (texto→vídeo de lábios)
+# -----------------------------------------------------------------------------
+DID_API_KEY = os.getenv("DID_API_KEY", "").strip()
+DEFAULT_IMAGE_URL = os.getenv("DEFAULT_IMAGE_URL", "").strip()
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "pt-PT-FernandaNeural").strip()
+DID_BASE = "https://api.d-id.com"
+
+def did_headers():
+    h = {"Content-Type": "application/json"}
+    if DID_API_KEY:
+        h["Authorization"] = f"Basic {DID_API_KEY}"
+        h["x-api-key"] = DID_API_KEY
+    return h
+
+# -----------------------------------------------------------------------------
+# Config HeyGen (token demo)
+# -----------------------------------------------------------------------------
+HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
+
+# -----------------------------------------------------------------------------
+# ROTAS BÁSICAS / STATUS
+# -----------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
@@ -331,7 +328,13 @@ def root():
             "heygen_token": "POST /heygen/token",
             "mem_facts": "/mem/facts?user_id=...",
             "mem_search": "/mem/search?user_id=...&q=...",
-            "rag_search": "/rag/search?q=...&namespace=..."
+            "rag_search_get": "/rag/search?q=...&namespace=...",
+            "rag_crawl": "POST /rag/crawl",
+            "rag_ingest_sitemap": "POST /rag/ingest-sitemap",
+            "rag_ingest_url": "POST /rag/ingest-url",
+            "rag_ingest_text": "POST /rag/ingest-text",
+            "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
+            "rag_search_post": "POST /rag/search {query, namespace?, top_k?}"
         }
     }
 
@@ -359,23 +362,26 @@ def ping_grok():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# Inspeção de memória contextual (FACTs)
+# -----------------------------------------------------------------------------
+# Memória contextual (FACTs) e Mem0 debug
+# -----------------------------------------------------------------------------
 @app.get("/mem/facts")
 def mem_facts(user_id: str = "anon"):
     facts = mem0_get_facts(user_id=user_id, limit=50)
     return {"user_id": user_id, "facts": facts}
 
-# Search livre no Mem0/Histórico (debug)
 @app.get("/mem/search")
-def mem_search(q: str = "", user_id: str = "anon"):
+def mem_search_route(q: str = "", user_id: str = "anon"):
     if not q:
         return {"user_id": user_id, "found": 0, "snippets": []}
     snippets = mem0_search(user_id=user_id, query=q, limit=10)
     return {"user_id": user_id, "found": len(snippets), "snippets": snippets}
 
-# RAG: debug/inspeção
+# -----------------------------------------------------------------------------
+# RAG: GET /rag/search (debug/inspeção rápida)
+# -----------------------------------------------------------------------------
 @app.get("/rag/search")
-def rag_search(q: str, namespace: str = None, top_k: int = None):
+def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     if not RAG_AVAILABLE:
         return {"ok": False, "error": "rag_client indisponível no servidor"}
     try:
@@ -384,9 +390,22 @@ def rag_search(q: str, namespace: str = None, top_k: int = None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# -----------------------------------------------------------------------------
+# Console HTML (UI para ingestão/testes RAG)
+# -----------------------------------------------------------------------------
+@app.get("/console", response_class=HTMLResponse)
+def serve_console():
+    try:
+        with open("console.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
+
+# -----------------------------------------------------------------------------
+# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo + Memória Contextual + RAG
+# -----------------------------------------------------------------------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon"):
-    # wrapper GET para testar rápido no browser
     if not q:
         return {"answer": "Falta query param ?q="}
 
@@ -417,11 +436,9 @@ def ask_get(q: str = "", user_id: str = "anon"):
         except Exception:
             rag_block = ""
 
-    # 3) Mensagens para Grok (ordem: persona -> FACTs -> RAG -> curto prazo -> user)
-    messages = [{
-        "role": "system",
-        "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
-    }]
+    # 3) Mensagens para Grok
+    messages = [{"role": "system",
+                 "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."}]
     if facts_block:
         messages.append({"role": "system", "content": facts_block})
     if rag_block:
@@ -446,7 +463,6 @@ def ask_get(q: str = "", user_id: str = "anon"):
         "rag": {"used": bool(rag_block), "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE}
     }
 
-# IA: Pergunta → Resposta (Grok-4) + Mem0 curto prazo + Memória Contextual + RAG
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
@@ -457,22 +473,22 @@ async def ask(request: Request):
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
 
-    # 0) Deteção e armazenamento de FACTs (do enunciado atual)
+    # 0) FACTs
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 1) Carregar FACTs (perfil contextual)
+    # 1) FACTs existentes
     facts = mem0_get_facts(user_id)
     facts_block = facts_to_context_block(facts)
 
-    # 2) Contexto curto prazo
+    # 2) curto prazo
     snippets = mem0_search(user_id=user_id, query=question, limit=5)
     memory_block = ""
     if snippets:
         memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in snippets[:3])
 
-    # 2.5) RAG: conhecimento externo (docs internos no Qdrant)
+    # 2.5) RAG
     rag_block = ""
     if RAG_AVAILABLE:
         try:
@@ -484,11 +500,9 @@ async def ask(request: Request):
         except Exception:
             rag_block = ""
 
-    # 3) Mensagens para Grok (ordem: persona -> FACTs -> RAG -> curto prazo -> user)
-    messages = [{
-        "role": "system",
-        "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
-    }]
+    # 3) Mensagens para Grok
+    messages = [{"role": "system",
+                 "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."}]
     if facts_block:
         messages.append({"role": "system", "content": facts_block})
     if rag_block:
@@ -514,7 +528,9 @@ async def ask(request: Request):
         "rag": {"used": bool(rag_block), "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE}
     }
 
+# -----------------------------------------------------------------------------
 # D-ID: Texto → Vídeo (lábios)
+# -----------------------------------------------------------------------------
 @app.post("/say")
 async def say(request: Request):
     if not DID_API_KEY:
@@ -570,86 +586,9 @@ async def say(request: Request):
 
     return {"video_url": result_url}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Console HTML (UI para ingestão/testes RAG)
-# ─────────────────────────────────────────────────────────────────────────────
-from fastapi.responses import HTMLResponse
-
-@app.get("/console", response_class=HTMLResponse)
-def serve_console():
-    try:
-        with open("console.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RAG Endpoints (crawl, ingest, search)
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    from rag_client import (
-        ingest_text, ingest_pdf_url, crawl_and_ingest,
-        search_chunks, build_context_block
-    )
-    RAG_READY = True
-    log.info("[rag] endpoints prontos")
-except Exception as e:
-    RAG_READY = False
-    log.warning(f"[rag] a importar falhou: {e}")
-
-@app.post("/rag/crawl")
-async def rag_crawl(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    data = await request.json()
-    seed_url  = (data.get("seed_url") or "").strip()
-    namespace = (data.get("namespace") or "default").strip()
-    max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "30"))
-    max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
-    if not seed_url:
-        return {"ok": False, "error": "Falta seed_url"}
-    res = crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
-    return res
-
-@app.post("/rag/ingest-text")
-async def rag_ingest_text(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    data = await request.json()
-    title     = (data.get("title") or "").strip()
-    text      = (data.get("text") or "").strip()
-    namespace = (data.get("namespace") or "default").strip()
-    if not title or not text:
-        return {"ok": False, "error": "Falta title ou text"}
-    return ingest_text(title=title, text=text, namespace=namespace)
-
-@app.post("/rag/ingest-pdf-url")
-async def rag_ingest_pdf_url(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    data = await request.json()
-    pdf_url  = (data.get("pdf_url") or "").strip()
-    title    = (data.get("title") or None)
-    namespace = (data.get("namespace") or "default").strip()
-    if not pdf_url:
-        return {"ok": False, "error": "Falta pdf_url"}
-    return ingest_pdf_url(pdf_url=pdf_url, title=title, namespace=namespace)
-
-@app.post("/rag/search")
-async def rag_search(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    data = await request.json()
-    query     = (data.get("query") or "").strip()
-    namespace = (data.get("namespace") or None)
-    top_k     = int(data.get("top_k") or os.getenv("RAG_TOP_K", "6"))
-    matches = search_chunks(query=query, namespace=namespace, top_k=top_k)
-    ctx = build_context_block(matches)
-    return {"ok": True, "matches": matches, "context_block": ctx}
-
-
-
+# -----------------------------------------------------------------------------
 # HeyGen token demo
+# -----------------------------------------------------------------------------
 @app.post("/heygen/token")
 def heygen_token():
     if not HEYGEN_API_KEY:
@@ -671,8 +610,107 @@ def heygen_token():
     except Exception as e:
         return {"error": str(e)}
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST)
+# -----------------------------------------------------------------------------
+@app.post("/rag/crawl")
+async def rag_crawl(request: Request):
+    """Crawl básico (BFS) a partir de uma seed_url (sem 500 — devolve erro no JSON)."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        seed_url  = (data.get("seed_url") or "").strip()
+        namespace = (data.get("namespace") or "default").strip()
+        max_pages = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
+        max_depth = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
+        if not seed_url:
+            return {"ok": False, "error": "Falta seed_url"}
+        return crawl_and_ingest(seed_url, namespace=namespace, max_pages=max_pages, max_depth=max_depth)
+    except Exception as e:
+        return {"ok": False, "error": "crawl_failed", "detail": str(e)}
+
+@app.post("/rag/ingest-sitemap")
+async def rag_ingest_sitemap_route(request: Request):
+    """Lê sitemaps (WordPress e outros). Aceita sitemap_url ou site_url."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        sitemap_url = (data.get("sitemap_url") or data.get("site_url") or "").strip()
+        namespace   = (data.get("namespace") or "default").strip()
+        max_pages   = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
+        if not sitemap_url:
+            return {"ok": False, "error": "Falta sitemap_url/site_url"}
+        return ingest_sitemap(sitemap_url, namespace=namespace, max_pages=max_pages)
+    except Exception as e:
+        return {"ok": False, "error": "sitemap_failed", "detail": str(e)}
+
+@app.post("/rag/ingest-url")
+async def rag_ingest_url_route(request: Request):
+    """Ingest de uma página única (URL)."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        page_url  = (data.get("page_url") or "").strip()
+        namespace = (data.get("namespace") or "default").strip()
+        if not page_url:
+            return {"ok": False, "error": "Falta page_url"}
+        return ingest_url(page_url, namespace=namespace)
+    except Exception as e:
+        return {"ok": False, "error": "ingest_url_failed", "detail": str(e)}
+
+@app.post("/rag/ingest-text")
+async def rag_ingest_text_route(request: Request):
+    """Ingest de texto puro (blocos/notes)."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        title     = (data.get("title") or "").strip()
+        text      = (data.get("text") or "").strip()
+        namespace = (data.get("namespace") or "default").strip()
+        if not title or not text:
+            return {"ok": False, "error": "Falta title ou text"}
+        return ingest_text(title=title, text=text, namespace=namespace)
+    except Exception as e:
+        return {"ok": False, "error": "ingest_text_failed", "detail": str(e)}
+
+@app.post("/rag/ingest-pdf-url")
+async def rag_ingest_pdf_url_route(request: Request):
+    """Ingest de um PDF remoto (por URL)."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        pdf_url  = (data.get("pdf_url") or "").strip()
+        title    = (data.get("title") or None)
+        namespace = (data.get("namespace") or "default").strip()
+        if not pdf_url:
+            return {"ok": False, "error": "Falta pdf_url"}
+        return ingest_pdf_url(pdf_url=pdf_url, title=title, namespace=namespace)
+    except Exception as e:
+        return {"ok": False, "error": "ingest_pdf_failed", "detail": str(e)}
+
+@app.post("/rag/search")
+async def rag_search_post(request: Request):
+    """Pesquisa vetorial no Qdrant + bloco de contexto pronto a injectar no LLM."""
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG não disponível"}
+    try:
+        data = await request.json()
+        query     = (data.get("query") or "").strip()
+        namespace = (data.get("namespace") or None)
+        top_k     = int(data.get("top_k") or os.getenv("RAG_TOP_K", "6"))
+        matches = search_chunks(query=query, namespace=namespace, top_k=top_k)
+        ctx = build_context_block(matches)
+        return {"ok": True, "matches": matches, "context_block": ctx}
+    except Exception as e:
+        return {"ok": False, "error": "search_failed", "detail": str(e)}
+
+# -----------------------------------------------------------------------------
 # Local run
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
