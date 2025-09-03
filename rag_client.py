@@ -12,16 +12,15 @@ from openai import OpenAI
 QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_rag")
-OPENAI_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-large")  # 1536D
+OPENAI_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # default → 1536D
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
 TIMEOUT_FETCH_S   = int(os.getenv("FETCH_TIMEOUT_S", "20"))
 
-# Qdrant expected dim for text-embedding-3-large: 1536
+# Dimensões reais dos modelos OpenAI
 MODEL_DIMS = {
-    "text-embedding-3-large": 1536,
-    "text-embedding-3-small": 1536,  # também 1536
-    # adiciona aqui se mudares de modelo
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
 
@@ -34,9 +33,7 @@ def ensure_collection(dim: int = VECTOR_SIZE):
     """Cria (se não existir) a collection com a dimensão pedida."""
     try:
         info = qdrant.get_collection(QDRANT_COLLECTION)
-        # Verifica dimensão existente
         cfg = info.config
-        # qdrant_client>=1.7: vectors_config.config
         existing_dim = None
         if cfg and cfg.vectors_config:
             vc = cfg.vectors_config
@@ -47,12 +44,12 @@ def ensure_collection(dim: int = VECTOR_SIZE):
         if existing_dim and existing_dim != dim:
             raise RuntimeError(
                 f"Qdrant collection '{QDRANT_COLLECTION}' tem dim={existing_dim}, "
-                f"mas o modelo produz dim={dim}. Apaga a collection ou cria outra "
-                f"(env QDRANT_COLLECTION) para coincidir."
+                f"mas o modelo {OPENAI_MODEL} produz dim={dim}. "
+                f"Apaga a collection ou define QDRANT_COLLECTION para outra."
             )
         return
     except Exception:
-        # Cria nova
+        # Cria nova coleção se não existir
         qdrant.create_collection(
             collection_name=QDRANT_COLLECTION,
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
@@ -111,11 +108,10 @@ def _chunk_text(text: str, max_tokens: int = 450) -> List[str]:
     return parts
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    """Embeddings com OpenAI — devolve lista de vetores 1536D."""
+    """Embeddings com OpenAI — devolve lista de vetores na dimensão correta."""
     if not texts:
         return []
     resp = openai_client.embeddings.create(model=OPENAI_MODEL, input=texts)
-    # Respeita a ordem do input
     return [d.embedding for d in resp.data]
 
 # ---------------------- Núcleo de ingest ----------------------------
@@ -131,7 +127,6 @@ def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
             vector=v,
             payload={"url": url, "title": title, "text": c, "namespace": namespace}
         ))
-    # upsert em batches
     total = 0
     for i in range(0, len(points), UPSERT_BATCH):
         qdrant.upsert(collection_name=QDRANT_COLLECTION, points=points[i:i+UPSERT_BATCH])
@@ -214,11 +209,9 @@ def crawl_and_ingest(seed_url: str, namespace: str = "default",
         title = (soup.title.string if soup.title else url).strip()
         text = soup.get_text(" ", strip=True)
         ok_chunks += _ingest(namespace, url, title, text)
-        # próximos links (mesmo domínio)
         for a in soup.find_all("a", href=True):
             nxt = urljoin(url, a["href"])
             nxt = _clean_url(nxt)
-            # mantém no mesmo domínio
             if urlsplit(nxt).netloc != urlsplit(start).netloc:
                 continue
             if nxt not in seen and _url_allowed(nxt):
@@ -232,7 +225,6 @@ def search_chunks(query: str, namespace: Optional[str] = None, top_k: int = 6):
         key="namespace", match=qm.MatchValue(value=namespace or "default")
     )])
     res = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=vec, limit=top_k, query_filter=flt)
-    # devolve payload + score
     out = []
     for m in res:
         p = dict(m.payload or {})
