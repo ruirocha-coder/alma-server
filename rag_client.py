@@ -93,10 +93,13 @@ def _chunk_text(text: str, max_words: int = 220) -> List[str]:
         parts.append(". ".join(buf) + ".")
     return parts
 
-def _embed_texts(texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    return embedder.encode(texts, convert_to_numpy=False).tolist()
+def _embed_texts(texts: list[str]):
+    # Garante numpy -> list, mesmo que a lib mude o default
+    return embedder.encode(
+        texts,
+        convert_to_numpy=True,      # força ndarray
+        normalize_embeddings=False  # deixa o Qdrant fazer COSINE
+    ).tolist()
 
 def _ingest(namespace: str, url: str, title: str, text: str) -> int:
     ensure_collection()
