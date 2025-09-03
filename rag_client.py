@@ -1,105 +1,169 @@
-import os
-import re
-import uuid
-import httpx
-from typing import List, Dict, Any
+# rag_client.py — OpenAI embeddings (1536D) + Qdrant + crawler/sitemap
+# -------------------------------------------------------------------
+import os, time, uuid, requests
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit, urljoin
 from bs4 import BeautifulSoup
-
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
-
+from qdrant_client.http import models as qm
 from openai import OpenAI
 
-# ========================= Config =========================
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_KEY = os.getenv("QDRANT_API_KEY")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+# =========================== Config ================================
+QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs")   # <== nome default consistente
+OPENAI_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536D
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
+FETCH_TIMEOUT_S   = int(os.getenv("FETCH_TIMEOUT_S", "20"))
+QDRANT_AUTO_MIGRATE = os.getenv("QDRANT_AUTO_MIGRATE", "1") == "1"  # recria coleção se dim não bater
 
-QDRANT_COLLECTION = "alma_docs"
-EMBED_MODEL = "text-embedding-3-small"  # 1536 dims
-UPSERT_BATCH = 32
+# Dimensões por modelo (ambos 1536 nas versões atuais)
+MODEL_DIMS = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 1536,
+}
+VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
 
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_KEY)
-openai_client = OpenAI(api_key=OPENAI_KEY)
+# ========================= Clients ================================
+qdrant = QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
 
-# ========================= Utils =========================
+# =================== Qdrant collection ensure =====================
+def _get_existing_dim(info) -> Optional[int]:
+    try:
+        cfg = info.config
+        if not cfg:
+            return None
+        vc = cfg.vectors_config
+        if not vc:
+            return None
+        # qdrant-client >=1.7
+        if hasattr(vc, "config") and vc.config and hasattr(vc.config, "size"):
+            return vc.config.size
+        # fallback
+        if hasattr(vc, "size"):
+            return vc.size
+    except Exception:
+        return None
+    return None
+
+def ensure_collection(dim: int = VECTOR_SIZE):
+    try:
+        info = qdrant.get_collection(QDRANT_COLLECTION)
+        existing_dim = _get_existing_dim(info)
+        if existing_dim and existing_dim != dim:
+            if QDRANT_AUTO_MIGRATE:
+                # ⚠️ isto APAGA a coleção e recria com a dimensão indicada
+                qdrant.recreate_collection(
+                    collection_name=QDRANT_COLLECTION,
+                    vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+                )
+            else:
+                raise RuntimeError(
+                    f"Qdrant collection '{QDRANT_COLLECTION}' tem dim={existing_dim}, "
+                    f"mas o modelo '{OPENAI_MODEL}' produz dim={dim}. "
+                    f"Ativa QDRANT_AUTO_MIGRATE=1 ou muda QDRANT_COLLECTION."
+                )
+        # se existir e bater certo → nada a fazer
+        return
+    except Exception:
+        # Não existe → criar
+        qdrant.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
+        )
+
+ensure_collection(VECTOR_SIZE)
+
+# =================== URL helpers / filtros ========================
+DENY_PATTERNS = [
+    "/carrinho", "/checkout", "/minha-conta", "/wp-login",
+    "/feed", "/tag/", "/categoria/", "/author/", "/cart/", "/my-account/",
+]
+DENY_CONTAINS = [
+    "add-to-cart=", "orderby=", "wc-ajax", "utm_", "replytocom=", "sessionid=",
+]
+
+DEFAULT_HEADERS = {
+    "User-Agent": "alma-bot/1.0 (+https://example.com/bot) Python-requests",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+def _clean_url(u: str) -> str:
+    if not u:
+        return ""
+    p = urlsplit(u)
+    path = p.path or "/"
+    # força slash se aparenta ser diretório
+    if not path.endswith("/") and "." not in path.rsplit("/", 1)[-1]:
+        path += "/"
+    return urlunsplit((p.scheme, p.netloc, path, "", ""))
+
+def _url_allowed(u: str) -> bool:
+    low = u.lower()
+    for pat in DENY_PATTERNS:
+        if pat in low:
+            return False
+    for pat in DENY_CONTAINS:
+        if pat in low:
+            return False
+    return True
+
 def _uuid_for_chunk(namespace: str, url: str, idx: int) -> str:
-    base = f"{namespace}:{url}:{idx}"
+    base = f"{namespace}|{url}|{idx}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
 
-def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 100) -> List[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
+# =================== Texto / embeddings ===========================
+def _chunk_text(text: str, max_tokens: int = 450) -> List[str]:
+    """Split simples por frases aproximadas."""
+    parts, buf, count = [], [], 0
+    for sent in text.split(". "):
+        t = sent.strip()
+        if not t:
+            continue
+        toks = len(t.split())
+        if count + toks > max_tokens and buf:
+            parts.append(". ".join(buf))
+            buf, count = [], 0
+        buf.append(t)
+        count += toks
+    if buf:
+        parts.append(". ".join(buf))
+    return parts
+
+def _embed_texts(texts: List[str]) -> List[List[float]]:
+    if not texts:
         return []
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + max_chars
-        chunks.append(text[start:end])
-        start += max_chars - overlap
-    return chunks
+    resp = openai_client.embeddings.create(model=OPENAI_MODEL, input=texts)
+    return [d.embedding for d in resp.data]  # 1536D
 
-def _embed_texts(chunks: List[str]) -> List[List[float]]:
-    if not chunks:
-        return []
-    resp = openai_client.embeddings.create(
-        model=EMBED_MODEL,
-        input=chunks
-    )
-    return [d.embedding for d in resp.data]
-
-# ========================= Fetch HTML =========================
-def fetch_url(url: str, timeout: int = 20) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/117.0 Safari/537.36"
-        )
-    }
-    try:
-        resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        raise RuntimeError(f"fetch_failed: {e}")
-
-# ========================= Ingest =========================
-def ingest(namespace: str, url: str, title: str, full_text: str) -> int:
+# ====================== Núcleo de ingest ==========================
+def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
     chunks = _chunk_text(full_text)
     if not chunks:
         return 0
 
     vecs = _embed_texts(chunks)
-    if not vecs:
-        return 0
+    # Sanity-check de dimensão vs coleção
+    if vecs:
+        embed_dim = len(vecs[0])
+        if embed_dim != VECTOR_SIZE:
+            # Tenta alinhar coleção se for permitido
+            if QDRANT_AUTO_MIGRATE:
+                qdrant.recreate_collection(
+                    collection_name=QDRANT_COLLECTION,
+                    vectors_config=qm.VectorParams(size=embed_dim, distance=qm.Distance.COSINE),
+                )
+            else:
+                raise RuntimeError(
+                    f"Dimensão do embedding={embed_dim} difere da coleção={VECTOR_SIZE}. "
+                    f"Ativa QDRANT_AUTO_MIGRATE=1 ou recria coleção manualmente."
+                )
 
-    # garantir que a collection tem a dimensão correta
-    embed_dim = len(vecs[0])
-    try:
-        info = qdrant.get_collection(QDRANT_COLLECTION)
-        existing_dim = None
-        if info and getattr(info, "config", None):
-            vc = info.config.vectors_config
-            if hasattr(vc, "config") and getattr(vc.config, "size", None):
-                existing_dim = vc.config.size
-            elif getattr(vc, "size", None):
-                existing_dim = vc.size
-        if existing_dim and existing_dim != embed_dim:
-            qdrant.recreate_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
-            )
-    except Exception:
-        # se não existir, cria
-        qdrant.recreate_collection(
-            collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
-        )
-
-    points: List[PointStruct] = []
+    points: List[qm.PointStruct] = []
     for idx, (c, v) in enumerate(zip(chunks, vecs)):
-        points.append(PointStruct(
+        points.append(qm.PointStruct(
             id=_uuid_for_chunk(namespace, url, idx),
             vector=v,
             payload={"url": url, "title": title, "text": c, "namespace": namespace}
@@ -111,101 +175,159 @@ def ingest(namespace: str, url: str, title: str, full_text: str) -> int:
         total += len(points[i:i+UPSERT_BATCH])
     return total
 
-# ========================= Sitemap ingest =========================
-def ingest_sitemap(namespace: str, sitemap_url: str, max_pages: int = 200) -> Dict[str, Any]:
-    from urllib.parse import urljoin
-    collected, ingested, failed = [], [], []
+# ====================== Ingest público ============================
+def ingest_text(title: str, text: str, namespace: str = "default") -> Dict:
+    count = _ingest(namespace, f"text://{title}", title, text)
+    return {"ok": True, "count": count}
 
+def ingest_url(page_url: str, namespace: str = "default", deadline_s: int = 55) -> Dict:
+    u = _clean_url(page_url)
+    if not _url_allowed(u):
+        return {"ok": False, "error": "url_blocked", "url": u}
     try:
-        xml = fetch_url(sitemap_url)
-        soup = BeautifulSoup(xml, "xml")
-        locs = [loc.text for loc in soup.find_all("loc")]
+        r = requests.get(u, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
+        r.raise_for_status()
     except Exception as e:
-        return {"ok": False, "error": "sitemap_failed", "detail": str(e)}
+        return {"ok": False, "error": f"fetch_failed: {e}", "url": u}
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = (soup.title.string if soup.title else u).strip()
+    text = soup.get_text(" ", strip=True)
+    count = _ingest(namespace, u, title, text)
+    return {"ok": True, "url": u, "count": count}
 
-    for url in locs[:max_pages]:
-        try:
-            html = fetch_url(url)
-            soup = BeautifulSoup(html, "html.parser")
-            title = soup.title.string.strip() if soup.title else url
-            text = soup.get_text(" ", strip=True)
-            if text:
-                n = ingest(namespace, url, title, text)
-                if n > 0:
-                    ingested.append(url)
-        except Exception as e:
-            failed.append((url, str(e)))
-        collected.append(url)
-
-    return {
-        "ok": True,
-        "sitemap": sitemap_url,
-        "pages_ingested": len(ingested),
-        "pages_failed": len(failed),
-        "namespace": namespace,
-        "ingested_urls": ingested,
-        "failed_urls": failed,
-    }
-
-# ========================= Search =========================
-def search(namespace: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
-    emb = _embed_texts([query])[0]
-    hits = qdrant.search(
-        collection_name=QDRANT_COLLECTION,
-        query_vector=emb,
-        limit=top_k,
-        query_filter={"must": [{"key": "namespace", "match": {"value": namespace}}]} if namespace else None
-    )
-    return [{"url": h.payload.get("url"), "title": h.payload.get("title"), "text": h.payload.get("text")} for h in hits]
-
-# -------------------------------------------------------------------
-# Retro-compat: API esperada pelo main.py
-# -------------------------------------------------------------------
-from typing import Optional
-import requests
-
-def ingest_text(title: str, text: str, namespace: str = "default"):
-    """
-    Ingest de texto puro (mantém assinatura antiga):
-    - title: título do bloco
-    - text:  conteúdo
-    - namespace: espaço lógico em Qdrant
-    """
-    return {"ok": True, "count": _ingest(namespace, f"text://{title}", title, text)}
-
-def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default"):
-    """
-    Ingest de um PDF remoto por URL (mantém assinatura antiga).
-    Usa o mesmo pipeline de embeddings e upsert em Qdrant.
-    """
+def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default") -> Dict:
+    import fitz
     try:
-        import fitz  # PyMuPDF
-    except Exception as e:
-        return {"ok": False, "error": f"pymupdf_missing: {e}"}
-
-    try:
-        r = requests.get(pdf_url, timeout=TIMEOUT_FETCH_S + 10, headers={"User-Agent": "alma-bot/1.0"})
+        r = requests.get(pdf_url, timeout=FETCH_TIMEOUT_S + 10, headers=DEFAULT_HEADERS)
         r.raise_for_status()
     except Exception as e:
         return {"ok": False, "error": f"fetch_pdf_failed: {e}", "url": pdf_url}
-
-    try:
-        doc = fitz.open("pdf", r.content)
-        full = " ".join(page.get_text() for page in doc)
-    except Exception as e:
-        return {"ok": False, "error": f"pdf_parse_failed: {e}", "url": pdf_url}
-
+    doc = fitz.open("pdf", r.content)
+    full = " ".join(page.get_text() for page in doc)
     count = _ingest(namespace, pdf_url, title or pdf_url, full)
     return {"ok": True, "url": pdf_url, "count": count}
 
-# Exportar símbolos que o main.py pode importar
+def ingest_sitemap(sitemap_url: str, namespace: str = "default",
+                   max_pages: int = 500, deadline_s: int = 120) -> Dict:
+    try:
+        r = requests.get(sitemap_url, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
+        r.raise_for_status()
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_sitemap_failed: {e}"}
+
+    # Se for XML, usa parser XML; caso contrário, tenta HTML
+    soup = BeautifulSoup(r.text, "xml") if r.headers.get("Content-Type", "").lower().startswith("application/xml") \
+        else BeautifulSoup(r.text, "xml")
+
+    locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
+    seen: set[str] = set()
+    ok, fail = 0, 0
+    ingested_urls: List[str] = []
+    failed_urls: List[Tuple[str, str]] = []
+
+    t0 = time.time()
+    for loc in locs:
+        if len(seen) >= max_pages or (time.time() - t0) > deadline_s:
+            break
+        url = _clean_url(loc)
+        if url in seen:
+            continue
+        seen.add(url)
+        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+        if res.get("ok"):
+            ok += res.get("count", 0)
+            ingested_urls.append(url)
+        else:
+            fail += 1
+            failed_urls.append((url, res.get("error", "unknown")))
+    return {
+        "ok": True,
+        "sitemap": sitemap_url,
+        "pages_ingested": len(ingested_urls),
+        "pages_failed": fail,
+        "namespace": namespace,
+        "ingested_urls": ingested_urls[:200],  # corta para resposta
+        "failed_urls": failed_urls[:200],
+    }
+
+# ========================= Crawler =================================
+def crawl_and_ingest(seed_url: str, namespace: str = "default",
+                     max_pages: int = 400, max_depth: int = 3, deadline_s: int = 120) -> Dict:
+    start = _clean_url(seed_url)
+    seen, queue = set(), [(start, 0)]
+    ok_chunks, fail = 0, 0
+    t0 = time.time()
+    start_host = urlsplit(start).netloc
+
+    while queue and len(seen) < max_pages and (time.time() - t0) < deadline_s:
+        url, depth = queue.pop(0)
+        if url in seen or depth > max_depth:
+            continue
+        seen.add(url)
+        if not _url_allowed(url):
+            continue
+        try:
+            r = requests.get(url, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
+            r.raise_for_status()
+        except Exception:
+            fail += 1
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.string if soup.title else url).strip()
+        text = soup.get_text(" ", strip=True)
+        ok_chunks += _ingest(namespace, url, title, text)
+
+        # próxima fronteira (mesmo domínio)
+        for a in soup.find_all("a", href=True):
+            nxt = urljoin(url, a["href"])
+            nxt = _clean_url(nxt)
+            if urlsplit(nxt).netloc != start_host:
+                continue
+            if nxt not in seen and _url_allowed(nxt):
+                queue.append((nxt, depth + 1))
+
+    return {"ok": True, "visited": len(seen), "ok_chunks": ok_chunks, "fail": fail, "namespace": namespace}
+
+# ========================= Search ==================================
+def search_chunks(query: str, namespace: Optional[str] = None, top_k: int = 6):
+    vec = _embed_texts([query])[0]
+    flt = qm.Filter(must=[qm.FieldCondition(
+        key="namespace", match=qm.MatchValue(value=namespace or "default")
+    )])
+    res = qdrant.search(
+        collection_name=QDRANT_COLLECTION,
+        query_vector=vec,
+        limit=top_k,
+        query_filter=flt
+    )
+    out = []
+    for m in res:
+        p = dict(m.payload or {})
+        p["score"] = float(getattr(m, "score", 0.0))
+        out.append(p)
+    return out
+
+def build_context_block(matches, token_budget: int = 1600):
+    lines, used = [], 0
+    for m in matches:
+        t = m.get("text", "") or ""
+        toks = len(t.split())
+        if used + toks > token_budget:
+            break
+        lines.append(f"[{m.get('title')}] {t}")
+        used += toks
+    return "\n".join(lines)
+
+# ========================= Public API ===============================
 __all__ = [
-    # endpoints públicos
+    "ensure_collection",
     "ingest_text",
-    "ingest_pdf_url",
     "ingest_url",
+    "ingest_pdf_url",
     "ingest_sitemap",
     "crawl_and_ingest",
     "search_chunks",
     "build_context_block",
+    "QDRANT_COLLECTION",
 ]
