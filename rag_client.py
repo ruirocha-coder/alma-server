@@ -1,17 +1,18 @@
-# rag_client.py — OpenAI embeddings (1536D) + Qdrant + crawler/sitemap
+# rag_client.py — OpenAI embeddings (1536D) + Qdrant + crawler/sitemap (parallel, retries, cursor)
 # -------------------------------------------------------------------
-import os, time, uuid, requests
+import os, time, uuid, math, random, requests
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit, urljoin
 from bs4 import BeautifulSoup
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 # =========================== Config ================================
 QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs")   # <== nome default consistente
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs")   # default consistente
 OPENAI_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536D
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
@@ -23,10 +24,13 @@ CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "150"))
 CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "300"))
 CRAWL_MAX_DEPTH   = int(os.getenv("CRAWL_MAX_DEPTH", "3"))
 
-# ---- Ritmo para sitemaps (anti-WAF/CDN) ----
-SITEMAP_SLEEP_MS      = int(os.getenv("SITEMAP_SLEEP_MS", "1000"))   # pausa entre URLs
+# ---- Ritmo/robustez para sitemaps (anti-WAF/CDN) ----
+SITEMAP_SLEEP_MS      = int(os.getenv("SITEMAP_SLEEP_MS", "300"))    # pausa base entre tarefas
 SITEMAP_MAX_RETRIES   = int(os.getenv("SITEMAP_MAX_RETRIES", "4"))   # tentativas por URL
-SITEMAP_BACKOFF_MS    = int(os.getenv("SITEMAP_BACKOFF_MS", "1000")) # backoff incremental por tentativa
+SITEMAP_BACKOFF_MS    = int(os.getenv("SITEMAP_BACKOFF_MS", "500"))  # backoff base por tentativa
+SITEMAP_JITTER_MS     = int(os.getenv("SITEMAP_JITTER_MS", "200"))   # jitter aleatório
+SITEMAP_CONCURRENCY   = int(os.getenv("SITEMAP_CONCURRENCY", "6"))   # trabalhadores paralelos
+SITEMAP_LIMIT_PER_CALL= int(os.getenv("SITEMAP_LIMIT_PER_CALL", "60")) # paginação por chamada
 
 # Dimensões por modelo (ambos 1536 nas versões atuais)
 MODEL_DIMS = {
@@ -34,6 +38,11 @@ MODEL_DIMS = {
     "text-embedding-3-large": 1536,
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
+
+print(f"[rag_client] defaults → max_pages={CRAWL_MAX_PAGES}, deadline_s={CRAWL_DEADLINE_S}, "
+      f"max_depth={CRAWL_MAX_DEPTH}, embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, "
+      f"collection={QDRANT_COLLECTION}, site_concurrency={SITEMAP_CONCURRENCY}, "
+      f"limit_per_call={SITEMAP_LIMIT_PER_CALL}")
 
 # ========================= Clients ================================
 qdrant = QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -48,10 +57,8 @@ def _get_existing_dim(info) -> Optional[int]:
         vc = cfg.vectors_config
         if not vc:
             return None
-        # qdrant-client >=1.7
         if hasattr(vc, "config") and vc.config and hasattr(vc.config, "size"):
             return vc.config.size
-        # fallback
         if hasattr(vc, "size"):
             return vc.size
     except Exception:
@@ -64,7 +71,6 @@ def ensure_collection(dim: int = VECTOR_SIZE):
         existing_dim = _get_existing_dim(info)
         if existing_dim and existing_dim != dim:
             if QDRANT_AUTO_MIGRATE:
-                # ⚠️ isto APAGA a coleção e recria com a dimensão indicada
                 qdrant.recreate_collection(
                     collection_name=QDRANT_COLLECTION,
                     vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
@@ -75,10 +81,8 @@ def ensure_collection(dim: int = VECTOR_SIZE):
                     f"mas o modelo '{OPENAI_MODEL}' produz dim={dim}. "
                     f"Ativa QDRANT_AUTO_MIGRATE=1 ou muda QDRANT_COLLECTION."
                 )
-        # se existir e bater certo → nada a fazer
         return
     except Exception:
-        # Não existe → criar
         qdrant.create_collection(
             collection_name=QDRANT_COLLECTION,
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
@@ -105,7 +109,6 @@ def _clean_url(u: str) -> str:
         return ""
     p = urlsplit(u)
     path = p.path or "/"
-    # força slash se aparenta ser diretório
     if not path.endswith("/") and "." not in path.rsplit("/", 1)[-1]:
         path += "/"
     return urlunsplit((p.scheme, p.netloc, path, "", ""))
@@ -126,7 +129,6 @@ def _uuid_for_chunk(namespace: str, url: str, idx: int) -> str:
 
 # =================== Texto / embeddings ===========================
 def _chunk_text(text: str, max_tokens: int = 450) -> List[str]:
-    """Split simples por frases aproximadas."""
     parts, buf, count = [], [], 0
     for sent in text.split(". "):
         t = sent.strip()
@@ -155,11 +157,9 @@ def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
         return 0
 
     vecs = _embed_texts(chunks)
-    # Sanity-check de dimensão vs coleção
     if vecs:
         embed_dim = len(vecs[0])
         if embed_dim != VECTOR_SIZE:
-            # Tenta alinhar coleção se for permitido
             if QDRANT_AUTO_MIGRATE:
                 qdrant.recreate_collection(
                     collection_name=QDRANT_COLLECTION,
@@ -218,26 +218,51 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     return {"ok": True, "url": pdf_url, "count": count}
 
 # ---- helpers de ritmo para sitemaps ----
-def _sleep():
-    time.sleep(max(SITEMAP_SLEEP_MS, 0) / 1000.0)
+def _sleep_ms(ms: int):
+    if ms > 0:
+        time.sleep(ms / 1000.0)
 
 def _backoff_sleep(attempt: int):
-    # attempt: 1,2,3,...  => 1x,2x,3x ...
-    delay_ms = max(SITEMAP_BACKOFF_MS, 0) * max(attempt, 1)
-    time.sleep(delay_ms / 1000.0)
+    # attempt: 1,2,3,... → (attempt * base) + jitter
+    base = max(SITEMAP_BACKOFF_MS, 0) * max(attempt, 1)
+    jitter = random.randint(0, max(SITEMAP_JITTER_MS, 0))
+    _sleep_ms(base + jitter)
+
+def _ingest_url_with_retry(url: str, namespace: str, deadline_s: int) -> Tuple[str, bool, str]:
+    """Tenta ingerir uma URL com retries + backoff. Retorna (url, ok, err_msg)."""
+    for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
+        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+        if res.get("ok"):
+            return (url, True, "")
+        err = (res.get("error") or "unknown").lower()
+        # Bloqueios lógicos não valem a pena re-tentar
+        if "url_blocked" in err:
+            return (url, False, "url_blocked")
+        # Em 403/429/5xx/timeout → backoff e nova tentativa
+        if any(code in err for code in ("403", "429", "5", "timeout", "temporarily")) and attempt < SITEMAP_MAX_RETRIES:
+            _backoff_sleep(attempt)
+            continue
+        return (url, False, res.get("error", "unknown"))
+    return (url, False, "max_retries_exceeded")
 
 def ingest_sitemap(
     sitemap_url: str,
     namespace: str = "default",
-    max_pages: Optional[int] = None,       # limite global de páginas a ingerir (todas as chamadas somadas)
-    deadline_s: Optional[int] = None,      # tempo-máximo *desta* chamada
-    start_index: int = 0,                  # cursor inicial nesta chamada
-    limit_per_call: int = 60,              # máximo de URLs desta chamada (para não dar 499)
+    max_pages: Optional[int] = None,
+    deadline_s: Optional[int] = None,
+    start_index: Optional[int] = None,
+    limit_per_call: Optional[int] = None,
 ) -> Dict:
+    """Ingestão do sitemap com:
+       - paginação por cursor (start_index/limit_per_call)
+       - paralelismo controlado (thread pool)
+       - retries + backoff
+       - filtro de bloqueados/duplicados
+    """
     max_pages = max_pages or CRAWL_MAX_PAGES
     deadline_s = deadline_s or CRAWL_DEADLINE_S
-    limit_per_call = max(1, int(limit_per_call))
-    start_index = max(0, int(start_index))
+    limit_per_call = limit_per_call or SITEMAP_LIMIT_PER_CALL
+    start_index = int(start_index or 0)
 
     try:
         r = requests.get(sitemap_url, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
@@ -249,75 +274,54 @@ def ingest_sitemap(
     locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
     total_locs = len(locs)
 
-    # recorta esta fatia
+    # Cursor window
     end_index = min(total_locs, start_index + limit_per_call)
-    batch = locs[start_index:end_index]
+    window = locs[start_index:end_index]
 
+    # Pré-filtrar e normalizar
     seen: set[str] = set()
-    ingested_urls: List[str] = []
-    failed_urls: List[Tuple[str, str]] = []
+    candidates: List[str] = []
     skipped_blocked: List[str] = []
     skipped_dupe: List[str] = []
-
-    t0 = time.time()
-    total_processed = 0
-
-    for raw in batch:
-        # respeita deadline da *chamada* para evitar 499
-        if (time.time() - t0) > deadline_s:
-            break
-
-        url = _clean_url(raw)
-
+    for loc in window:
+        url = _clean_url(loc)
         if url in seen:
             skipped_dupe.append(url)
             continue
         seen.add(url)
-
         if not _url_allowed(url):
             skipped_blocked.append(url)
             continue
+        candidates.append(url)
 
-        # aplica limite global max_pages (todas as chamadas somadas) por “melhor esforço”.
-        # aqui não temos estado acumulado; este check protege da ingest “demais” por chamada.
-        if len(ingested_urls) >= max_pages:
-            break
+    ingested_urls: List[str] = []
+    failed_urls: List[Tuple[str, str]] = []
 
-        # --- retries com backoff simples ---
-        err_msg = None
-        for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
+    t0 = time.time()
+    # Paraleliza em lotes com semáforo via ThreadPoolExecutor
+    max_workers = max(1, SITEMAP_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for i, url in enumerate(candidates):
+            # pequeno espaçamento entre submissões para não fazer burst
+            _sleep_ms(SITEMAP_SLEEP_MS)
+            futures[pool.submit(_ingest_url_with_retry, url, namespace, deadline_s)] = url
+
+        for fut in as_completed(futures):
+            url = futures[fut]
             try:
-                res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
-                if res.get("ok"):
-                    ingested_urls.append(url)
-                    err_msg = None
-                    # pequena pausa entre URLs para não acionar WAF
-                    if SITEMAP_SLEEP_MS > 0:
-                        _sleep()
-                    break
+                u, ok, err = fut.result()
+                if ok:
+                    ingested_urls.append(u)
                 else:
-                    err_msg = res.get("error", "unknown")
+                    failed_urls.append((u, err))
             except Exception as e:
-                err_msg = str(e)
-
-            # backoff e tenta de novo
-            _backoff_sleep(attempt)
-
-        if err_msg:
-            failed_urls.append((url, err_msg))
-
-        total_processed += 1
-
-        # *guarda-costas*: se mesmo com batch pequeno a chamada se alongar, sai antes do proxy cortar
-        if (time.time() - t0) > deadline_s:
-            break
+                failed_urls.append((url, f"exception: {e}"))
 
     elapsed_s = round(time.time() - t0, 2)
 
-    next_cursor = None
-    # se ainda há URLs no sitemap por processar, devolve cursor para próxima chamada
-    if end_index < total_locs:
-        next_cursor = end_index
+    # Prepara cursor para próxima chamada
+    next_cursor = end_index if end_index < total_locs else None
 
     return {
         "ok": True,
@@ -328,11 +332,13 @@ def ingest_sitemap(
         "total_locs": total_locs,
         "start_index": start_index,
         "end_index": end_index,
-        "next_cursor": next_cursor,           # <-- para a consola chamar a próxima fatia
+        "next_cursor": next_cursor,
         "limits": {
             "max_pages": max_pages,
             "deadline_s": deadline_s,
-            "limit_per_call": limit_per_call
+            "limit_per_call": limit_per_call,
+            "concurrency": max_workers,
+            "retries": SITEMAP_MAX_RETRIES
         },
         "skipped_blocked": skipped_blocked[:200],
         "skipped_dupe": skipped_dupe[:200],
@@ -340,6 +346,7 @@ def ingest_sitemap(
         "ingested_urls": ingested_urls[:200],
         "elapsed_s": elapsed_s,
     }
+
 # ========================= Crawler =================================
 def crawl_and_ingest(
     seed_url: str,
@@ -348,7 +355,6 @@ def crawl_and_ingest(
     max_depth: Optional[int] = None,
     deadline_s: Optional[int] = None,
 ) -> Dict:
-    # usar defaults do ambiente se não vierem parâmetros
     max_pages = max_pages or CRAWL_MAX_PAGES
     max_depth = max_depth or CRAWL_MAX_DEPTH
     deadline_s = deadline_s or CRAWL_DEADLINE_S
@@ -378,7 +384,6 @@ def crawl_and_ingest(
         text = soup.get_text(" ", strip=True)
         ok_chunks += _ingest(namespace, url, title, text)
 
-        # próxima fronteira (mesmo domínio)
         for a in soup.find_all("a", href=True):
             nxt = urljoin(url, a["href"])
             nxt = _clean_url(nxt)
