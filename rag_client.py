@@ -229,11 +229,15 @@ def _backoff_sleep(attempt: int):
 def ingest_sitemap(
     sitemap_url: str,
     namespace: str = "default",
-    max_pages: Optional[int] = None,
-    deadline_s: Optional[int] = None,
+    max_pages: Optional[int] = None,       # limite global de páginas a ingerir (todas as chamadas somadas)
+    deadline_s: Optional[int] = None,      # tempo-máximo *desta* chamada
+    start_index: int = 0,                  # cursor inicial nesta chamada
+    limit_per_call: int = 60,              # máximo de URLs desta chamada (para não dar 499)
 ) -> Dict:
     max_pages = max_pages or CRAWL_MAX_PAGES
     deadline_s = deadline_s or CRAWL_DEADLINE_S
+    limit_per_call = max(1, int(limit_per_call))
+    start_index = max(0, int(start_index))
 
     try:
         r = requests.get(sitemap_url, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
@@ -242,9 +246,12 @@ def ingest_sitemap(
         return {"ok": False, "error": f"fetch_sitemap_failed: {e}"}
 
     soup = BeautifulSoup(r.text, "xml")
-
     locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
     total_locs = len(locs)
+
+    # recorta esta fatia
+    end_index = min(total_locs, start_index + limit_per_call)
+    batch = locs[start_index:end_index]
 
     seen: set[str] = set()
     ingested_urls: List[str] = []
@@ -253,32 +260,65 @@ def ingest_sitemap(
     skipped_dupe: List[str] = []
 
     t0 = time.time()
-    for loc in locs:
-        if len(ingested_urls) >= max_pages:
-            break
+    total_processed = 0
+
+    for raw in batch:
+        # respeita deadline da *chamada* para evitar 499
         if (time.time() - t0) > deadline_s:
             break
 
-        url = _clean_url(loc)
+        url = _clean_url(raw)
 
-        # duplicados do próprio sitemap / normalização
         if url in seen:
             skipped_dupe.append(url)
             continue
         seen.add(url)
 
-        # aplica o mesmo filtro do crawler/ingest
         if not _url_allowed(url):
             skipped_blocked.append(url)
             continue
 
-        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
-        if res.get("ok"):
-            ingested_urls.append(url)
-        else:
-            failed_urls.append((url, res.get("error", "unknown")))
+        # aplica limite global max_pages (todas as chamadas somadas) por “melhor esforço”.
+        # aqui não temos estado acumulado; este check protege da ingest “demais” por chamada.
+        if len(ingested_urls) >= max_pages:
+            break
+
+        # --- retries com backoff simples ---
+        err_msg = None
+        for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
+            try:
+                res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+                if res.get("ok"):
+                    ingested_urls.append(url)
+                    err_msg = None
+                    # pequena pausa entre URLs para não acionar WAF
+                    if SITEMAP_SLEEP_MS > 0:
+                        _sleep()
+                    break
+                else:
+                    err_msg = res.get("error", "unknown")
+            except Exception as e:
+                err_msg = str(e)
+
+            # backoff e tenta de novo
+            _backoff_sleep(attempt)
+
+        if err_msg:
+            failed_urls.append((url, err_msg))
+
+        total_processed += 1
+
+        # *guarda-costas*: se mesmo com batch pequeno a chamada se alongar, sai antes do proxy cortar
+        if (time.time() - t0) > deadline_s:
+            break
 
     elapsed_s = round(time.time() - t0, 2)
+
+    next_cursor = None
+    # se ainda há URLs no sitemap por processar, devolve cursor para próxima chamada
+    if end_index < total_locs:
+        next_cursor = end_index
+
     return {
         "ok": True,
         "sitemap": sitemap_url,
@@ -286,12 +326,19 @@ def ingest_sitemap(
         "pages_ingested": len(ingested_urls),
         "pages_failed": len(failed_urls),
         "total_locs": total_locs,
+        "start_index": start_index,
+        "end_index": end_index,
+        "next_cursor": next_cursor,           # <-- para a consola chamar a próxima fatia
+        "limits": {
+            "max_pages": max_pages,
+            "deadline_s": deadline_s,
+            "limit_per_call": limit_per_call
+        },
         "skipped_blocked": skipped_blocked[:200],
         "skipped_dupe": skipped_dupe[:200],
         "failed_urls": failed_urls[:200],
-        "elapsed_s": elapsed_s,
-        "limits": {"max_pages": max_pages, "deadline_s": deadline_s},
         "ingested_urls": ingested_urls[:200],
+        "elapsed_s": elapsed_s,
     }
 # ========================= Crawler =================================
 def crawl_and_ingest(
