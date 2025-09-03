@@ -397,16 +397,22 @@ def crawl_and_ingest(
 # ============================ Search =========================================
 
 def search_chunks(query: str, namespace: Optional[str] = None, top_k: int = 6) -> List[Dict]:
+    ns = (namespace or "default").strip() or "default"  # vazio -> "default"
     vec = _embed_texts([query])[0]
     flt = qm.Filter(must=[qm.FieldCondition(
-        key="namespace", match=qm.MatchValue(value=namespace or "default")
+        key="namespace", match=qm.MatchValue(value=ns)
     )])
-    res = qdrant.search(
-        collection_name=QDRANT_COLLECTION,
-        query_vector=vec,
-        limit=top_k,
-        query_filter=flt
-    )
+    try:
+        res = qdrant.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=vec,
+            limit=top_k,
+            query_filter=flt
+        )
+    except Exception as e:
+        # devolve erro claro à API de cima
+        raise RuntimeError(f"qdrant_search_failed: {e}")
+
     out = []
     for m in res:
         p = dict(m.payload or {})
