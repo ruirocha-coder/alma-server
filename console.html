@@ -1,338 +1,244 @@
 <!doctype html>
-<html lang="pt">
+<html lang="pt-PT">
 <head>
   <meta charset="utf-8" />
-  <title>Alma — Console RAG</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Alma RAG Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root { --bg:#0b0c10; --card:#15171c; --ink:#e6e6e6; --muted:#9aa0a6; --accent:#5ac8fa; }
-    html,body{background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
-    h1{font-size:20px;margin:24px 0 12px}
-    h2{font-size:16px;margin:18px 0 8px;color:var(--accent)}
-    .wrap{max-width:980px;margin:24px auto;padding:0 16px}
-    .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
-    .card{background:var(--card);border-radius:12px;padding:14px;border:1px solid #23262d}
-    label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px}
-    input,textarea,select{width:100%;background:#0f1116;border:1px solid #2a2f39;color:var(--ink);
-      border-radius:10px;padding:10px 12px;outline:none}
-    textarea{min-height:110px;resize:vertical}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-    .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-    button{background:var(--accent);border:0;color:#00131f;font-weight:700;border-radius:10px;
-      padding:10px 14px;margin-top:10px;cursor:pointer}
+    :root { --bg:#0f1115; --panel:#151822; --muted:#9aa4b2; --text:#e9edf1; --ok:#39d353; --err:#ff6b6b; --link:#7aa2f7; }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;}
+    h1{margin:0 0 8px 0;font-size:20px}
+    .note{color:var(--muted);margin-bottom:16px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:16px}
+    .card{background:var(--panel);border:1px solid #202638;border-radius:10px;padding:16px}
+    .card h2{font-size:16px;margin:0 0 10px 0}
+    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+    input,textarea,select{width:100%;box-sizing:border-box;background:#0f1320;color:var(--text);border:1px solid #2a3350;border-radius:8px;padding:10px}
+    textarea{min-height:90px;resize:vertical}
+    .row{display:flex;gap:8px}
+    .row > *{flex:1}
+    button{background:#2b5cff;border:0;color:white;padding:10px 12px;border-radius:8px;cursor:pointer}
     button:disabled{opacity:.6;cursor:not-allowed}
-    pre{white-space:pre-wrap;background:#0f1116;border:1px solid #2a2f39;color:#cfe7ff;border-radius:10px;padding:12px}
-    .log{font-size:12px;color:#b7c1cc}
-    .pill{display:inline-block;border:1px solid #2a2f39;border-radius:999px;padding:2px 8px;margin-right:6px;font-size:12px}
-    .flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .muted{color:var(--muted);font-size:12px}
+    .ok{color:var(--ok)} .err{color:var(--err)}
+    pre{background:#0b0e16;border:1px solid #1a2033;border-radius:8px;padding:12px;overflow:auto;max-height:360px}
+    .small{font-size:12px}
+    .pill{display:inline-block;border:1px solid #2a3350;border-radius:999px;padding:2px 8px;font-size:12px;color:var(--muted);margin-left:8px}
+    a{color:var(--link);text-decoration:none}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Alma • Console RAG</h1>
-    <div class="grid">
+  <h1>Alma • RAG Console <span id="status" class="pill">idle</span></h1>
+  <div class="note">Usa estes painéis para ingerir conteúdo (Sitemap, Crawl, URL, Texto, PDF) e testar pesquisa. Timeout de pedido: <b>15 minutos</b>.</div>
 
-      <!-- INGEST VIA SITEMAP -->
-      <div class="card">
-        <h2>Ingerir via Sitemap</h2>
-        <label>Sitemap URL</label>
-        <input id="sitemap_url" placeholder="https://exemplo.com/sitemap.xml" />
-        <div class="row3">
-          <div>
-            <label>Namespace</label>
-            <input id="sitemap_ns" placeholder="default" />
-          </div>
-          <div>
-            <label>Max pages</label>
-            <input id="sitemap_max" type="number" min="1" value="500" />
-          </div>
-          <div>
-            <label>Deadline (s)</label>
-            <input id="sitemap_deadline" type="number" min="30" value="600" />
-          </div>
+  <div class="grid">
+    <!-- Global options -->
+    <div class="card">
+      <h2>Opções globais</h2>
+      <label>Namespace (default: <code>default</code>)</label>
+      <input id="ns" placeholder="ex.: site_boasafra" />
+      <div class="row">
+        <div>
+          <label>max_pages</label>
+          <input id="maxPages" type="number" min="1" placeholder="ex.: 500" />
         </div>
-        <button id="btn_sitemap">Ingerir Sitemap</button>
-        <div class="log" id="log_sitemap"></div>
-        <pre id="out_sitemap"></pre>
-      </div>
-
-      <!-- CRAWLER -->
-      <div class="card">
-        <h2>Crawler (seed URL)</h2>
-        <label>Seed URL</label>
-        <input id="crawl_seed" placeholder="https://exemplo.com/" />
-        <div class="row3">
-          <div>
-            <label>Namespace</label>
-            <input id="crawl_ns" placeholder="default" />
-          </div>
-          <div>
-            <label>Max pages</label>
-            <input id="crawl_max" type="number" min="1" value="400" />
-          </div>
-          <div>
-            <label>Max depth</label>
-            <input id="crawl_depth" type="number" min="1" value="3" />
-          </div>
+        <div>
+          <label>deadline_s</label>
+          <input id="deadline" type="number" min="10" placeholder="ex.: 900" />
         </div>
-        <div class="row">
-          <div>
-            <label>Deadline (s)</label>
-            <input id="crawl_deadline" type="number" min="30" value="600" />
-          </div>
-          <div>
-            <label>Verbose (debug UI)</label>
-            <select id="crawl_verbose">
-              <option value="false" selected>Não</option>
-              <option value="true">Sim</option>
-            </select>
-          </div>
-        </div>
-        <button id="btn_crawl">Crawl & Ingest</button>
-        <div class="log" id="log_crawl"></div>
-        <pre id="out_crawl"></pre>
       </div>
-
-      <!-- INGEST URL INDIVIDUAL -->
-      <div class="card">
-        <h2>Ingerir URL individual</h2>
-        <label>Page URL</label>
-        <input id="url_one" placeholder="https://exemplo.com/pagina/" />
-        <div class="row">
-          <div>
-            <label>Namespace</label>
-            <input id="url_one_ns" placeholder="default" />
-          </div>
-          <div>
-            <label>Deadline (s)</label>
-            <input id="url_one_deadline" type="number" min="30" value="120" />
-          </div>
-        </div>
-        <button id="btn_url_one">Ingerir URL</button>
-        <div class="log" id="log_url_one"></div>
-        <pre id="out_url_one"></pre>
-      </div>
-
-      <!-- INGEST TEXTO -->
-      <div class="card">
-        <h2>Ingerir Texto</h2>
-        <label>Título</label>
-        <input id="txt_title" placeholder="Nota / Documento" />
-        <label>Texto</label>
-        <textarea id="txt_body" placeholder="Texto para indexar…"></textarea>
-        <label>Namespace</label>
-        <input id="txt_ns" placeholder="default" />
-        <button id="btn_txt">Ingerir Texto</button>
-        <div class="log" id="log_txt"></div>
-        <pre id="out_txt"></pre>
-      </div>
-
-      <!-- INGEST PDF -->
-      <div class="card">
-        <h2>Ingerir PDF (URL)</h2>
-        <label>PDF URL</label>
-        <input id="pdf_url" placeholder="https://exemplo.com/ficheiro.pdf" />
-        <div class="row">
-          <div>
-            <label>Título (opcional)</label>
-            <input id="pdf_title" />
-          </div>
-          <div>
-            <label>Namespace</label>
-            <input id="pdf_ns" placeholder="default" />
-          </div>
-        </div>
-        <button id="btn_pdf">Ingerir PDF</button>
-        <div class="log" id="log_pdf"></div>
-        <pre id="out_pdf"></pre>
-      </div>
-
-      <!-- SEARCH -->
-      <div class="card">
-        <h2>Pesquisar</h2>
-        <label>Query</label>
-        <input id="q" placeholder="ex.: diretora da boa safra" />
-        <div class="row">
-          <div>
-            <label>Namespace</label>
-            <input id="q_ns" placeholder="default" />
-          </div>
-          <div>
-            <label>Top K</label>
-            <input id="q_topk" type="number" min="1" value="6" />
-          </div>
-        </div>
-        <button id="btn_search">Pesquisar</button>
-        <div class="log" id="log_search"></div>
-        <pre id="out_search"></pre>
-      </div>
-
+      <div class="muted small">Se deixares vazio, o servidor usa os <i>defaults</i> de ambiente (CRAWL_MAX_PAGES, CRAWL_DEADLINE_S).</div>
     </div>
 
-    <div class="card" style="margin-top:16px">
-      <div class="flex">
-        <span class="pill">/rag/ingest-sitemap</span>
-        <span class="pill">/rag/crawl</span>
-        <span class="pill">/rag/ingest-url</span>
-        <span class="pill">/rag/ingest-text</span>
-        <span class="pill">/rag/ingest-pdf-url</span>
-        <span class="pill">/rag/search</span>
+    <!-- Sitemap -->
+    <div class="card">
+      <h2>Ingerir via Sitemap</h2>
+      <label>Sitemap URL</label>
+      <input id="sitemapUrl" placeholder="https://exemplo.com/sitemap.xml ou .../sitemap-1.xml" />
+      <button id="btnSitemap">Ingerir Sitemap</button>
+      <div class="muted small">Evita sitemaps só de imagens se o site os separar.</div>
+    </div>
+
+    <!-- Crawl -->
+    <div class="card">
+      <h2>Crawl (seed URL)</h2>
+      <label>Seed URL</label>
+      <input id="seedUrl" placeholder="https://exemplo.com/" />
+      <div class="row">
+        <div>
+          <label>max_depth</label>
+          <input id="maxDepth" type="number" min="1" placeholder="ex.: 3" />
+        </div>
       </div>
+      <button id="btnCrawl">Crawl + Ingest</button>
+    </div>
+
+    <!-- URL individual -->
+    <div class="card">
+      <h2>Ingerir URL individual</h2>
+      <label>Page URL</label>
+      <input id="pageUrl" placeholder="https://exemplo.com/pagina/" />
+      <button id="btnUrl">Ingerir URL</button>
+      <div class="muted small">Útil para páginas que falharam no sitemap/crawl.</div>
+    </div>
+
+    <!-- Texto -->
+    <div class="card">
+      <h2>Ingerir Texto</h2>
+      <label>Título</label>
+      <input id="txtTitle" placeholder="Título do bloco" />
+      <label>Texto</label>
+      <textarea id="txtBody" placeholder="Conteúdo a ingerir..."></textarea>
+      <button id="btnText">Ingerir Texto</button>
+    </div>
+
+    <!-- PDF -->
+    <div class="card">
+      <h2>Ingerir PDF (URL)</h2>
+      <label>PDF URL</label>
+      <input id="pdfUrl" placeholder="https://exemplo.com/ficheiro.pdf" />
+      <label>Título (opcional)</label>
+      <input id="pdfTitle" placeholder="Título a mostrar no índice" />
+      <button id="btnPdf">Ingerir PDF</button>
+    </div>
+
+    <!-- Pesquisa -->
+    <div class="card">
+      <h2>Pesquisar</h2>
+      <label>Query</label>
+      <input id="q" placeholder="ex.: diretora da Boa Safra" />
+      <div class="row">
+        <div>
+          <label>top_k</label>
+          <input id="topK" type="number" min="1" placeholder="ex.: 6" />
+        </div>
+      </div>
+      <button id="btnSearch">Pesquisar</button>
     </div>
   </div>
 
+  <div style="margin-top:16px" class="card">
+    <h2>Resultado</h2>
+    <div id="msg" class="muted small">Sem operações ainda.</div>
+    <pre id="out"></pre>
+  </div>
+
   <script>
-    const $ = (id) => document.getElementById(id);
-    const api = (path) => path; // mesmo host
+    // Timeout de 15 minutos (podes aumentar/diminuir)
+    const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 
-    function show(elLog, elOut, head, obj) {
-      const now = new Date().toLocaleTimeString();
-      elLog.textContent = `[${now}] ${head}`;
-      elOut.textContent = JSON.stringify(obj, null, 2);
+    function el(id){ return document.getElementById(id); }
+    function setStatus(txt){ el("status").textContent = txt; }
+    function setMsg(html){ el("msg").innerHTML = html; }
+    function setOut(obj){
+      try{
+        // Não tenta imprimir arrays gigantes inteiros
+        const safe = JSON.stringify(obj, (k,v)=>{
+          if (Array.isArray(v) && v.length > 200) return v.slice(0,200).concat([`... (${v.length-200} mais)`]);
+          return v;
+        }, 2);
+        el("out").textContent = safe;
+      }catch(e){
+        el("out").textContent = String(obj);
+      }
     }
-    function disable(btn, on) { btn.disabled = on; btn.textContent = on ? 'A processar…' : btn.dataset.label; }
+    function getCommonPayload(){
+      const ns = el("ns").value.trim();
+      const max_pages = parseInt(el("maxPages").value,10);
+      const deadline_s = parseInt(el("deadline").value,10);
+      const payload = {};
+      if (ns) payload.namespace = ns;
+      if (!isNaN(max_pages) && max_pages > 0) payload.max_pages = max_pages;
+      if (!isNaN(deadline_s) && deadline_s > 0) payload.deadline_s = deadline_s;
+      return payload;
+    }
 
-    // ------- Sitemap -------
-    (function(){
-      const btn = $("btn_sitemap");
-      btn.dataset.label = "Ingerir Sitemap";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const body = {
-          sitemap_url: $("sitemap_url").value.trim(),
-          namespace: $("sitemap_ns").value.trim() || "default",
-          max_pages: Number($("sitemap_max").value || 0) || undefined,
-          deadline_s: Number($("sitemap_deadline").value || 0) || undefined
-        };
+    async function postJSON(path, body, timeoutMs = DEFAULT_TIMEOUT_MS){
+      setStatus("loading");
+      setMsg(`<span class="muted">A processar… (timeout ${Math.round(timeoutMs/60000)} min)</span>`);
+      el("out").textContent = "";
+      const ctrl = new AbortController();
+      const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+      try{
+        const res = await fetch(path, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body),
+          signal: ctrl.signal
+        });
+        const text = await res.text(); // lê como texto primeiro (evita falhas de JSON)
+        let data;
         try {
-          const r = await fetch(api("/rag/ingest-sitemap"), {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify(body)
-          });
-          const j = await r.json();
-          show($("log_sitemap"), $("out_sitemap"), `Resumo: ok=${j.ok} pages_ingested=${j.pages_ingested} domain=-`, j);
-        } catch (e) {
-          show($("log_sitemap"), $("out_sitemap"), "Erro a chamar /rag/ingest-sitemap", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+          data = JSON.parse(text);
+        } catch(parseErr){
+          throw new Error(`Resposta não-JSON (status ${res.status}): ${text.slice(0,400)}...`);
+        }
+        if (!res.ok) throw new Error(data && data.error ? data.error : `HTTP ${res.status}`);
+        setMsg(`<span class="ok">✔ OK</span>`);
+        setOut(data);
+        return data;
+      } catch(err){
+        // Captura abort/timeout → mostra erro humano
+        const isAbort = err.name === "AbortError";
+        setMsg(`<span class="err">✖ ${isAbort ? "Timeout/Abort" : "Erro"}:</span> <span class="muted">${(err && err.message) || err}</span>`);
+        setOut({error: String(err)});
+        throw err;
+      } finally{
+        clearTimeout(t);
+        setStatus("idle");
+      }
+    }
 
-    // ------- Crawl -------
-    (function(){
-      const btn = $("btn_crawl");
-      btn.dataset.label = "Crawl & Ingest";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const body = {
-          seed_url: $("crawl_seed").value.trim(),
-          namespace: $("crawl_ns").value.trim() || "default",
-          max_pages: Number($("crawl_max").value || 0) || undefined,
-          max_depth: Number($("crawl_depth").value || 0) || undefined,
-          deadline_s: Number($("crawl_deadline").value || 0) || undefined,
-          verbose: $("crawl_verbose").value === "true"
-        };
-        try {
-          const r = await fetch(api("/rag/crawl"), {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify(body)
-          });
-          const j = await r.json();
-          const v = j.visited ?? "–";
-          show($("log_crawl"), $("out_crawl"), `Resumo: ok=${j.ok} visited=${v} namespace=${body.namespace}`, j);
-        } catch (e) {
-          show($("log_crawl"), $("out_crawl"), "Erro a chamar /rag/crawl", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+    // Botões
+    el("btnSitemap").onclick = async ()=>{
+      const sitemap_url = el("sitemapUrl").value.trim();
+      if (!sitemap_url){ setMsg('<span class="err">Indica o sitemap_url</span>'); return; }
+      const payload = { sitemap_url, ...getCommonPayload() };
+      await postJSON("/rag/ingest-sitemap", payload);
+    };
 
-    // ------- URL individual -------
-    (function(){
-      const btn = $("btn_url_one");
-      btn.dataset.label = "Ingerir URL";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const body = {
-          page_url: $("url_one").value.trim(),
-          namespace: $("url_one_ns").value.trim() || "default",
-          deadline_s: Number($("url_one_deadline").value || 0) || undefined,
-        };
-        try {
-          const r = await fetch(api("/rag/ingest-url"), {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify(body)
-          });
-          const j = await r.json();
-          show($("log_url_one"), $("out_url_one"), `URL: ${body.page_url}`, j);
-        } catch (e) {
-          show($("log_url_one"), $("out_url_one"), "Erro a chamar /rag/ingest-url", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+    el("btnCrawl").onclick = async ()=>{
+      const seed_url = el("seedUrl").value.trim();
+      if (!seed_url){ setMsg('<span class="err">Indica a seed_url</span>'); return; }
+      const payload = { seed_url, ...getCommonPayload() };
+      const maxDepth = parseInt(el("maxDepth").value, 10);
+      if (!isNaN(maxDepth) && maxDepth > 0) payload.max_depth = maxDepth;
+      await postJSON("/rag/crawl", payload);
+    };
 
-    // ------- Texto -------
-    (function(){
-      const btn = $("btn_txt");
-      btn.dataset.label = "Ingerir Texto";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const body = {
-          title: $("txt_title").value.trim(),
-          text: $("txt_body").value.trim(),
-          namespace: $("txt_ns").value.trim() || "default",
-        };
-        try {
-          const r = await fetch(api("/rag/ingest-text"), {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify(body)
-          });
-          show($("log_txt"), $("out_txt"), "Ingest texto", await r.json());
-        } catch (e) {
-          show($("log_txt"), $("out_txt"), "Erro a chamar /rag/ingest-text", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+    el("btnUrl").onclick = async ()=>{
+      const page_url = el("pageUrl").value.trim();
+      if (!page_url){ setMsg('<span class="err">Indica a page_url</span>'); return; }
+      const payload = { page_url, ...getCommonPayload() };
+      await postJSON("/rag/ingest-url", payload);
+    };
 
-    // ------- PDF -------
-    (function(){
-      const btn = $("btn_pdf");
-      btn.dataset.label = "Ingerir PDF";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const body = {
-          pdf_url: $("pdf_url").value.trim(),
-          title: $("pdf_title").value.trim() || undefined,
-          namespace: $("pdf_ns").value.trim() || "default",
-        };
-        try {
-          const r = await fetch(api("/rag/ingest-pdf-url"), {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify(body)
-          });
-          show($("log_pdf"), $("out_pdf"), "Ingest PDF", await r.json());
-        } catch (e) {
-          show($("log_pdf"), $("out_pdf"), "Erro a chamar /rag/ingest-pdf-url", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+    el("btnText").onclick = async ()=>{
+      const title = el("txtTitle").value.trim();
+      const text = el("txtBody").value.trim();
+      if (!title || !text){ setMsg('<span class="err">Indica título e texto</span>'); return; }
+      const payload = { title, text, ...getCommonPayload() };
+      await postJSON("/rag/ingest-text", payload);
+    };
 
-    // ------- Search -------
-    (function(){
-      const btn = $("btn_search");
-      btn.dataset.label = "Pesquisar";
-      btn.addEventListener("click", async () => {
-        disable(btn, true);
-        const q = encodeURIComponent($("q").value.trim());
-        const ns = encodeURIComponent(($("q_ns").value.trim() || ""));
-        const topk = Number($("q_topk").value || 6);
-        const qs = `/rag/search?q=${q}&namespace=${ns}&top_k=${topk}`;
-        try {
-          const r = await fetch(api(qs));
-          show($("log_search"), $("out_search"), "Pesquisa", await r.json());
-        } catch (e) {
-          show($("log_search"), $("out_search"), "Erro a chamar /rag/search", {error:String(e)});
-        } finally { disable(btn, false); }
-      });
-    })();
+    el("btnPdf").onclick = async ()=>{
+      const pdf_url = el("pdfUrl").value.trim();
+      if (!pdf_url){ setMsg('<span class="err">Indica o pdf_url</span>'); return; }
+      const title = el("pdfTitle").value.trim();
+      const payload = { pdf_url, ...(title ? {title} : {}), ...getCommonPayload() };
+      await postJSON("/rag/ingest-pdf-url", payload);
+    };
+
+    el("btnSearch").onclick = async ()=>{
+      const q = el("q").value.trim();
+      if (!q){ setMsg('<span class="err">Indica a query</span>'); return; }
+      const ns = el("ns").value.trim();
+      const top_k = parseInt(el("topK").value, 10);
+      const payload = { query: q };
+      if (ns) payload.namespace = ns;
+      if (!isNaN(top_k) && top_k > 0) payload.top_k = top_k;
+      await postJSON("/rag/search", payload, /*search pode ser curto*/ 120000);
+    };
   </script>
 </body>
 </html>
