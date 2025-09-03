@@ -369,7 +369,9 @@
     }
   }
 
-  // ————— Actions: Search —————
+
+
+// ————— Actions: Search —————
   async function doSearch(){
     const q = $('q').value.trim();
     const ns = ($('searchNs').value || '').trim();
@@ -415,6 +417,26 @@ function appendLog(el, msg) {
   const time = new Date().toLocaleTimeString();
   el.textContent += `[${time}] ${msg}\n`;
   el.scrollTop = el.scrollHeight; // faz scroll automático para o fim
+}
+</script>
+  <div>
+  <h3>Ingerir URL manual</h3>
+  <input id="urlInput" type="text" placeholder="https://exemplo.com/pagina" style="width:70%">
+  <button onclick="ingestUrl()">Ingerir</button>
+</div>
+
+<script>
+async function ingestUrl() {
+  const url = document.getElementById("urlInput").value;
+  if (!url) { alert("Insere uma URL!"); return; }
+  const res = await fetch("/rag/ingest-url", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ url: url, namespace: "default" })
+  });
+  const data = await res.json();
+  console.log("Resposta ingest-url:", data);
+  alert(JSON.stringify(data, null, 2));
 }
 </script>
 </body>
