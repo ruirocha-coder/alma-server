@@ -623,9 +623,9 @@ async def rag_crawl(request: Request):
         data = await request.json()
         seed_url   = (data.get("seed_url") or "").strip()
         namespace  = (data.get("namespace") or "default").strip()
-        max_pages  = int(data.get("max_pages")  or os.getenv("CRAWL_MAX_PAGES", "40"))
-        max_depth  = int(data.get("max_depth")  or os.getenv("CRAWL_MAX_DEPTH", "2"))
-        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
+        max_pages  = int(data.get("max_pages")  or os.getenv("CRAWL_MAX_PAGES", "500"))
+        max_depth  = int(data.get("max_depth")  or os.getenv("CRAWL_MAX_DEPTH", "4"))
+        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "500"))
 
         # Aceitamos 'verbose' no payload mas, como o rag_client atual não expõe eventos,
         # simplesmente ignoramos para manter compatibilidade com a UI.
