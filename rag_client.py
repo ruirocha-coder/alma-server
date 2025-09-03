@@ -232,7 +232,6 @@ def ingest_sitemap(
     max_pages: Optional[int] = None,
     deadline_s: Optional[int] = None,
 ) -> Dict:
-    # usar defaults do ambiente se não vierem parâmetros
     max_pages = max_pages or CRAWL_MAX_PAGES
     deadline_s = deadline_s or CRAWL_DEADLINE_S
 
@@ -242,65 +241,58 @@ def ingest_sitemap(
     except Exception as e:
         return {"ok": False, "error": f"fetch_sitemap_failed: {e}"}
 
-    # Parse como XML (sitemaps são XML; evita warning)
     soup = BeautifulSoup(r.text, "xml")
 
-    # Apanhar todos os <loc>
     locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
-
-    # Filtrar sitemaps secundários (terminam em .xml) — queremos só páginas HTML
-    page_urls = [u for u in locs if not u.lower().endswith(".xml")]
+    total_locs = len(locs)
 
     seen: set[str] = set()
     ingested_urls: List[str] = []
     failed_urls: List[Tuple[str, str]] = []
+    skipped_blocked: List[str] = []
+    skipped_dupe: List[str] = []
 
     t0 = time.time()
-    def _time_ok() -> bool:
-        return (time.time() - t0) <= deadline_s
-
-    for loc in page_urls:
-        if not _time_ok() or len(ingested_urls) >= max_pages:
+    for loc in locs:
+        if len(ingested_urls) >= max_pages:
+            break
+        if (time.time() - t0) > deadline_s:
             break
 
         url = _clean_url(loc)
+
+        # duplicados do próprio sitemap / normalização
         if url in seen:
+            skipped_dupe.append(url)
             continue
         seen.add(url)
 
-        # --- retry loop por URL ---
-        ok = False
-        last_err = None
-        for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
-            try:
-                res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
-                if res.get("ok"):
-                    ingested_urls.append(url)
-                    ok = True
-                    break
-                else:
-                    last_err = res.get("error", "unknown")
-            except Exception as e:
-                last_err = str(e)
-            # backoff progressivo antes da próxima tentativa
-            _backoff_sleep(attempt)
+        # aplica o mesmo filtro do crawler/ingest
+        if not _url_allowed(url):
+            skipped_blocked.append(url)
+            continue
 
-        if not ok:
-            failed_urls.append((url, last_err or "failed"))
+        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+        if res.get("ok"):
+            ingested_urls.append(url)
+        else:
+            failed_urls.append((url, res.get("error", "unknown")))
 
-        # pausa curta entre URLs para não rebentar o WAF/CDN
-        _sleep()
-
+    elapsed_s = round(time.time() - t0, 2)
     return {
         "ok": True,
         "sitemap": sitemap_url,
+        "namespace": namespace,
         "pages_ingested": len(ingested_urls),
         "pages_failed": len(failed_urls),
-        "namespace": namespace,
-        "ingested_urls": ingested_urls[:200],  # corta para resposta
+        "total_locs": total_locs,
+        "skipped_blocked": skipped_blocked[:200],
+        "skipped_dupe": skipped_dupe[:200],
         "failed_urls": failed_urls[:200],
+        "elapsed_s": elapsed_s,
+        "limits": {"max_pages": max_pages, "deadline_s": deadline_s},
+        "ingested_urls": ingested_urls[:200],
     }
-
 # ========================= Crawler =================================
 def crawl_and_ingest(
     seed_url: str,
