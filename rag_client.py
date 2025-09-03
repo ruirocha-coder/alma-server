@@ -11,7 +11,7 @@ from openai import OpenAI
 # =========================== Config ================================
 QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY    = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "alma_docs")  # coleção única
 OPENAI_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536D
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
@@ -19,28 +19,29 @@ FETCH_TIMEOUT_S   = int(os.getenv("FETCH_TIMEOUT_S", "20"))
 QDRANT_AUTO_MIGRATE = os.getenv("QDRANT_AUTO_MIGRATE", "1") == "1"
 
 # =========================== Crawling defaults =====================
-CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "150"))
-CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "300"))
-CRAWL_MAX_DEPTH   = int(os.getenv("CRAWL_MAX_DEPTH", "3"))
+CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "500"))
+CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "500"))
+CRAWL_MAX_DEPTH   = int(os.getenv("CRAWL_MAX_DEPTH", "4"))
 
-# ---------- Sitemap chunking / ritmo ----------
-LIMIT_PER_CALL    = int(os.getenv("LIMIT_PER_CALL", "60"))   # <== lido da ENV (MAIÚSC.)
-SITEMAP_SLEEP_MS  = int(os.getenv("SITEMAP_SLEEP_MS", "0"))
-SITEMAP_MAX_RETRIES = int(os.getenv("SITEMAP_MAX_RETRIES", "2"))
-SITEMAP_BACKOFF_MS  = int(os.getenv("SITEMAP_BACKOFF_MS", "1000"))
-SITE_CONCURRENCY    = int(os.getenv("SITE_CONCURRENCY", "6"))  # reservado p/ futuro (assíncrono)
+# Sitemap “chunking” (para UI com cursor/limite por chamada)
+LIMIT_PER_CALL    = int(os.getenv("LIMIT_PER_CALL", "60"))          # quantos URLs por clique
+SITE_CONCURRENCY  = int(os.getenv("SITE_CONCURRENCY", "6"))         # informativo
+SITEMAP_MAX_RETRIES = int(os.getenv("SITEMAP_MAX_RETRIES", "2"))    # por URL (leve)
+SITEMAP_SLEEP_MS  = int(os.getenv("SITEMAP_SLEEP_MS", "0"))         # pausa entre URLs (ms)
 
-# Dimensões por modelo
+# Dimensão do embedding
 MODEL_DIMS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 1536,
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
 
-print(f"[rag_client] defaults → max_pages={CRAWL_MAX_PAGES}, deadline_s={CRAWL_DEADLINE_S}, "
-      f"max_depth={CRAWL_MAX_DEPTH}, embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, "
-      f"collection={QDRANT_COLLECTION}, site_concurrency={SITE_CONCURRENCY}, "
-      f"limit_per_call={LIMIT_PER_CALL}")
+print(
+    "[rag_client] defaults → "
+    f"max_pages={CRAWL_MAX_PAGES}, deadline_s={CRAWL_DEADLINE_S}, max_depth={CRAWL_MAX_DEPTH}, "
+    f"embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, collection={QDRANT_COLLECTION}, "
+    f"site_concurrency={SITE_CONCURRENCY}, limit_per_call={LIMIT_PER_CALL}"
+)
 
 # ========================= Clients ================================
 qdrant = QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -69,14 +70,14 @@ def ensure_collection(dim: int = VECTOR_SIZE):
         existing_dim = _get_existing_dim(info)
         if existing_dim and existing_dim != dim:
             if QDRANT_AUTO_MIGRATE:
-                # ⚠️ recria com a dimensão indicada
                 qdrant.recreate_collection(
                     collection_name=QDRANT_COLLECTION,
                     vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
                 )
             else:
                 raise RuntimeError(
-                    f"Qdrant '{QDRANT_COLLECTION}' dim={existing_dim} != embed dim={dim}. "
+                    f"Qdrant collection '{QDRANT_COLLECTION}' tem dim={existing_dim}, "
+                    f"mas o modelo '{OPENAI_MODEL}' produz dim={dim}. "
                     f"Ativa QDRANT_AUTO_MIGRATE=1 ou muda QDRANT_COLLECTION."
                 )
         return
@@ -86,7 +87,21 @@ def ensure_collection(dim: int = VECTOR_SIZE):
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
         )
 
+# ---- NOVO: garantir índice de payload para 'namespace' (necessário ao filtro) ----
+def ensure_payload_indexes():
+    try:
+        qdrant.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="namespace",
+            field_schema=qm.PayloadSchemaType.KEYWORD,
+        )
+        print("[rag_client] payload index 'namespace' criado (KEYWORD)")
+    except Exception as e:
+        # Já existe ou a API devolveu 409 — ignoramos
+        print(f"[rag_client] payload index 'namespace' pode já existir: {e}")
+
 ensure_collection(VECTOR_SIZE)
+ensure_payload_indexes()
 
 # =================== URL helpers / filtros ========================
 DENY_PATTERNS = [
@@ -155,6 +170,8 @@ def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
         return 0
 
     vecs = _embed_texts(chunks)
+
+    # sanity-check dimensão
     if vecs:
         embed_dim = len(vecs[0])
         if embed_dim != VECTOR_SIZE:
@@ -165,7 +182,8 @@ def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
                 )
             else:
                 raise RuntimeError(
-                    f"Embedding dim={embed_dim} difere da coleção={VECTOR_SIZE}."
+                    f"Dimensão do embedding={embed_dim} difere da coleção={VECTOR_SIZE}. "
+                    f"Ativa QDRANT_AUTO_MIGRATE=1 ou recria coleção manualmente."
                 )
 
     points: List[qm.PointStruct] = []
@@ -191,16 +209,20 @@ def ingest_url(page_url: str, namespace: str = "default", deadline_s: int = 55) 
     u = _clean_url(page_url)
     if not _url_allowed(u):
         return {"ok": False, "error": "url_blocked", "url": u}
-    try:
-        r = requests.get(u, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
-        r.raise_for_status()
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_failed: {e}", "url": u}
-    soup = BeautifulSoup(r.text, "html.parser")
-    title = (soup.title.string if soup.title else u).strip()
-    text = soup.get_text(" ", strip=True)
-    count = _ingest(namespace, u, title, text)
-    return {"ok": True, "url": u, "count": count}
+    err = None
+    for att in range(1, SITEMAP_MAX_RETRIES + 1):
+        try:
+            r = requests.get(u, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            title = (soup.title.string if soup.title else u).strip()
+            text = soup.get_text(" ", strip=True)
+            count = _ingest(namespace, u, title, text)
+            return {"ok": True, "url": u, "count": count}
+        except Exception as e:
+            err = e
+            time.sleep(max(SITEMAP_SLEEP_MS, 0) / 1000.0)
+    return {"ok": False, "error": f"fetch_failed: {err}", "url": u}
 
 def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default") -> Dict:
     import fitz
@@ -214,23 +236,14 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     count = _ingest(namespace, pdf_url, title or pdf_url, full)
     return {"ok": True, "url": pdf_url, "count": count}
 
-# ---- helpers de ritmo ----
-def _sleep_ms(ms: int):
-    if ms > 0:
-        time.sleep(ms / 1000.0)
-
-def _backoff_sleep(attempt: int):
-    delay_ms = max(SITEMAP_BACKOFF_MS, 0) * max(attempt, 1)
-    _sleep_ms(delay_ms)
-
-# ====================== Sitemap (com cursor) ======================
+# ====================== Sitemap (com cursor/limite) ================
 def ingest_sitemap(
     sitemap_url: str,
     namespace: str = "default",
     max_pages: Optional[int] = None,
     deadline_s: Optional[int] = None,
-    cursor: int = 0,
-    limit_per_call: Optional[int] = None,
+    cursor: Optional[int] = None,           # índice inicial (para “Próximo bloco”)
+    limit_per_call: Optional[int] = None,   # override do limite por chamada
 ) -> Dict:
     max_pages = max_pages or CRAWL_MAX_PAGES
     deadline_s = deadline_s or CRAWL_DEADLINE_S
@@ -243,54 +256,50 @@ def ingest_sitemap(
         return {"ok": False, "error": f"fetch_sitemap_failed: {e}"}
 
     soup = BeautifulSoup(r.text, "xml")
-    locs_all = [loc.get_text().strip() for loc in soup.find_all("loc")]
-    # Normaliza + filtra já URLs bloqueadas
-    filtered: List[str] = []
-    for raw in locs_all:
-        u = _clean_url(raw)
-        if _url_allowed(u):
-            filtered.append(u)
-    total_locs = len(filtered)
+    locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
+    total_locs = len(locs)
 
-    # fatia por cursor
-    start = max(cursor, 0)
-    end = min(start + limit, total_locs)
+    # janela desta chamada
+    start_idx = int(cursor or 0)
+    if start_idx < 0: start_idx = 0
+    end_idx = min(start_idx + limit, total_locs)
+    window = locs[start_idx:end_idx]
 
     seen: set[str] = set()
     ingested_urls: List[str] = []
     failed_urls: List[Tuple[str, str]] = []
+    skipped_blocked: List[str] = []
     skipped_dupe: List[str] = []
 
     t0 = time.time()
-    for url in filtered[start:end]:
+    for raw in window:
         if len(ingested_urls) >= max_pages:
             break
         if (time.time() - t0) > deadline_s:
             break
+
+        url = _clean_url(raw)
 
         if url in seen:
             skipped_dupe.append(url)
             continue
         seen.add(url)
 
-        # tentativas simples (WAF)
-        err = None
-        for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
-            res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
-            if res.get("ok"):
-                ingested_urls.append(url)
-                err = None
-                break
-            err = res.get("error", "unknown")
-            _backoff_sleep(attempt)
-        if err:
-            failed_urls.append((url, err))
+        if not _url_allowed(url):
+            skipped_blocked.append(url)
+            continue
 
-        _sleep_ms(SITEMAP_SLEEP_MS)
+        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+        if res.get("ok"):
+            ingested_urls.append(url)
+        else:
+            failed_urls.append((url, res.get("error", "unknown")))
 
+        if SITEMAP_SLEEP_MS > 0:
+            time.sleep(SITEMAP_SLEEP_MS / 1000.0)
+
+    next_cursor = end_idx if end_idx < total_locs else None
     elapsed_s = round(time.time() - t0, 2)
-    next_cursor = end if (end < total_locs and len(ingested_urls) < max_pages) else None
-
     return {
         "ok": True,
         "sitemap": sitemap_url,
@@ -298,8 +307,8 @@ def ingest_sitemap(
         "pages_ingested": len(ingested_urls),
         "pages_failed": len(failed_urls),
         "total_locs": total_locs,
-        "start_index": start,
-        "end_index": end,
+        "start_index": start_idx,
+        "end_index": end_idx if end_idx <= total_locs else total_locs,
         "next_cursor": next_cursor,
         "limits": {
             "max_pages": max_pages,
@@ -308,13 +317,14 @@ def ingest_sitemap(
             "concurrency": SITE_CONCURRENCY,
             "retries": SITEMAP_MAX_RETRIES,
         },
+        "skipped_blocked": skipped_blocked[:200],
         "skipped_dupe": skipped_dupe[:200],
         "failed_urls": failed_urls[:200],
         "ingested_urls": ingested_urls[:200],
         "elapsed_s": elapsed_s,
     }
 
-# ========================= Crawler =================================
+# ========================= Crawler (mesmo domínio) =================
 def crawl_and_ingest(
     seed_url: str,
     namespace: str = "default",
