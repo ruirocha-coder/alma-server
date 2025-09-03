@@ -18,12 +18,21 @@ UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
 FETCH_TIMEOUT_S   = int(os.getenv("FETCH_TIMEOUT_S", "20"))
 QDRANT_AUTO_MIGRATE = os.getenv("QDRANT_AUTO_MIGRATE", "1") == "1"  # recria coleção se dim não bater
 
+# =========================== Crawling defaults =====================
+CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "150"))
+CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "300"))
+CRAWL_MAX_DEPTH   = int(os.getenv("CRAWL_MAX_DEPTH", "3"))
+
 # Dimensões por modelo (ambos 1536 nas versões atuais)
 MODEL_DIMS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 1536,
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
+
+print(f"[rag_client] defaults → max_pages={CRAWL_MAX_PAGES}, "
+      f"deadline_s={CRAWL_DEADLINE_S}, max_depth={CRAWL_MAX_DEPTH}, "
+      f"embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, collection={QDRANT_COLLECTION}")
 
 # ========================= Clients ================================
 qdrant = QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -207,17 +216,24 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     count = _ingest(namespace, pdf_url, title or pdf_url, full)
     return {"ok": True, "url": pdf_url, "count": count}
 
-def ingest_sitemap(sitemap_url: str, namespace: str = "default",
-                   max_pages: int = 500, deadline_s: int = 120) -> Dict:
+def ingest_sitemap(
+    sitemap_url: str,
+    namespace: str = "default",
+    max_pages: Optional[int] = None,
+    deadline_s: Optional[int] = None,
+) -> Dict:
+    # usar defaults do ambiente se não vierem parâmetros
+    max_pages = max_pages or CRAWL_MAX_PAGES
+    deadline_s = deadline_s or CRAWL_DEADLINE_S
+
     try:
         r = requests.get(sitemap_url, timeout=FETCH_TIMEOUT_S, headers=DEFAULT_HEADERS)
         r.raise_for_status()
     except Exception as e:
         return {"ok": False, "error": f"fetch_sitemap_failed: {e}"}
 
-    # Se for XML, usa parser XML; caso contrário, tenta HTML
-    soup = BeautifulSoup(r.text, "xml") if r.headers.get("Content-Type", "").lower().startswith("application/xml") \
-        else BeautifulSoup(r.text, "xml")
+    # Parse como XML (sitemaps são XML; evita warning)
+    soup = BeautifulSoup(r.text, "xml")
 
     locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
     seen: set[str] = set()
@@ -251,8 +267,18 @@ def ingest_sitemap(sitemap_url: str, namespace: str = "default",
     }
 
 # ========================= Crawler =================================
-def crawl_and_ingest(seed_url: str, namespace: str = "default",
-                     max_pages: int = 400, max_depth: int = 3, deadline_s: int = 120) -> Dict:
+def crawl_and_ingest(
+    seed_url: str,
+    namespace: str = "default",
+    max_pages: Optional[int] = None,
+    max_depth: Optional[int] = None,
+    deadline_s: Optional[int] = None,
+) -> Dict:
+    # usar defaults do ambiente se não vierem parâmetros
+    max_pages = max_pages or CRAWL_MAX_PAGES
+    max_depth = max_depth or CRAWL_MAX_DEPTH
+    deadline_s = deadline_s or CRAWL_DEADLINE_S
+
     start = _clean_url(seed_url)
     seen, queue = set(), [(start, 0)]
     ok_chunks, fail = 0, 0
