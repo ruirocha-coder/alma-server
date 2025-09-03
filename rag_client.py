@@ -158,7 +158,54 @@ def search(namespace: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
     )
     return [{"url": h.payload.get("url"), "title": h.payload.get("title"), "text": h.payload.get("text")} for h in hits]
 
-# retrocompatibilidade com código antigo
-def ingest_text(namespace: str, text: str, url: str = "manual://input", title: str = "Manual Ingest"):
-    """Alias para manter compatibilidade com alma"""
-    return ingest(namespace, url, title, text)
+# -------------------------------------------------------------------
+# Retro-compat: API esperada pelo main.py
+# -------------------------------------------------------------------
+from typing import Optional
+import requests
+
+def ingest_text(title: str, text: str, namespace: str = "default"):
+    """
+    Ingest de texto puro (mantém assinatura antiga):
+    - title: título do bloco
+    - text:  conteúdo
+    - namespace: espaço lógico em Qdrant
+    """
+    return {"ok": True, "count": _ingest(namespace, f"text://{title}", title, text)}
+
+def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default"):
+    """
+    Ingest de um PDF remoto por URL (mantém assinatura antiga).
+    Usa o mesmo pipeline de embeddings e upsert em Qdrant.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        return {"ok": False, "error": f"pymupdf_missing: {e}"}
+
+    try:
+        r = requests.get(pdf_url, timeout=TIMEOUT_FETCH_S + 10, headers={"User-Agent": "alma-bot/1.0"})
+        r.raise_for_status()
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_pdf_failed: {e}", "url": pdf_url}
+
+    try:
+        doc = fitz.open("pdf", r.content)
+        full = " ".join(page.get_text() for page in doc)
+    except Exception as e:
+        return {"ok": False, "error": f"pdf_parse_failed: {e}", "url": pdf_url}
+
+    count = _ingest(namespace, pdf_url, title or pdf_url, full)
+    return {"ok": True, "url": pdf_url, "count": count}
+
+# Exportar símbolos que o main.py pode importar
+__all__ = [
+    # endpoints públicos
+    "ingest_text",
+    "ingest_pdf_url",
+    "ingest_url",
+    "ingest_sitemap",
+    "crawl_and_ingest",
+    "search_chunks",
+    "build_context_block",
+]
