@@ -1,244 +1,397 @@
 <!doctype html>
 <html lang="pt-PT">
 <head>
-  <meta charset="utf-8" />
-  <title>Alma RAG Console</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <title>Alma — Console RAG</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    :root { --bg:#0f1115; --panel:#151822; --muted:#9aa4b2; --text:#e9edf1; --ok:#39d353; --err:#ff6b6b; --link:#7aa2f7; }
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;}
-    h1{margin:0 0 8px 0;font-size:20px}
-    .note{color:var(--muted);margin-bottom:16px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:16px}
-    .card{background:var(--panel);border:1px solid #202638;border-radius:10px;padding:16px}
-    .card h2{font-size:16px;margin:0 0 10px 0}
-    label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
-    input,textarea,select{width:100%;box-sizing:border-box;background:#0f1320;color:var(--text);border:1px solid #2a3350;border-radius:8px;padding:10px}
-    textarea{min-height:90px;resize:vertical}
-    .row{display:flex;gap:8px}
-    .row > *{flex:1}
-    button{background:#2b5cff;border:0;color:white;padding:10px 12px;border-radius:8px;cursor:pointer}
+    :root{
+      --bg:#0f1115; --panel:#151823; --muted:#9aa4b2; --ok:#21c87a; --warn:#ffb020; --err:#ff5d5d; --ink:#e6e9ef;
+      --accent:#6aa1ff;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font:14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial;background:var(--bg);color:var(--ink)}
+    header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,#0f1115 70%,transparent);padding:16px 16px 8px;border-bottom:1px solid #1f2433}
+    h1{margin:0 0 8px;font-size:18px}
+    .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));padding:12px}
+    .card{background:var(--panel);border:1px solid #252b3b;border-radius:10px;padding:12px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    label{display:block;font-size:12px;color:var(--muted);margin-top:8px}
+    input, textarea, select{width:100%;background:#0e121a;border:1px solid #2b3348;color:#e6e9ef;border-radius:8px;padding:8px}
+    textarea{min-height:96px;resize:vertical}
+    button{background:#1e2433;border:1px solid #313a52;color:#e6e9ef;border-radius:8px;padding:8px 10px;cursor:pointer}
+    button.primary{background:var(--accent);border-color:#5a8df0;color:#fff}
     button:disabled{opacity:.6;cursor:not-allowed}
-    .muted{color:var(--muted);font-size:12px}
-    .ok{color:var(--ok)} .err{color:var(--err)}
-    pre{background:#0b0e16;border:1px solid #1a2033;border-radius:8px;padding:12px;overflow:auto;max-height:360px}
-    .small{font-size:12px}
-    .pill{display:inline-block;border:1px solid #2a3350;border-radius:999px;padding:2px 8px;font-size:12px;color:var(--muted);margin-left:8px}
-    a{color:var(--link);text-decoration:none}
+    .pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:6px 10px;border:1px solid #2a3146;background:#121725}
+    .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+    pre{background:#0c0f16;border:1px solid #262c3e;border-radius:8px;padding:10px;overflow:auto;max-height:320px}
+    .small{font-size:12px;color:var(--muted)}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace}
+    .sticky-result{position:sticky;top:64px;z-index:9}
+    .divider{height:1px;background:#20263a;margin:10px 0}
+    .tag{display:inline-block;font-size:11px;padding:3px 8px;border:1px solid #2b3348;border-radius:999px;color:#c9d2e3;margin:2px 4px 0 0}
+    .live-dot{width:8px;height:8px;border-radius:50%;background:#666;display:inline-block;box-shadow:0 0 0 0 rgba(106,161,255,.7);animation:pulse 2s infinite}
+    .live-dot.ok{background:var(--ok)} .live-dot.warn{background:var(--warn)} .live-dot.err{background:var(--err)}
+    @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(106,161,255,.7)}70%{box-shadow:0 0 0 10px rgba(106,161,255,0)}100%{box-shadow:0 0 0 0 rgba(106,161,255,0)}}
+    .hl{color:#a9c7ff}
   </style>
 </head>
 <body>
-  <h1>Alma • RAG Console <span id="status" class="pill">idle</span></h1>
-  <div class="note">Usa estes painéis para ingerir conteúdo (Sitemap, Crawl, URL, Texto, PDF) e testar pesquisa. Timeout de pedido: <b>15 minutos</b>.</div>
 
-  <div class="grid">
-    <!-- Global options -->
-    <div class="card">
-      <h2>Opções globais</h2>
-      <label>Namespace (default: <code>default</code>)</label>
-      <input id="ns" placeholder="ex.: site_boasafra" />
-      <div class="row">
-        <div>
-          <label>max_pages</label>
-          <input id="maxPages" type="number" min="1" placeholder="ex.: 500" />
-        </div>
-        <div>
-          <label>deadline_s</label>
-          <input id="deadline" type="number" min="10" placeholder="ex.: 900" />
-        </div>
-      </div>
-      <div class="muted small">Se deixares vazio, o servidor usa os <i>defaults</i> de ambiente (CRAWL_MAX_PAGES, CRAWL_DEADLINE_S).</div>
+<header>
+  <div class="row" style="justify-content:space-between">
+    <div class="row" style="gap:10px">
+      <h1>Alma — Console RAG</h1>
+      <span id="hb-dot" class="live-dot"></span>
+      <span id="hb-text" class="small">a verificar…</span>
     </div>
-
-    <!-- Sitemap -->
-    <div class="card">
-      <h2>Ingerir via Sitemap</h2>
-      <label>Sitemap URL</label>
-      <input id="sitemapUrl" placeholder="https://exemplo.com/sitemap.xml ou .../sitemap-1.xml" />
-      <button id="btnSitemap">Ingerir Sitemap</button>
-      <div class="muted small">Evita sitemaps só de imagens se o site os separar.</div>
-    </div>
-
-    <!-- Crawl -->
-    <div class="card">
-      <h2>Crawl (seed URL)</h2>
-      <label>Seed URL</label>
-      <input id="seedUrl" placeholder="https://exemplo.com/" />
-      <div class="row">
-        <div>
-          <label>max_depth</label>
-          <input id="maxDepth" type="number" min="1" placeholder="ex.: 3" />
-        </div>
-      </div>
-      <button id="btnCrawl">Crawl + Ingest</button>
-    </div>
-
-    <!-- URL individual -->
-    <div class="card">
-      <h2>Ingerir URL individual</h2>
-      <label>Page URL</label>
-      <input id="pageUrl" placeholder="https://exemplo.com/pagina/" />
-      <button id="btnUrl">Ingerir URL</button>
-      <div class="muted small">Útil para páginas que falharam no sitemap/crawl.</div>
-    </div>
-
-    <!-- Texto -->
-    <div class="card">
-      <h2>Ingerir Texto</h2>
-      <label>Título</label>
-      <input id="txtTitle" placeholder="Título do bloco" />
-      <label>Texto</label>
-      <textarea id="txtBody" placeholder="Conteúdo a ingerir..."></textarea>
-      <button id="btnText">Ingerir Texto</button>
-    </div>
-
-    <!-- PDF -->
-    <div class="card">
-      <h2>Ingerir PDF (URL)</h2>
-      <label>PDF URL</label>
-      <input id="pdfUrl" placeholder="https://exemplo.com/ficheiro.pdf" />
-      <label>Título (opcional)</label>
-      <input id="pdfTitle" placeholder="Título a mostrar no índice" />
-      <button id="btnPdf">Ingerir PDF</button>
-    </div>
-
-    <!-- Pesquisa -->
-    <div class="card">
-      <h2>Pesquisar</h2>
-      <label>Query</label>
-      <input id="q" placeholder="ex.: diretora da Boa Safra" />
-      <div class="row">
-        <div>
-          <label>top_k</label>
-          <input id="topK" type="number" min="1" placeholder="ex.: 6" />
-        </div>
-      </div>
-      <button id="btnSearch">Pesquisar</button>
+    <div class="row">
+      <span class="pill small">Versão servidor: <span id="sv-version" class="mono">?</span></span>
+      <span class="pill small">RAG: <span id="sv-rag" class="mono">?</span></span>
+      <span class="pill small">Mem0: <span id="sv-mem0" class="mono">?</span></span>
     </div>
   </div>
+  <div id="sticky" class="sticky-result"></div>
+</header>
 
-  <div style="margin-top:16px" class="card">
-    <h2>Resultado</h2>
-    <div id="msg" class="muted small">Sem operações ainda.</div>
-    <pre id="out"></pre>
-  </div>
+<div class="grid">
 
-  <script>
-    // Timeout de 15 minutos (podes aumentar/diminuir)
-    const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+  <!-- PARÂMETROS GERAIS -->
+  <section class="card">
+    <div class="row" style="justify-content:space-between;align-items:flex-end">
+      <div>
+        <div class="small">Parâmetros por omissão para tarefas</div>
+        <div class="divider"></div>
+        <label>Namespace</label>
+        <input id="ns" placeholder="ex.: site_boasafra" value="default">
+        <div class="row">
+          <div style="flex:1">
+            <label>max_pages</label>
+            <input id="max_pages" type="number" min="1" max="5000" value="500">
+          </div>
+          <div style="flex:1">
+            <label>deadline_s</label>
+            <input id="deadline_s" type="number" min="10" max="3600" value="900">
+          </div>
+          <div style="flex:1">
+            <label>max_depth (crawler)</label>
+            <input id="max_depth" type="number" min="1" max="16" value="4">
+          </div>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div class="small">Tarefa atual</div>
+        <div class="divider"></div>
+        <div class="row" style="justify-content:flex-end">
+          <span class="tag">⏱️ <span id="timer">00:00</span></span>
+          <span class="tag">ação: <span id="task-name" class="mono">—</span></span>
+          <span class="tag">item: <span id="task-item" class="mono">—</span></span>
+        </div>
+        <div class="row" style="margin-top:8px;gap:6px;justify-content:flex-end">
+          <button id="btn-cancel" class="warn" onclick="cancelTask()" disabled>Cancelar</button>
+          <button onclick="clearLogs()">Limpar logs</button>
+        </div>
+      </div>
+    </div>
+  </section>
 
-    function el(id){ return document.getElementById(id); }
-    function setStatus(txt){ el("status").textContent = txt; }
-    function setMsg(html){ el("msg").innerHTML = html; }
-    function setOut(obj){
-      try{
-        // Não tenta imprimir arrays gigantes inteiros
-        const safe = JSON.stringify(obj, (k,v)=>{
-          if (Array.isArray(v) && v.length > 200) return v.slice(0,200).concat([`... (${v.length-200} mais)`]);
-          return v;
-        }, 2);
-        el("out").textContent = safe;
-      }catch(e){
-        el("out").textContent = String(obj);
-      }
+  <!-- SITEMAP -->
+  <section class="card">
+    <h3>Ingestão via Sitemap</h3>
+    <label>Sitemap URL</label>
+    <input id="sitemap_url" placeholder="https://exemplo.com/sitemap.xml">
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runSitemap()">Ingerir Sitemap</button>
+    </div>
+    <label>Resultado</label>
+    <pre id="sitemap_res">{}</pre>
+  </section>
+
+  <!-- CRAWLER -->
+  <section class="card">
+    <h3>Crawler (mesmo domínio)</h3>
+    <label>Seed URL</label>
+    <input id="seed_url" placeholder="https://exemplo.com/">
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runCrawler()">Rastrear & Ingerir</button>
+    </div>
+    <label>Resultado</label>
+    <pre id="crawl_res">{}</pre>
+  </section>
+
+  <!-- URL INDIVIDUAL -->
+  <section class="card">
+    <h3>Ingestão de URL individual</h3>
+    <label>URL</label>
+    <input id="page_url" placeholder="https://exemplo.com/pagina/">
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runUrl()">Ingerir URL</button>
+    </div>
+    <label>Resultado</label>
+    <pre id="url_res">{}</pre>
+  </section>
+
+  <!-- TEXTO -->
+  <section class="card">
+    <h3>Ingestão de Texto</h3>
+    <label>Título</label>
+    <input id="txt_title" placeholder="Título do bloco">
+    <label>Texto</label>
+    <textarea id="txt_text" placeholder="Cole aqui o texto"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runText()">Ingerir Texto</button>
+    </div>
+    <label>Resultado</label>
+    <pre id="text_res">{}</pre>
+  </section>
+
+  <!-- PDF -->
+  <section class="card">
+    <h3>Ingestão de PDF (URL)</h3>
+    <label>PDF URL</label>
+    <input id="pdf_url" placeholder="https://exemplo.com/ficheiro.pdf">
+    <label>Título (opcional)</label>
+    <input id="pdf_title" placeholder="Título a usar (opcional)">
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runPdf()">Ingerir PDF</button>
+    </div>
+    <label>Resultado</label>
+    <pre id="pdf_res">{}</pre>
+  </section>
+
+  <!-- SEARCH -->
+  <section class="card">
+    <h3>Pesquisar (RAG)</h3>
+    <label>Query</label>
+    <input id="q" placeholder="ex.: diretora da Boa Safra">
+    <label>top_k</label>
+    <input id="top_k" type="number" min="1" max="20" value="6">
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="runSearch()">Pesquisar</button>
+    </div>
+    <label>Matches</label>
+    <pre id="search_res">{}</pre>
+  </section>
+
+  <!-- LOGS -->
+  <section class="card" style="grid-column:1 / -1">
+    <h3>Logs (cliente)</h3>
+    <pre id="logs"></pre>
+  </section>
+
+</div>
+
+<script>
+  // ---------------- Core helpers ----------------
+  const $ = sel => document.querySelector(sel);
+  const logBox = $("#logs");
+  const sticky = $("#sticky");
+  let task = {name:"—", started:0, tick:null, current:"—", cancel:false};
+
+  function pad(n){return n<10?"0"+n:n}
+  function fmtElapsed(ms){
+    const s = Math.floor(ms/1000), m = Math.floor(s/60), sec = s%60;
+    return `${pad(m)}:${pad(sec)}`;
+  }
+  function startTask(name){
+    task = {name, started: Date.now(), tick: null, current: "—", cancel:false};
+    $("#task-name").textContent = name;
+    $("#task-item").textContent = "—";
+    $("#btn-cancel").disabled = false;
+    const tEl = $("#timer");
+    task.tick = setInterval(()=>{ tEl.textContent = fmtElapsed(Date.now()-task.started); }, 500);
+  }
+  function updateItem(txt){
+    task.current = txt;
+    $("#task-item").textContent = txt || "—";
+  }
+  function finishTask(summaryHtml){
+    if(task.tick) clearInterval(task.tick);
+    $("#btn-cancel").disabled = true;
+    const elapsed = fmtElapsed(Date.now()-task.started);
+    sticky.innerHTML = `<div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div><b>Resultado</b> • <span class="small">ação: <span class="mono">${task.name}</span></span></div>
+        <div class="tag">⏱️ ${elapsed}</div>
+      </div>
+      <div class="divider"></div>
+      ${summaryHtml||""}
+    </div>`;
+  }
+  function cancelTask(){ task.cancel = true; appendLog("⚠️ pedido de cancelamento (nota: o backend não suporta cancelar chamadas em curso)."); }
+  function appendLog(line){
+    const ts = new Date().toLocaleTimeString();
+    logBox.textContent += `[${ts}] ${line}\n`;
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+  function clearLogs(){ logBox.textContent=""; }
+
+  async function postJSON(url, payload){
+    appendLog(`POST ${url} …`);
+    const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+    let txt = await r.text();
+    try{ return [r.ok, JSON.parse(txt)]; } catch{ return [r.ok, {error: txt || `HTTP ${r.status}`}] }
+  }
+  async function getJSON(url){
+    appendLog(`GET ${url} …`);
+    const r = await fetch(url);
+    let txt = await r.text();
+    try{ return [r.ok, JSON.parse(txt)]; } catch{ return [r.ok, {error: txt || `HTTP ${r.status}`}] }
+  }
+
+  // ---------------- Heartbeat ----------------
+  async function heartbeat(){
+    const [ok, j] = await getJSON("/health");
+    const dot = $("#hb-dot"); const t = $("#hb-text");
+    if(ok && j && j.status==="ok"){
+      dot.classList.remove("warn","err"); dot.classList.add("ok");
+      t.textContent = "online";
+      $("#sv-version").textContent = (j.model||"?");
+      $("#sv-rag").textContent = j.rag_available ? "disponível" : "off";
+      $("#sv-mem0").textContent = j.mem0_client_ready ? "on" : "off";
+    }else{
+      dot.classList.remove("ok"); dot.classList.add("warn");
+      t.textContent = "ligação instável";
     }
-    function getCommonPayload(){
-      const ns = el("ns").value.trim();
-      const max_pages = parseInt(el("maxPages").value,10);
-      const deadline_s = parseInt(el("deadline").value,10);
-      const payload = {};
-      if (ns) payload.namespace = ns;
-      if (!isNaN(max_pages) && max_pages > 0) payload.max_pages = max_pages;
-      if (!isNaN(deadline_s) && deadline_s > 0) payload.deadline_s = deadline_s;
-      return payload;
-    }
+  }
+  setInterval(heartbeat, 2500); heartbeat();
 
-    async function postJSON(path, body, timeoutMs = DEFAULT_TIMEOUT_MS){
-      setStatus("loading");
-      setMsg(`<span class="muted">A processar… (timeout ${Math.round(timeoutMs/60000)} min)</span>`);
-      el("out").textContent = "";
-      const ctrl = new AbortController();
-      const t = setTimeout(()=>ctrl.abort(), timeoutMs);
-      try{
-        const res = await fetch(path, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify(body),
-          signal: ctrl.signal
-        });
-        const text = await res.text(); // lê como texto primeiro (evita falhas de JSON)
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch(parseErr){
-          throw new Error(`Resposta não-JSON (status ${res.status}): ${text.slice(0,400)}...`);
-        }
-        if (!res.ok) throw new Error(data && data.error ? data.error : `HTTP ${res.status}`);
-        setMsg(`<span class="ok">✔ OK</span>`);
-        setOut(data);
-        return data;
-      } catch(err){
-        // Captura abort/timeout → mostra erro humano
-        const isAbort = err.name === "AbortError";
-        setMsg(`<span class="err">✖ ${isAbort ? "Timeout/Abort" : "Erro"}:</span> <span class="muted">${(err && err.message) || err}</span>`);
-        setOut({error: String(err)});
-        throw err;
-      } finally{
-        clearTimeout(t);
-        setStatus("idle");
-      }
-    }
-
-    // Botões
-    el("btnSitemap").onclick = async ()=>{
-      const sitemap_url = el("sitemapUrl").value.trim();
-      if (!sitemap_url){ setMsg('<span class="err">Indica o sitemap_url</span>'); return; }
-      const payload = { sitemap_url, ...getCommonPayload() };
-      await postJSON("/rag/ingest-sitemap", payload);
+  // ---------------- Actions ----------------
+  function readCommon(){
+    return {
+      namespace: $("#ns").value.trim() || "default",
+      max_pages: parseInt($("#max_pages").value || "0",10) || undefined,
+      deadline_s: parseInt($("#deadline_s").value || "0",10) || undefined,
+      max_depth: parseInt($("#max_depth").value || "0",10) || undefined,
     };
+  }
 
-    el("btnCrawl").onclick = async ()=>{
-      const seed_url = el("seedUrl").value.trim();
-      if (!seed_url){ setMsg('<span class="err">Indica a seed_url</span>'); return; }
-      const payload = { seed_url, ...getCommonPayload() };
-      const maxDepth = parseInt(el("maxDepth").value, 10);
-      if (!isNaN(maxDepth) && maxDepth > 0) payload.max_depth = maxDepth;
-      await postJSON("/rag/crawl", payload);
-    };
+  async function runSitemap(){
+    const sitemap_url = $("#sitemap_url").value.trim();
+    if(!sitemap_url){ alert("Indica o sitemap_url"); return; }
+    const p = readCommon();
+    startTask("ingest-sitemap");
+    updateItem(sitemap_url);
 
-    el("btnUrl").onclick = async ()=>{
-      const page_url = el("pageUrl").value.trim();
-      if (!page_url){ setMsg('<span class="err">Indica a page_url</span>'); return; }
-      const payload = { page_url, ...getCommonPayload() };
-      await postJSON("/rag/ingest-url", payload);
-    };
+    const [ok, j] = await postJSON("/rag/ingest-sitemap", { sitemap_url, namespace: p.namespace, max_pages: p.max_pages, deadline_s: p.deadline_s });
+    $("#sitemap_res").textContent = JSON.stringify(j, null, 2);
 
-    el("btnText").onclick = async ()=>{
-      const title = el("txtTitle").value.trim();
-      const text = el("txtBody").value.trim();
-      if (!title || !text){ setMsg('<span class="err">Indica título e texto</span>'); return; }
-      const payload = { title, text, ...getCommonPayload() };
-      await postJSON("/rag/ingest-text", payload);
-    };
+    // resumo bonito no topo (usa campos extra se existirem)
+    const total = j.total_locs ?? "—";
+    const ing = j.pages_ingested ?? 0;
+    const fail = j.pages_failed ?? 0;
+    const skippedBlocked = j.skipped_blocked?.length ?? 0;
+    const skippedDupe = j.skipped_dupe?.length ?? 0;
+    const elapsed = j.elapsed_s ? `${j.elapsed_s}s` : $("#timer").textContent;
 
-    el("btnPdf").onclick = async ()=>{
-      const pdf_url = el("pdfUrl").value.trim();
-      if (!pdf_url){ setMsg('<span class="err">Indica o pdf_url</span>'); return; }
-      const title = el("pdfTitle").value.trim();
-      const payload = { pdf_url, ...(title ? {title} : {}), ...getCommonPayload() };
-      await postJSON("/rag/ingest-pdf-url", payload);
-    };
+    const html = `
+      <div class="row">
+        <span class="tag">Sitemap: <span class="mono">${sitemap_url}</span></span>
+        <span class="tag">namespace: <span class="mono">${p.namespace}</span></span>
+      </div>
+      <div class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px">
+        <span class="pill">Total no sitemap: <b class="hl">${total}</b></span>
+        <span class="pill">Ingeridas: <b class="ok">${ing}</b></span>
+        <span class="pill">Falhadas: <b class="err">${fail}</b></span>
+        <span class="pill">Bloqueadas: <b>${skippedBlocked}</b></span>
+        <span class="pill">Duplicadas: <b>${skippedDupe}</b></span>
+        <span class="pill">deadline_s: <b>${p.deadline_s ?? "default"}</b></span>
+        <span class="pill">max_pages: <b>${p.max_pages ?? "default"}</b></span>
+      </div>
+    `;
+    finishTask(html);
+  }
 
-    el("btnSearch").onclick = async ()=>{
-      const q = el("q").value.trim();
-      if (!q){ setMsg('<span class="err">Indica a query</span>'); return; }
-      const ns = el("ns").value.trim();
-      const top_k = parseInt(el("topK").value, 10);
-      const payload = { query: q };
-      if (ns) payload.namespace = ns;
-      if (!isNaN(top_k) && top_k > 0) payload.top_k = top_k;
-      await postJSON("/rag/search", payload, /*search pode ser curto*/ 120000);
-    };
-  </script>
+  async function runCrawler(){
+    const seed_url = $("#seed_url").value.trim();
+    if(!seed_url){ alert("Indica o seed_url"); return; }
+    const p = readCommon();
+    startTask("crawl");
+    updateItem(seed_url);
+
+    const [ok, j] = await postJSON("/rag/crawl", {
+      seed_url, namespace: p.namespace,
+      max_pages: p.max_pages, max_depth: p.max_depth, deadline_s: p.deadline_s
+    });
+    $("#crawl_res").textContent = JSON.stringify(j, null, 2);
+
+    const html = `
+      <div class="row">
+        <span class="tag">Seed: <span class="mono">${seed_url}</span></span>
+        <span class="tag">namespace: <span class="mono">${p.namespace}</span></span>
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">
+        <span class="pill">Visitadas: <b class="hl">${j.visited ?? "—"}</b></span>
+        <span class="pill">Chunks OK: <b class="ok">${j.ok_chunks ?? 0}</b></span>
+        <span class="pill">Falhas: <b class="err">${j.fail ?? 0}</b></span>
+        <span class="pill">max_depth: <b>${p.max_depth ?? "default"}</b></span>
+        <span class="pill">deadline_s: <b>${p.deadline_s ?? "default"}</b></span>
+      </div>
+    `;
+    finishTask(html);
+  }
+
+  async function runUrl(){
+    const page_url = $("#page_url").value.trim();
+    if(!page_url){ alert("Indica o URL"); return; }
+    const p = readCommon();
+    startTask("ingest-url");
+    updateItem(page_url);
+
+    const [ok, j] = await postJSON("/rag/ingest-url", { page_url, namespace: p.namespace, deadline_s: p.deadline_s });
+    $("#url_res").textContent = JSON.stringify(j, null, 2);
+
+    const html = `
+      <div class="row">
+        <span class="tag">URL: <span class="mono">${page_url}</span></span>
+        <span class="tag">namespace: <span class="mono">${p.namespace}</span></span>
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px">
+        <span class="pill">Chunks: <b class="ok">${j.count ?? 0}</b></span>
+        <span class="pill">${j.ok ? 'OK' : '<span class="err">Erro</span>'}</span>
+      </div>
+    `;
+    finishTask(html);
+  }
+
+  async function runText(){
+    const title = $("#txt_title").value.trim();
+    const text = $("#txt_text").value.trim();
+    if(!title || !text){ alert("Título e Texto são obrigatórios"); return; }
+    const p = readCommon();
+    startTask("ingest-text");
+    updateItem(title);
+
+    const [ok, j] = await postJSON("/rag/ingest-text", { title, text, namespace: p.namespace });
+    $("#text_res").textContent = JSON.stringify(j, null, 2);
+    finishTask(`<div class="pill">Chunks: <b class="ok">${j.count ?? 0}</b></div>`);
+  }
+
+  async function runPdf(){
+    const pdf_url = $("#pdf_url").value.trim();
+    const title = $("#pdf_title").value.trim() || null;
+    if(!pdf_url){ alert("Indica o PDF URL"); return; }
+    const p = readCommon();
+    startTask("ingest-pdf-url");
+    updateItem(pdf_url);
+
+    const [ok, j] = await postJSON("/rag/ingest-pdf-url", { pdf_url, title, namespace: p.namespace });
+    $("#pdf_res").textContent = JSON.stringify(j, null, 2);
+    finishTask(`<div class="pill">Chunks: <b class="ok">${j.count ?? 0}</b></div>`);
+  }
+
+  async function runSearch(){
+    const q = $("#q").value.trim();
+    const top_k = parseInt($("#top_k").value||"6",10);
+    const ns = $("#ns").value.trim() || null;
+    if(!q){ alert("Escreve a query"); return; }
+    startTask("search");
+    updateItem(q);
+
+    const [ok, j] = await postJSON("/rag/search", { query:q, namespace: ns || undefined, top_k });
+    $("#search_res").textContent = JSON.stringify(j, null, 2);
+    finishTask(`<div class="pill">Matches: <b class="ok">${(j.matches||[]).length}</b></div>`);
+  }
+</script>
 </body>
 </html>
