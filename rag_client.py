@@ -157,3 +157,8 @@ def search(namespace: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
         query_filter={"must": [{"key": "namespace", "match": {"value": namespace}}]} if namespace else None
     )
     return [{"url": h.payload.get("url"), "title": h.payload.get("title"), "text": h.payload.get("text")} for h in hits]
+
+# retrocompatibilidade com código antigo
+def ingest_text(namespace: str, text: str, url: str = "manual://input", title: str = "Manual Ingest"):
+    """Alias para manter compatibilidade com alma"""
+    return ingest(namespace, url, title, text)
