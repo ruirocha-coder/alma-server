@@ -23,16 +23,17 @@ CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "150"))
 CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "300"))
 CRAWL_MAX_DEPTH   = int(os.getenv("CRAWL_MAX_DEPTH", "3"))
 
+# ---- Ritmo para sitemaps (anti-WAF/CDN) ----
+SITEMAP_SLEEP_MS      = int(os.getenv("SITEMAP_SLEEP_MS", "1000"))   # pausa entre URLs
+SITEMAP_MAX_RETRIES   = int(os.getenv("SITEMAP_MAX_RETRIES", "4"))   # tentativas por URL
+SITEMAP_BACKOFF_MS    = int(os.getenv("SITEMAP_BACKOFF_MS", "1000")) # backoff incremental por tentativa
+
 # Dimensões por modelo (ambos 1536 nas versões atuais)
 MODEL_DIMS = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 1536,
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
-
-print(f"[rag_client] defaults → max_pages={CRAWL_MAX_PAGES}, "
-      f"deadline_s={CRAWL_DEADLINE_S}, max_depth={CRAWL_MAX_DEPTH}, "
-      f"embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, collection={QDRANT_COLLECTION}")
 
 # ========================= Clients ================================
 qdrant = QdrantClient(QDRANT_URL, api_key=QDRANT_API_KEY)
@@ -216,6 +217,15 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     count = _ingest(namespace, pdf_url, title or pdf_url, full)
     return {"ok": True, "url": pdf_url, "count": count}
 
+# ---- helpers de ritmo para sitemaps ----
+def _sleep():
+    time.sleep(max(SITEMAP_SLEEP_MS, 0) / 1000.0)
+
+def _backoff_sleep(attempt: int):
+    # attempt: 1,2,3,...  => 1x,2x,3x ...
+    delay_ms = max(SITEMAP_BACKOFF_MS, 0) * max(attempt, 1)
+    time.sleep(delay_ms / 1000.0)
+
 def ingest_sitemap(
     sitemap_url: str,
     namespace: str = "default",
@@ -235,32 +245,57 @@ def ingest_sitemap(
     # Parse como XML (sitemaps são XML; evita warning)
     soup = BeautifulSoup(r.text, "xml")
 
+    # Apanhar todos os <loc>
     locs = [loc.get_text().strip() for loc in soup.find_all("loc")]
+
+    # Filtrar sitemaps secundários (terminam em .xml) — queremos só páginas HTML
+    page_urls = [u for u in locs if not u.lower().endswith(".xml")]
+
     seen: set[str] = set()
-    ok, fail = 0, 0
     ingested_urls: List[str] = []
     failed_urls: List[Tuple[str, str]] = []
 
     t0 = time.time()
-    for loc in locs:
-        if len(seen) >= max_pages or (time.time() - t0) > deadline_s:
+    def _time_ok() -> bool:
+        return (time.time() - t0) <= deadline_s
+
+    for loc in page_urls:
+        if not _time_ok() or len(ingested_urls) >= max_pages:
             break
+
         url = _clean_url(loc)
         if url in seen:
             continue
         seen.add(url)
-        res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
-        if res.get("ok"):
-            ok += res.get("count", 0)
-            ingested_urls.append(url)
-        else:
-            fail += 1
-            failed_urls.append((url, res.get("error", "unknown")))
+
+        # --- retry loop por URL ---
+        ok = False
+        last_err = None
+        for attempt in range(1, SITEMAP_MAX_RETRIES + 1):
+            try:
+                res = ingest_url(url, namespace=namespace, deadline_s=deadline_s)
+                if res.get("ok"):
+                    ingested_urls.append(url)
+                    ok = True
+                    break
+                else:
+                    last_err = res.get("error", "unknown")
+            except Exception as e:
+                last_err = str(e)
+            # backoff progressivo antes da próxima tentativa
+            _backoff_sleep(attempt)
+
+        if not ok:
+            failed_urls.append((url, last_err or "failed"))
+
+        # pausa curta entre URLs para não rebentar o WAF/CDN
+        _sleep()
+
     return {
         "ok": True,
         "sitemap": sitemap_url,
         "pages_ingested": len(ingested_urls),
-        "pages_failed": fail,
+        "pages_failed": len(failed_urls),
         "namespace": namespace,
         "ingested_urls": ingested_urls[:200],  # corta para resposta
         "failed_urls": failed_urls[:200],
