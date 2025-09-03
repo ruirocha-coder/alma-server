@@ -667,20 +667,32 @@ async def rag_crawl(request: Request):
 
 @app.post("/rag/ingest-sitemap")
 async def rag_ingest_sitemap_route(request: Request):
+    """
+    Ingest via Sitemap XML.
+    Defaults generosos (podem ser override por payload ou env):
+      - max_pages: payload.max_pages || CRAWL_MAX_PAGES || 500
+      - deadline_s: payload.deadline_s || RAG_DEADLINE_S || 500
+    """
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
     try:
         data = await request.json()
         sitemap_url = (data.get("sitemap_url") or data.get("site_url") or "").strip()
         namespace   = (data.get("namespace") or "default").strip()
-        max_pages   = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
-        deadline_s  = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
+        max_pages   = int(data.get("max_pages")  or os.getenv("CRAWL_MAX_PAGES", "500"))
+        deadline_s  = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "500"))
         if not sitemap_url:
             return {"ok": False, "error": "Falta sitemap_url/site_url"}
-        return ingest_sitemap(sitemap_url, namespace=namespace, max_pages=max_pages, deadline_s=deadline_s)
+
+        # Delega no rag_client (que já devolve ingested_urls/failed_urls se disponível)
+        return ingest_sitemap(
+            sitemap_url,
+            namespace=namespace,
+            max_pages=max_pages,
+            deadline_s=deadline_s
+        )
     except Exception as e:
         return {"ok": False, "error": "sitemap_failed", "detail": str(e)}
-
 
 @app.post("/rag/ingest-url")
 async def rag_ingest_url_route(request: Request):
