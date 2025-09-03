@@ -618,54 +618,51 @@ def heygen_token():
 async def rag_crawl(request: Request):
     if not RAG_READY:
         return {"ok": False, "error": "RAG não disponível"}
+
     try:
         data = await request.json()
         seed_url   = (data.get("seed_url") or "").strip()
         namespace  = (data.get("namespace") or "default").strip()
-        max_pages  = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
-        max_depth  = int(data.get("max_depth") or os.getenv("CRAWL_MAX_DEPTH", "2"))
+        max_pages  = int(data.get("max_pages")  or os.getenv("CRAWL_MAX_PAGES", "40"))
+        max_depth  = int(data.get("max_depth")  or os.getenv("CRAWL_MAX_DEPTH", "2"))
         deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
-        verbose    = bool(data.get("verbose") or False)
+
+        # Aceitamos 'verbose' no payload mas, como o rag_client atual não expõe eventos,
+        # simplesmente ignoramos para manter compatibilidade com a UI.
+        _ = data.get("verbose")
 
         if not seed_url:
             return {"ok": False, "error": "Falta seed_url"}
 
-        events = []
-
-        def _progress(ev):
-            if verbose:
-                slim = dict(ev)
-                txt = str(slim.get("url", ""))
-                if len(txt) > 160:
-                    slim["url"] = txt[:157] + "..."
-                events.append(slim)
-                # mantém a lista controlada
-                if len(events) > 500:
-                    events.pop(0)
-
+        # >>> CHAMADA sem progress_cb <<<
         res = crawl_and_ingest(
-            seed_url,
+            seed_url=seed_url,
             namespace=namespace,
             max_pages=max_pages,
             max_depth=max_depth,
             deadline_s=deadline_s,
-            progress_cb=_progress,
         )
 
-        if verbose:
-            res["events"] = events
+        # Normaliza resposta
+        if "ok" not in res:
+            res["ok"] = True
 
-        res["ok"] = True if res.get("ok", True) else False
+        # Pequeno resumo auxiliar (não obrigatório)
+        res.setdefault(
+            "summary",
+            f"visited={res.get('visited')} ok_chunks={res.get('ok_chunks')} fail={res.get('fail')} namespace={namespace}"
+        )
         return res
 
     except Exception as e:
-        logger.exception("crawl_failed")
-        tb = traceback.format_exc(limit=3)
+        # Usa o logger correto ('log') e devolve stack curto para debug no console
+        import traceback
+        log.exception("crawl_failed")
         return {
             "ok": False,
             "error": "crawl_failed",
             "detail": str(e),
-            "trace": tb,
+            "trace": traceback.format_exc(limit=3),
         }
 
 @app.post("/rag/ingest-sitemap")
