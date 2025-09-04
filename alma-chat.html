@@ -2,7 +2,7 @@
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
-  <title>Alma</title>
+  <title>Alma - chat</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
@@ -25,7 +25,7 @@
       display:flex; overflow:hidden;
     }
 
-    /* Sidebar */
+    /* Sidebar / Topbar */
     .sidebar{
       width:310px; min-width:260px; max-width:360px;
       background:linear-gradient(180deg,var(--panel),var(--panel-2));
@@ -34,7 +34,7 @@
     }
     .side-header{
       position:sticky; top:0; z-index:20;
-      display:flex; align-items:flex-end; gap:16px;
+      display:flex; align-items:center; gap:12px;
       padding:14px 16px;
       border-bottom:1px solid var(--border);
       background:linear-gradient(180deg,rgba(10,10,11,.98),rgba(10,10,11,.90));
@@ -45,21 +45,6 @@
       box-shadow: var(--shadow);
       object-fit:cover;
     }
-    .side-title{
-      display:flex; flex-direction:column; gap:6px; padding-bottom:2px;
-    }
-    .side-title h1{
-      margin:0; font-size:1.25rem; font-weight:700; letter-spacing:.2px;
-    }
-    .side-actions{
-      display:flex; gap:10px; align-items:center;
-      color:var(--fg-dim);
-    }
-    .side-actions button{
-      background:none; border:none; color:var(--fg);
-      cursor:pointer; font-size:1rem; padding:4px 6px;
-    }
-    .side-actions button:hover{ color:var(--accent); }
 
     .session-search{
       padding:10px 12px; border-bottom:1px solid var(--border);
@@ -70,6 +55,17 @@
       outline:none;
     }
     .session-search input::placeholder{ color:#8a8a92; }
+
+    .side-actions{
+      display:flex; gap:10px; align-items:center;
+      color:var(--fg-dim); padding:10px 12px;
+      border-bottom:1px solid var(--border);
+    }
+    .side-actions button{
+      background:none; border:none; color:var(--fg);
+      cursor:pointer; font-size:1rem; padding:4px 6px;
+    }
+    .side-actions button:hover{ color:var(--accent); }
 
     .sessions{ flex:1; overflow:auto; padding:10px; }
     .session{
@@ -99,16 +95,22 @@
       scroll-behavior:smooth;
     }
 
-    .msg{ position:relative; max-width:880px; margin:0 auto 12px auto; display:flex; }
+    .msg{ position:relative; max-width:980px; margin:0 auto 12px auto; display:flex; }
     .msg .bubble{
       padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
       font-size:1rem; line-height:1.55; white-space:pre-wrap; word-break:break-word;
       border:1px solid rgba(255,255,255,0.06);
     }
     .msg.user{ justify-content:flex-start; }
-    .msg.user .bubble{ background:var(--bubble-user); }
+    .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
+
     .msg.alma{ justify-content:flex-end; }
-    .msg.alma .bubble{ background:var(--bubble-alma); position:relative; }
+    .msg.alma .bubble{
+      background:var(--bubble-alma);
+      margin-left:auto;           /* garante encosto à direita */
+      max-width:min(90%, 720px);
+      text-align:left;            /* texto normal, apenas balão à direita */
+    }
 
     .copy-btn{
       position:absolute; right:12px; bottom:8px;
@@ -134,7 +136,7 @@
       padding:14px 14px; font-size:1rem; border:none; outline:none;
     }
     .send-btn{
-      min-width:64px; /* igual altura da barra */
+      min-width:64px; /* altura visual compatível com a barra */
       background:var(--accent); color:#000; border:none; font-size:1.2rem;
       display:flex; align-items:center; justify-content:center; cursor:pointer;
       padding:0 22px;
@@ -146,28 +148,47 @@
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
-    @media (max-width: 900px){
-      .sidebar{ width:260px; }
-      .side-header img{ width:60px; height:60px; }
+
+    /* --- Responsivo (mobile / iPad) --- */
+    @media (max-width: 1024px){
+      .sidebar{ width:280px; }
+      .side-header img{ width:64px; height:64px; }
+      .messages{ padding:14px 14px 20px; }
+    }
+    @media (max-width: 820px){ /* iPad portrait / tablets pequenos */
+      body{ flex-direction:column; }
+      .sidebar{
+        width:100%; max-width:none; border-right:none; border-bottom:1px solid var(--border);
+      }
+      .sessions{ max-height:40vh; }
+      .messages{ padding:14px; }
+      .input-wrap{ margin:0 6px; }
+    }
+    @media (max-width: 480px){ /* telemóvel */
+      .side-header img{ width:54px; height:54px; }
+      .session-search{ padding:8px; }
+      .side-actions{ padding:8px; }
+      .sessions{ padding:8px; }
+      .input-bar{ padding:8px; }
+      .send-btn{ padding:0 18px; }
+      .msg .bubble{ font-size:.98rem; }
     }
   </style>
 </head>
 <body>
-  <!-- Sidebar -->
+  <!-- Sidebar / Topbar -->
   <aside class="sidebar">
     <div class="side-header">
       <img src="/static/alma.png" alt="Alma">
-      <div class="side-title">
-        <h1>Alma</h1>
-        <div class="side-actions">
-          <button title="Nova sessão" onclick="newSession()">+</button>
-          <button title="Limpar histórico local" onclick="clearLocal()">x</button>
-        </div>
-      </div>
     </div>
 
     <div class="session-search">
       <input id="search" placeholder="Procurar sessões…" oninput="renderSessions()">
+    </div>
+
+    <div class="side-actions">
+      <button title="Nova sessão" onclick="newSession()">+</button>
+      <button title="Limpar histórico local" onclick="clearLocal()">x</button>
     </div>
 
     <div id="sessions" class="sessions"></div>
