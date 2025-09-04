@@ -1,147 +1,324 @@
 <!DOCTYPE html>
-<html lang="pt">
+<html lang="pt-PT">
 <head>
-  <meta charset="UTF-8">
-  <title>Alma Chat</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: monospace;
-      background: #111;
-      color: #eee;
-      display: flex;
-      height: 100vh;
-    }
-    #sidebar {
-      width: 220px;
-      background: #1a1a1a;
-      padding: 10px;
-      border-right: 2px solid #333;
-      display: flex;
-      flex-direction: column;
-    }
-    #sessions {
-      flex: 1;
-      overflow-y: auto;
-    }
-    .session {
-      padding: 8px;
-      margin: 4px 0;
-      background: #222;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    .session:hover {
-      background: #333;
-    }
-    #chat {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-    }
-    #messages {
-      flex: 1;
-      padding: 20px;
-      overflow-y: auto;
-    }
-    .msg {
-      margin: 8px 0;
-      padding: 10px 14px;
-      border-radius: 6px;
-      max-width: 70%;
-      white-space: pre-wrap;
-    }
-    .user {
-      background: #444;
-      align-self: flex-end;
-    }
-    .alma {
-      background: #2a2a2a;
-      border-left: 4px solid #f2b632; /* amarelo torrado */
-      align-self: flex-start;
-    }
-    #inputBar {
-      display: flex;
-      border-top: 2px solid #333;
-    }
-    #q {
-      flex: 1;
-      padding: 12px;
-      border: none;
-      background: #222;
-      color: #eee;
-      font-size: 14px;
-    }
-    button {
-      background: #f2b632;
-      border: none;
-      padding: 12px 18px;
-      cursor: pointer;
-      font-weight: bold;
-    }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Alma • Chat</title>
+<style>
+  :root{
+    --bg:#0c0c0c; --panel:#131313; --ink:#e9e9e9; --muted:#9ca3af;
+    --accent:#c08a00; /* amarelo torrado */
+    --bubble-user:#1f1f1f; --bubble-alma:#191919;
+    --stroke:#2a2a2a; --btn:#000; --btn-ink:#fff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;
+  }
+  /* layout */
+  .wrap{display:grid; grid-template-rows:auto 1fr auto; height:100%}
+  header{
+    display:flex; align-items:center; gap:.75rem;
+    padding:.75rem 1rem; background:var(--panel); border-bottom:1px solid var(--stroke);
+    position:sticky; top:0; z-index:5;
+  }
+  header img#avatar{
+    width:36px; height:36px; border-radius:50%; object-fit:cover; background:#333;
+  }
+  header .brand{font-weight:600}
+  header .status{color:var(--muted); font-size:12px}
+  .main{
+    display:grid; grid-template-columns:260px 1fr; gap:0; min-height:0;
+  }
+  /* sidebar */
+  .side{
+    border-right:1px solid var(--stroke); background:#0f0f0f; min-height:0;
+    display:flex; flex-direction:column;
+  }
+  .side .controls{padding:.75rem; border-bottom:1px solid var(--stroke)}
+  .side input[type="search"]{
+    width:100%; padding:.55rem .7rem; border-radius:.5rem; border:1px solid var(--stroke);
+    background:#0c0c0c; color:var(--ink); outline:none;
+  }
+  .side .btn{
+    display:inline-flex; align-items:center; justify-content:center; gap:.5rem;
+    background:var(--btn); color:var(--btn-ink); border:1px solid #111;
+    padding:.55rem .7rem; border-radius:.5rem; cursor:pointer; font-weight:600;
+  }
+  .side .sessions{overflow:auto; padding:.5rem}
+  .sess{
+    padding:.55rem .6rem; border:1px solid transparent; border-radius:.5rem; cursor:pointer;
+    display:flex; flex-direction:column; gap:.15rem;
+  }
+  .sess:hover{background:#121212; border-color:#1f1f1f}
+  .sess.active{background:#141414; border-color:var(--accent)}
+  .sess .title{font-weight:600; font-size:14px}
+  .sess .meta{color:var(--muted); font-size:12px}
+  .rename{display:none; width:100%; margin-top:.35rem;
+    background:#0b0b0b; color:var(--ink); border:1px solid var(--stroke);
+    padding:.4rem .5rem; border-radius:.35rem;
+  }
+  /* chat */
+  .chat{display:flex; flex-direction:column; min-height:0}
+  .log{flex:1; overflow:auto; padding:1rem; display:flex; flex-direction:column; gap:.75rem}
+  .row{display:flex; gap:.5rem; align-items:flex-start}
+  .row.user{justify-content:flex-start}
+  .row.alma{justify-content:flex-end}
+  .bubble{
+    max-width:min(720px, 90%); padding:.8rem .95rem; border-radius:14px; border:1px solid var(--stroke);
+    box-shadow:0 0 0 1px rgba(255,255,255,.02) inset;
+  }
+  .row.user .bubble{background:var(--bubble-user)}
+  .row.alma .bubble{background:var(--bubble-alma)}
+  .bubble .meta{
+    display:flex; gap:.5rem; align-items:center; color:var(--muted); font-size:12px; margin-top:.45rem;
+  }
+  .bubble .copy{cursor:pointer; color:var(--accent); font-weight:600}
+  .bubble strong{font-weight:800}
+  .bubble u{text-underline-offset:3px; text-decoration-thickness:2px}
+  .inputbar{
+    display:flex; gap:.6rem; align-items:center; padding:.75rem; border-top:1px solid var(--stroke); background:var(--panel);
+  }
+  .inputbar .ns{
+    padding:.5rem .6rem; border-radius:.5rem; border:1px solid var(--stroke);
+    background:#0d0d0d; color:var(--ink); min-width:12ch;
+  }
+  .input{
+    flex:1; display:flex; align-items:center; gap:.55rem;
+    border:1px solid var(--stroke); border-radius:.75rem; padding:.35rem .5rem; background:#0c0c0c;
+  }
+  .input textarea{
+    flex:1; resize:none; border:none; outline:none; background:transparent; color:var(--ink);
+    height:44px; padding:.45rem .6rem; font:inherit;
+  }
+  .send{
+    width:44px; height:44px; border-radius:.6rem; display:flex; align-items:center; justify-content:center;
+    background:#000; color:#fff; border:1px solid #111; font-size:22px; line-height:1; cursor:pointer;
+  }
+  .pill{display:inline-flex; align-items:center; gap:.35rem; font-size:12px;
+    padding:.2rem .45rem; border-radius:999px; border:1px solid var(--stroke); color:var(--muted)}
+  .accent{color:var(--accent)}
+</style>
 </head>
 <body>
-  <div id="sidebar">
-    <h3>Histórico</h3>
-    <div id="sessions"></div>
-    <button onclick="newSession()">Nova sessão</button>
+<div class="wrap">
+  <header>
+    <img id="avatar" src="alma.png" alt="Alma" onerror="this.style.display='none'"/>
+    <div class="brand">Alma</div>
+    <div class="status">modo chat • <span id="ns-pill" class="accent"></span></div>
+  </header>
+
+  <div class="main">
+    <!-- Sidebar -->
+    <aside class="side">
+      <div class="controls">
+        <button class="btn" id="newSession">+ Nova sessão</button>
+        <div style="height:.55rem"></div>
+        <input id="searchBox" type="search" placeholder="Pesquisar sessões…" />
+      </div>
+      <div class="sessions" id="sessions"></div>
+    </aside>
+
+    <!-- Chat -->
+    <section class="chat">
+      <div class="log" id="log"></div>
+      <div class="inputbar">
+        <select id="ns" class="ns" title="namespace">
+          <option value="">default</option>
+          <option value="boasafra">boasafra</option>
+          <option value="interiorguider">interiorguider</option>
+        </select>
+        <div class="input">
+          <textarea id="box" placeholder="Escreve aqui…" spellcheck="true"></textarea>
+          <button class="send" id="send" title="Enviar">&gt;</button>
+        </div>
+        <span class="pill">Enter para enviar</span>
+      </div>
+    </section>
   </div>
-  <div id="chat">
-    <div id="messages"></div>
-    <div id="inputBar">
-      <input id="q" placeholder="Escreve aqui…" onkeydown="if(event.key==='Enter') send()">
-      <button onclick="send()">Enviar</button>
+</div>
+
+<script>
+/* ---------- config ---------- */
+const API_BASE = location.origin;            // mesmo host do server
+const ASK_URL  = `${API_BASE}/ask`;
+const NS_DEFAULT = localStorage.getItem('alma_ns') || (new URLSearchParams(location.search).get('ns') || '');
+document.getElementById('ns').value = NS_DEFAULT;
+document.getElementById('ns-pill').textContent = NS_DEFAULT || 'default';
+
+/* ---------- utils ---------- */
+const el = (q)=>document.querySelector(q);
+const fmtTime = (d)=> new Date(d).toLocaleTimeString('pt-PT',{hour:'2-digit',minute:'2-digit'});
+const uid = ()=> Math.random().toString(36).slice(2,10);
+
+/* mini-render: **bold**, __underline__ */
+function renderBasicMarkup(raw){
+  if(!raw) return '';
+  let html = raw
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/__(.+?)__/g, '<u>$1</u>');
+  html = html.replace(/\n/g,'<br>');
+  return html;
+}
+
+/* copy to clipboard */
+async function copyText(t){
+  try{ await navigator.clipboard.writeText(t); }catch(e){ console.warn(e); }
+}
+
+/* ---------- session state ---------- */
+let S = {
+  list: JSON.parse(localStorage.getItem('alma_sessions')||'[]'), // [{id,title,ts}]
+  byId: JSON.parse(localStorage.getItem('alma_session_content')||'{}'), // id -> [{role,content,ts}]
+  cur: null
+};
+
+function save(){
+  localStorage.setItem('alma_sessions', JSON.stringify(S.list));
+  localStorage.setItem('alma_session_content', JSON.stringify(S.byId));
+}
+
+function newSession(title="Nova sessão"){
+  const id = uid();
+  const now = Date.now();
+  S.list.unshift({id, title, ts: now});
+  S.byId[id] = [];
+  S.cur = id;
+  save(); drawSessions(); drawLog();
+}
+
+function setTitle(id, title){
+  const it = S.list.find(x=>x.id===id); if(!it) return;
+  it.title = title; save(); drawSessions();
+}
+
+function current(){ return S.byId[S.cur] || []; }
+
+/* ---------- UI: sessions ---------- */
+const sessionsDiv = el('#sessions');
+const searchBox = el('#searchBox');
+searchBox.addEventListener('input', drawSessions);
+
+function drawSessions(){
+  const q = (searchBox.value||'').toLowerCase();
+  sessionsDiv.innerHTML = '';
+  S.list
+    .filter(s => !q || s.title.toLowerCase().includes(q))
+    .forEach(sess=>{
+      const d = document.createElement('div');
+      d.className = 'sess' + (S.cur===sess.id?' active':'');
+      d.innerHTML = `
+        <div class="title" contenteditable="true" data-id="${sess.id}">${sess.title}</div>
+        <div class="meta">${fmtTime(sess.ts)}</div>
+      `;
+      d.onclick = (e)=>{
+        if(e.target.isContentEditable) return;
+        S.cur = sess.id; drawSessions(); drawLog();
+      };
+      sessionsDiv.appendChild(d);
+    });
+
+  // edit handlers
+  sessionsDiv.querySelectorAll('.title[contenteditable]').forEach(node=>{
+    node.addEventListener('blur', ()=> setTitle(node.dataset.id, node.textContent.trim()||'Sem título'));
+    node.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); node.blur(); }});
+  });
+}
+
+/* ---------- UI: chat log ---------- */
+const logDiv = el('#log');
+
+function addRow(role, content, ts=Date.now()){
+  const row = document.createElement('div');
+  row.className = 'row '+(role==='user'?'user':'alma');
+  const canCopy = (role==='assistant'||role==='alma');
+  const copyBtn = canCopy ? `<span class="copy">copiar</span>` : '';
+  row.innerHTML = `
+    <div class="bubble">
+      <div class="txt">${renderBasicMarkup(content)}</div>
+      <div class="meta">
+        <span>${role==='user'?'Tu':'Alma'}</span>
+        <span>•</span>
+        <span>${fmtTime(ts)}</span>
+        ${canCopy? `<span>•</span>${copyBtn}` : ''}
+      </div>
     </div>
-  </div>
+  `;
+  if(canCopy){
+    row.querySelector('.copy').onclick = ()=> copyText(content);
+  }
+  logDiv.appendChild(row);
+  logDiv.scrollTop = logDiv.scrollHeight;
+}
 
-  <script>
-    let userId = "session-" + Date.now();
-    let sessions = JSON.parse(localStorage.getItem("alma_sessions") || "[]");
-    sessions.push(userId);
-    localStorage.setItem("alma_sessions", JSON.stringify(sessions));
-    renderSessions();
+function drawLog(){
+  logDiv.innerHTML = '';
+  (current()).forEach(m=>{
+    addRow(m.role==='assistant'?'alma':m.role, m.content, m.ts);
+  });
+}
 
-    function renderSessions() {
-      let s = document.getElementById("sessions");
-      s.innerHTML = "";
-      (JSON.parse(localStorage.getItem("alma_sessions")||"[]")).forEach(id=>{
-        let div = document.createElement("div");
-        div.className = "session";
-        div.textContent = id;
-        div.onclick = ()=>{ userId=id; };
-        s.appendChild(div);
-      });
-    }
+/* ---------- sending ---------- */
+const box = el('#box');
+const sendBtn = el('#send');
+const nsSel = el('#ns');
 
-    async function send() {
-      let q = document.getElementById("q").value.trim();
-      if(!q) return;
-      addMsg("user", q);
-      document.getElementById("q").value="";
-      let res = await fetch("/ask", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({question:q, user_id:userId})
-      });
-      let j = await res.json();
-      addMsg("alma", j.answer || "[erro]");
-    }
+nsSel.addEventListener('change', ()=>{
+  localStorage.setItem('alma_ns', nsSel.value);
+  el('#ns-pill').textContent = nsSel.value || 'default';
+});
 
-    function addMsg(role, text) {
-      let div = document.createElement("div");
-      div.className = "msg " + role;
-      div.textContent = text;
-      document.getElementById("messages").appendChild(div);
-      document.getElementById("messages").scrollTop = 999999;
-    }
+function autoTitleFromFirstQuestion(text){
+  const words = text.trim().split(/\s+/).slice(0,12).join(' ');
+  return words + (text.split(/\s+/).length>12?'…':'');
+}
 
-    function newSession() {
-      userId = "session-" + Date.now();
-      let sessions = JSON.parse(localStorage.getItem("alma_sessions") || "[]");
-      sessions.push(userId);
-      localStorage.setItem("alma_sessions", JSON.stringify(sessions));
-      renderSessions();
-    }
-  </script>
+async function send(){
+  const q = box.value.trim(); if(!q) return;
+  if(!S.cur) newSession();
+  // se for a primeira mensagem da sessão, gerar título-resumo
+  if(current().length===0){
+    setTitle(S.cur, autoTitleFromFirstQuestion(q));
+  }
+
+  // append local
+  const ts = Date.now();
+  current().push({role:'user', content:q, ts});
+  save(); addRow('user', q, ts);
+  box.value='';
+
+  const namespace = nsSel.value || '';
+  try{
+    const r = await fetch(ASK_URL, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ question:q, user_id:S.cur, namespace })
+    });
+    const j = await r.json();
+    const a = (j && (j.answer||j.reply||j.content)) || '—';
+    const ts2 = Date.now();
+    current().push({role:'assistant', content:a, ts:ts2});
+    save(); addRow('alma', a, ts2);
+  }catch(err){
+    const msg = 'Erro a contactar o servidor.';
+    current().push({role:'assistant', content:msg, ts:Date.now()});
+    save(); addRow('alma', msg, Date.now());
+  }
+}
+
+sendBtn.onclick = send;
+box.addEventListener('keydown', (e)=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+});
+
+el('#newSession').onclick = ()=> newSession('Nova sessão');
+
+(function boot(){
+  if(!S.list.length) newSession('Nova sessão');
+  else { if(!S.cur) S.cur = S.list[0].id; drawSessions(); drawLog(); }
+})();
+</script>
 </body>
 </html>
