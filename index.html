@@ -20,26 +20,36 @@
     }
     .wrap{ width:min(1200px,92vw); display:flex; flex-direction:column; align-items:center; gap:28px; }
 
-    /* -------- AVATAR STAGE -------- */
+    /* Stage avatar */
     .stage{
       width:min(980px,92vw); aspect-ratio:16/9; position:relative;
       background: radial-gradient(1000px 480px at 80% -10%, rgba(212,160,23,.06), transparent 60%),
                   linear-gradient(180deg,var(--panel),var(--panel-2));
       border:1px solid var(--tile-br); border-radius:16px; box-shadow:var(--shadow); overflow:hidden;
     }
-    #avatar-canvas{ position:absolute; inset:0; }
+    #avatar-canvas{ position:absolute; inset:0; display:block; }
+    /* Fallback spinner */
+    .fallback{
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    }
+    .ring{
+      width:64px; height:64px; border-radius:50%;
+      border:3px solid rgba(255,255,255,.12);
+      border-top-color: var(--accent);
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
 
-    /* -------- TYPEWRITER -------- */
+    /* Typewriter */
     .hero-line{
       font-weight:900; letter-spacing:-0.02em; line-height:.95;
-      /* ~5x do tamanho “normal”: grande a sério */
       font-size: clamp(56px, 10vw, 128px);
       text-align:center; user-select:none; white-space:pre-wrap;
     }
     .caret{ display:inline-block; width:.6ch; border-right:4px solid var(--accent); transform: translateY(6px); animation: blink 1s steps(2,start) infinite; }
     @keyframes blink{ 50%{ border-right-color: transparent; } }
 
-    /* -------- TILES -------- */
+    /* Tiles */
     .tiles{ width:100%; display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
     @media (max-width:980px){ .tiles{ grid-template-columns:1fr; } }
     .tile{
@@ -53,9 +63,7 @@
     .tile p{ margin:6px 0 0 0; color:var(--muted); font-size:14px; }
     .go{ font-weight:800; background:var(--accent); color:#121212; padding:8px 12px; border-radius:10px; }
 
-    /* Footer mínimo (opcional) */
     .foot{ color:#8a8a92; font-size:12px; opacity:.6 }
-
   </style>
 
   <!-- Three.js + loaders (CDN) -->
@@ -65,15 +73,13 @@
 </head>
 <body>
   <div class="wrap">
-    <!-- STAGE com avatar 3D -->
     <div class="stage">
       <canvas id="avatar-canvas"></canvas>
+      <div id="fallback" class="fallback" aria-hidden="true"><div class="ring"></div></div>
     </div>
 
-    <!-- Typewriter gigante -->
     <div id="hero" class="hero-line" aria-live="polite"></div>
 
-    <!-- Tiles -->
     <div class="tiles">
       <a class="tile" href="/alma-chat">
         <div>
@@ -82,7 +88,6 @@
         </div>
         <div class="go">&#x3e;</div>
       </a>
-      <!-- Ajusta /voice para o caminho real do teu front de voz -->
       <a class="tile" href="/voice" target="_blank" rel="noopener">
         <div>
           <h3>Falar com a Alma</h3>
@@ -102,198 +107,189 @@
     <div class="foot"> </div>
   </div>
 
+<!-- AVATAR: isolado com try/catch (não bloqueia o resto) -->
 <script>
-/* =========================
-   AVATAR 3D (vanilla Three)
-   ========================= */
 (function(){
-  const canvas = document.getElementById('avatar-canvas');
-  const rect = () => canvas.parentElement.getBoundingClientRect();
+  try{
+    const canvas = document.getElementById('avatar-canvas');
+    const fallback = document.getElementById('fallback');
+    const rect = () => canvas.parentElement.getBoundingClientRect();
 
-  // Scene
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color("#0b0b0b");
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color("#0b0b0b");
 
-  // Camera
-  const r0 = rect();
-  const camera = new THREE.PerspectiveCamera(45, r0.width/r0.height, 0.1, 100);
-  camera.position.set(0, 1.6, 2.0);
+    // Camera
+    const r0 = rect();
+    const camera = new THREE.PerspectiveCamera(45, r0.width/r0.height, 0.1, 100);
+    camera.position.set(0, 1.6, 2.0);
 
-  // Renderer
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(r0.width, r0.height);
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(r0.width, r0.height);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
 
-  // Lights
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 1.0);
-  hemi.position.set(0,2,0);
-  scene.add(hemi);
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 1.0);
+    hemi.position.set(0,2,0);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(2,4,2);
+    scene.add(dir);
 
-  const dir = new THREE.DirectionalLight(0xffffff, 1.0);
-  dir.position.set(2,4,2);
-  scene.add(dir);
+    // Controls
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enableZoom = false; controls.enableRotate = false; controls.enablePan = false;
 
-  // Controls (disabled interactions — só para easing de framing)
-  const controls = new THREE.OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.enableZoom = false; controls.enableRotate = false; controls.enablePan = false;
-
-  // URL do GLB (podes trocar via ?glb=)
-  const urlParam = new URLSearchParams(location.search).get('glb');
-  const AVATAR_URL = urlParam || "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit";
-
-  // Loader
-  const loader = new THREE.GLTFLoader();
-
-  // morph helpers
-  function findMorphIndex(mesh, names){
-    if (!mesh.morphTargetDictionary) return -1;
-    for (const n of names){
-      const i = mesh.morphTargetDictionary[n];
-      if (typeof i === 'number') return i;
-    }
-    return -1;
-  }
-
-  let avatar = null;
-  let exprMeshes = [];
-  let idxSmileL=[], idxSmileR=[];
-  let initialYaw = -35 * Math.PI/180; // começa à esquerda
-  let yaw = initialYaw;
-  let animStart = 0;
-  let turning = true;
-  let smiled = false;
-
-  loader.load(AVATAR_URL, (gltf)=>{
-    avatar = gltf.scene;
-
-    // esconder mãos, afinar materiais
-    avatar.traverse((o)=>{
-      const name = (o.name||"").toLowerCase();
-      if (name.includes("hand") || name.includes("wrist") || name.includes("wolf3d_hands")) o.visible=false;
-      if (o.isMesh && o.material && o.material.isMeshStandardMaterial){
-        o.material.roughness = 0.75;
-        o.material.metalness = 0.05;
+    // Helpers
+    function findMorphIndex(mesh, names){
+      if (!mesh.morphTargetDictionary) return -1;
+      for (const n of names){
+        const i = mesh.morphTargetDictionary[n];
+        if (typeof i === 'number') return i;
       }
+      return -1;
+    }
+    function fitCameraToObject(camera, object, controls, renderer, opt){
+      const {padding=.95,yFocusBias=.72,zoomFactor=.58} = opt||{};
+      const box = new THREE.Box3().setFromObject(object);
+      const size = new THREE.Vector3(), center = new THREE.Vector3();
+      box.getSize(size); box.getCenter(center);
+      const target = center.clone(); target.y += size.y * (yFocusBias - 0.5);
+      const fov = camera.fov*Math.PI/180;
+      const height = size.y*padding, width = size.x*padding;
+      const distH = height/(2*Math.tan(fov/2));
+      const distW = width /(2*Math.tan((fov*camera.aspect)/2));
+      const distance = Math.max(distH, distW) * zoomFactor;
+      const dir = new THREE.Vector3(0,0.12,1).normalize();
+      const newPos = target.clone().add(dir.multiplyScalar(distance));
+      camera.position.copy(newPos);
+      camera.near = Math.max(0.01, distance/100);
+      camera.far = distance*100;
+      camera.updateProjectionMatrix();
+      controls.target.copy(target);
+      controls.update();
+      renderer.render(object.parent||scene, camera);
+    }
+
+    const urlParam = new URLSearchParams(location.search).get('glb');
+    const AVATAR_URL = urlParam || "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit";
+
+    const loader = new THREE.GLTFLoader();
+
+    let avatar = null;
+    let exprMeshes = [];
+    let idxSmileL=[], idxSmileR=[];
+    const initialYaw = -35 * Math.PI/180;
+    let yaw = initialYaw;
+    let animStart = 0;
+    let turning = true;
+    let smiled = false;
+
+    loader.load(AVATAR_URL, (gltf)=>{
+      avatar = gltf.scene;
+
+      avatar.traverse((o)=>{
+        const name = (o.name||"").toLowerCase();
+        if (name.includes("hand") || name.includes("wrist") || name.includes("wolf3d_hands")) o.visible=false;
+        if (o.isMesh && o.material && o.material.isMeshStandardMaterial){
+          o.material.roughness = 0.75;
+          o.material.metalness = 0.05;
+        }
+      });
+
+      // normalizar escala
+      const box = new THREE.Box3().setFromObject(avatar);
+      const size = new THREE.Vector3(); box.getSize(size);
+      const h = size.y || 1;
+      avatar.scale.setScalar(1.75 / h);
+
+      avatar.rotation.y = initialYaw;
+      scene.add(avatar);
+
+      // morphs de sorriso
+      exprMeshes = [];
+      idxSmileL=[]; idxSmileR=[];
+      avatar.traverse((obj)=>{
+        const m = obj;
+        if (m.isMesh && m.morphTargetDictionary && m.morphTargetInfluences){
+          const sL = findMorphIndex(m, ["mouthSmileLeft","MouthSmileLeft","CC_Base_BlendShape.mouthSmileLeft","Wolf3D_Avatar.mouthSmileLeft"]);
+          const sR = findMorphIndex(m, ["mouthSmileRight","MouthSmileRight","CC_Base_BlendShape.mouthSmileRight","Wolf3D_Avatar.mouthSmileRight"]);
+          if (sL>=0 || sR>=0){
+            exprMeshes.push(m);
+            idxSmileL.push(sL);
+            idxSmileR.push(sR);
+          }
+        }
+      });
+
+      fitCameraToObject(camera, avatar, controls, renderer, {padding:.95,yFocusBias:.72,zoomFactor:.58});
+      animStart = performance.now();
+
+      // esconder fallback assim que renderizamos algo
+      fallback.style.display = "none";
+    }, undefined, (err)=>{
+      console.error("Falha ao carregar GLB:", err);
+      // mantém fallback visível
     });
 
-    // normalizar escala ~1.75m
-    const box = new THREE.Box3().setFromObject(avatar);
-    const size = new THREE.Vector3(); box.getSize(size);
-    const h = size.y || 1;
-    avatar.scale.setScalar(1.75 / h);
+    // resize
+    const onResize = ()=>{
+      const r = rect();
+      camera.aspect = r.width/r.height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(r.width, r.height);
+      if (avatar) fitCameraToObject(camera, avatar, controls, renderer, {padding:.95,yFocusBias:.72,zoomFactor:.58});
+    };
+    new ResizeObserver(onResize).observe(canvas.parentElement);
 
-    // posição/rotação inicial
-    avatar.rotation.y = initialYaw;
-    scene.add(avatar);
+    // animação
+    function tick(now){
+      controls.update();
 
-    // localizar morphs sorriso
-    exprMeshes = [];
-    idxSmileL=[]; idxSmileR=[];
-    avatar.traverse((obj)=>{
-      const m = obj;
-      if (m.isMesh && m.morphTargetDictionary && m.morphTargetInfluences){
-        const sL = findMorphIndex(m, ["mouthSmileLeft","MouthSmileLeft","CC_Base_BlendShape.mouthSmileLeft","Wolf3D_Avatar.mouthSmileLeft"]);
-        const sR = findMorphIndex(m, ["mouthSmileRight","MouthSmileRight","CC_Base_BlendShape.mouthSmileRight","Wolf3D_Avatar.mouthSmileRight"]);
-        if (sL>=0 || sR>=0){
-          exprMeshes.push(m);
-          idxSmileL.push(sL);
-          idxSmileR.push(sR);
-        }
+      if (avatar && turning){
+        const t = Math.min(1, (now - animStart)/2200);
+        const eased = t<.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;
+        yaw = initialYaw * (1 - eased); // -35º -> 0
+        avatar.rotation.y = yaw;
+        if (t>=1){ turning = false; }
       }
-    });
-
-    // enquadrar (busto)
-    fitCameraToObject(camera, avatar, controls, renderer, {padding:.95,yFocusBias:.72,zoomFactor:.58});
-
-    animStart = performance.now();
-  }, undefined, (err)=>console.error("Falha ao carregar GLB:", err));
-
-  function fitCameraToObject(camera, object, controls, renderer, opt){
-    const {padding=.95,yFocusBias=.7,zoomFactor=.6} = opt||{};
-    const box = new THREE.Box3().setFromObject(object);
-    const size = new THREE.Vector3(), center = new THREE.Vector3();
-    box.getSize(size); box.getCenter(center);
-    const target = center.clone(); target.y += size.y * (yFocusBias - 0.5);
-    const fov = camera.fov*Math.PI/180;
-    const height = size.y*padding, width = size.x*padding;
-    const distH = height/(2*Math.tan(fov/2));
-    const distW = width /(2*Math.tan((fov*camera.aspect)/2));
-    const distance = Math.max(distH, distW) * zoomFactor;
-    const dir = new THREE.Vector3(0,0.12,1).normalize();
-    const newPos = target.clone().add(dir.multiplyScalar(distance));
-    camera.position.copy(newPos);
-    camera.near = Math.max(0.01, distance/100);
-    camera.far = distance*100;
-    camera.updateProjectionMatrix();
-    controls.target.copy(target);
-    controls.update();
-    renderer.render(object.parent||scene, camera);
-  }
-
-  // resize
-  const onResize = ()=>{
-    const r = rect();
-    camera.aspect = r.width/r.height;
-    camera.updateProjectionMatrix();
-    renderer.setSize(r.width, r.height);
-    if (avatar) fitCameraToObject(camera, avatar, controls, renderer, {padding:.95,yFocusBias:.72,zoomFactor:.58});
-  };
-  new ResizeObserver(onResize).observe(canvas.parentElement);
-
-  // animação
-  function tick(now){
-    controls.update();
-
-    if (avatar && turning){
-      const t = Math.min(1, (now - animStart)/2200); // 2.2s
-      const eased = t<.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2; // ease in-out
-      yaw = initialYaw * (1 - eased); // -35º -> 0
-      avatar.rotation.y = yaw;
-
-      if (t>=1){
-        turning = false;
+      if (avatar && !turning && !smiled){
+        smiled = true;
+        const start = performance.now();
+        const up = 500, down=700, total = up+down;
+        const animSmile = (ts)=>{
+          const p = Math.min(1,(ts-start)/total);
+          let v=0;
+          if (p<=up/total){ v = 0.55*(p/(up/total)); }
+          else { v = 0.55*(1 - 0.6*((p - up/total)/(down/total))); }
+          for (let i=0;i<exprMeshes.length;i++){
+            const infl = exprMeshes[i].morphTargetInfluences||[];
+            if (idxSmileL[i]>=0) infl[idxSmileL[i]] = v;
+            if (idxSmileR[i]>=0) infl[idxSmileR[i]] = v;
+          }
+          if (p<1) requestAnimationFrame(animSmile);
+        };
+        requestAnimationFrame(animSmile);
       }
-    }
 
-    // sorriso quando parar de rodar
-    if (avatar && !turning && !smiled){
-      smiled = true;
-      // anima leve do sorriso (0 -> 0.55 -> 0.22)
-      const start = performance.now();
-      const durationUp = 500, durationDown=700;
-      const total = durationUp+durationDown;
-      const animateSmile = (ts)=>{
-        const p = Math.min(1,(ts-start)/total);
-        let v=0;
-        if (p<=durationUp/total){
-          const u = p/(durationUp/total);
-          v = 0.55*u;
-        } else {
-          const u = (p - durationUp/total)/(durationDown/total);
-          v = 0.55*(1 - 0.6*u); // cai para ~0.22
-        }
-        for (let i=0;i<exprMeshes.length;i++){
-          const infl = exprMeshes[i].morphTargetInfluences||[];
-          if (idxSmileL[i]>=0) infl[idxSmileL[i]] = v;
-          if (idxSmileR[i]>=0) infl[idxSmileR[i]] = v;
-        }
-        if (p<1) requestAnimationFrame(animateSmile);
-      };
-      requestAnimationFrame(animateSmile);
+      renderer.render(scene, camera);
+      requestAnimationFrame(tick);
     }
-
-    renderer.render(scene, camera);
     requestAnimationFrame(tick);
+  }catch(e){
+    console.error("Avatar script error:", e);
+    // deixa o fallback visível e segue
   }
-  requestAnimationFrame(tick);
 })();
+</script>
 
-/* =========================
-   TYPEWRITER (sem caixas)
-   ========================= */
+<!-- TYPEWRITER + PRÉ-AQUECIMENTO (separado, assim corre mesmo que o Three falhe) -->
+<script>
 (function(){
+  // Typewriter
   const el = document.getElementById('hero');
   const text = "> olá , sou a Alma";
   let i=0;
@@ -301,25 +297,16 @@
     i++;
     el.innerHTML = text.slice(0,i) + '<span class="caret"></span>';
     if (i<text.length) setTimeout(step, 45);
-    else el.innerHTML = text; // remove caret no fim
+    else el.textContent = text; // sem caret
   }
-  // começa um pouco após a rotação iniciar
   setTimeout(step, 350);
-})();
 
-/* =========================
-   PRÉ-AQUECIMENTO silencioso
-   ========================= */
-(function(){
-  // não mostrar nada — só aquece endpoints e ficheiros
+  // Pré-aquecimento silencioso
   const silent = (p)=>p.catch(()=>{});
-  silent(fetch('/ping_grok', {method:'GET'}));
-  silent(fetch('/health', {method:'GET'}));
-  // “pré-carregar” as páginas HTML
-  silent(fetch('/alma-chat', {method:'GET'}));
-  silent(fetch('/console', {method:'GET'}));
-  // opcional: prepara cache de modelos de voz, etc. (deixa comentado p/ evitar custos)
-  // silent(fetch('/heygen/token', {method:'POST'}));
+  silent(fetch('/ping_grok'));
+  silent(fetch('/health'));
+  silent(fetch('/alma-chat'));
+  silent(fetch('/console'));
 })();
 </script>
 </body>
