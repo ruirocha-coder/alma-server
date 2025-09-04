@@ -1,324 +1,507 @@
 <!DOCTYPE html>
 <html lang="pt-PT">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Alma • Chat</title>
-<style>
-  :root{
-    --bg:#0c0c0c; --panel:#131313; --ink:#e9e9e9; --muted:#9ca3af;
-    --accent:#c08a00; /* amarelo torrado */
-    --bubble-user:#1f1f1f; --bubble-alma:#191919;
-    --stroke:#2a2a2a; --btn:#000; --btn-ink:#fff;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{
-    margin:0; background:var(--bg); color:var(--ink);
-    font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;
-  }
-  /* layout */
-  .wrap{display:grid; grid-template-rows:auto 1fr auto; height:100%}
-  header{
-    display:flex; align-items:center; gap:.75rem;
-    padding:.75rem 1rem; background:var(--panel); border-bottom:1px solid var(--stroke);
-    position:sticky; top:0; z-index:5;
-  }
-  header img#avatar{
-    width:36px; height:36px; border-radius:50%; object-fit:cover; background:#333;
-  }
-  header .brand{font-weight:600}
-  header .status{color:var(--muted); font-size:12px}
-  .main{
-    display:grid; grid-template-columns:260px 1fr; gap:0; min-height:0;
-  }
-  /* sidebar */
-  .side{
-    border-right:1px solid var(--stroke); background:#0f0f0f; min-height:0;
-    display:flex; flex-direction:column;
-  }
-  .side .controls{padding:.75rem; border-bottom:1px solid var(--stroke)}
-  .side input[type="search"]{
-    width:100%; padding:.55rem .7rem; border-radius:.5rem; border:1px solid var(--stroke);
-    background:#0c0c0c; color:var(--ink); outline:none;
-  }
-  .side .btn{
-    display:inline-flex; align-items:center; justify-content:center; gap:.5rem;
-    background:var(--btn); color:var(--btn-ink); border:1px solid #111;
-    padding:.55rem .7rem; border-radius:.5rem; cursor:pointer; font-weight:600;
-  }
-  .side .sessions{overflow:auto; padding:.5rem}
-  .sess{
-    padding:.55rem .6rem; border:1px solid transparent; border-radius:.5rem; cursor:pointer;
-    display:flex; flex-direction:column; gap:.15rem;
-  }
-  .sess:hover{background:#121212; border-color:#1f1f1f}
-  .sess.active{background:#141414; border-color:var(--accent)}
-  .sess .title{font-weight:600; font-size:14px}
-  .sess .meta{color:var(--muted); font-size:12px}
-  .rename{display:none; width:100%; margin-top:.35rem;
-    background:#0b0b0b; color:var(--ink); border:1px solid var(--stroke);
-    padding:.4rem .5rem; border-radius:.35rem;
-  }
-  /* chat */
-  .chat{display:flex; flex-direction:column; min-height:0}
-  .log{flex:1; overflow:auto; padding:1rem; display:flex; flex-direction:column; gap:.75rem}
-  .row{display:flex; gap:.5rem; align-items:flex-start}
-  .row.user{justify-content:flex-start}
-  .row.alma{justify-content:flex-end}
-  .bubble{
-    max-width:min(720px, 90%); padding:.8rem .95rem; border-radius:14px; border:1px solid var(--stroke);
-    box-shadow:0 0 0 1px rgba(255,255,255,.02) inset;
-  }
-  .row.user .bubble{background:var(--bubble-user)}
-  .row.alma .bubble{background:var(--bubble-alma)}
-  .bubble .meta{
-    display:flex; gap:.5rem; align-items:center; color:var(--muted); font-size:12px; margin-top:.45rem;
-  }
-  .bubble .copy{cursor:pointer; color:var(--accent); font-weight:600}
-  .bubble strong{font-weight:800}
-  .bubble u{text-underline-offset:3px; text-decoration-thickness:2px}
-  .inputbar{
-    display:flex; gap:.6rem; align-items:center; padding:.75rem; border-top:1px solid var(--stroke); background:var(--panel);
-  }
-  .inputbar .ns{
-    padding:.5rem .6rem; border-radius:.5rem; border:1px solid var(--stroke);
-    background:#0d0d0d; color:var(--ink); min-width:12ch;
-  }
-  .input{
-    flex:1; display:flex; align-items:center; gap:.55rem;
-    border:1px solid var(--stroke); border-radius:.75rem; padding:.35rem .5rem; background:#0c0c0c;
-  }
-  .input textarea{
-    flex:1; resize:none; border:none; outline:none; background:transparent; color:var(--ink);
-    height:44px; padding:.45rem .6rem; font:inherit;
-  }
-  .send{
-    width:44px; height:44px; border-radius:.6rem; display:flex; align-items:center; justify-content:center;
-    background:#000; color:#fff; border:1px solid #111; font-size:22px; line-height:1; cursor:pointer;
-  }
-  .pill{display:inline-flex; align-items:center; gap:.35rem; font-size:12px;
-    padding:.2rem .45rem; border-radius:999px; border:1px solid var(--stroke); color:var(--muted)}
-  .accent{color:var(--accent)}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alma Chat</title>
+  <style>
+    :root {
+      --bg: #0b0b0b;
+      --panel: #151515;
+      --panel-2: #1b1b1b;
+      --text: #eaeaea;
+      --muted: #b7b7b7;
+      --accent: #d1a100; /* amarelo mais torrado */
+      --accent-2: #b48a00;
+      --me: #0f0f0f;
+      --alma: #171717;
+      --border: #2a2a2a;
+      --btn-bg: #000;
+      --btn-bg-hover: #111;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      line-height: 1.45;
+    }
+
+    /* Header */
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: linear-gradient(180deg, #0b0b0b, rgba(11,11,11,0.92));
+      border-bottom: 1px solid var(--border);
+    }
+    .header img {
+      width: 36px; height: 36px; border-radius: 50%;
+      border: 1px solid var(--border);
+      object-fit: cover;
+    }
+    .header .title {
+      font-weight: 600;
+      letter-spacing: .2px;
+    }
+    .header .right {
+      margin-left: auto;
+      display: flex; gap: 8px; align-items: center;
+    }
+    .btn {
+      background: var(--btn-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn:hover { background: var(--btn-bg-hover); }
+    .btn-accent {
+      background: var(--accent); border-color: #000; color: #111;
+    }
+    .btn-accent:hover { background: var(--accent-2); }
+
+    /* Layout */
+    .container {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 0;
+      min-height: calc(100dvh - 60px);
+    }
+    @media (max-width: 900px) {
+      .container { grid-template-columns: 1fr; }
+      .sidebar { order: 2; }
+    }
+
+    /* Sidebar */
+    .sidebar {
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+      min-height: calc(100dvh - 60px);
+      display: flex; flex-direction: column;
+    }
+    .side-head {
+      padding: 14px 14px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .side-head input {
+      width: 100%;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 12px;
+      outline: none;
+    }
+    .sessions {
+      padding: 8px 8px 16px;
+      overflow-y: auto;
+      flex: 1;
+    }
+    .session-item {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px;
+      align-items: center;
+      padding: 10px 10px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      border-radius: 10px;
+      margin: 8px 6px;
+      cursor: pointer;
+    }
+    .session-item.active { outline: 1px solid var(--accent); }
+    .session-title {
+      font-size: 14px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-actions {
+      display: flex; gap: 8px;
+    }
+    .icon-btn {
+      background: transparent;
+      color: var(--muted);
+      border: none;
+      cursor: pointer;
+      padding: 6px 6px;
+      border-radius: 6px;
+    }
+    .icon-btn:hover { background: #222; color: var(--text); }
+
+    /* Chat area */
+    .chat {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: calc(100dvh - 60px);
+    }
+    .chat-head {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .chat-head .badge {
+      background: var(--accent);
+      color: #111;
+      font-weight: 700;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      letter-spacing: .3px;
+    }
+    .transcript {
+      padding: 16px;
+      overflow-y: auto;
+      background: radial-gradient(1200px 800px at 100% -200px, #161616 0%, #0b0b0b 45%);
+    }
+    .bubble {
+      max-width: 900px;
+      padding: 14px 16px;
+      margin: 12px 0;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .me { background: var(--me); text-align: left; margin-right: 15%; }
+    .alma { background: var(--alma); text-align: right; margin-left: 15%; border-left: 2px solid var(--accent); }
+    .bubble .meta {
+      display: flex; gap: 10px; align-items: center;
+      font-size: 12px; color: var(--muted); margin-top: 6px;
+    }
+    .bubble .copy {
+      cursor: pointer; text-decoration: underline; color: var(--muted);
+    }
+    .bubble .copy:hover { color: var(--text); }
+
+    .composer {
+      border-top: 1px solid var(--border);
+      padding: 12px;
+      background: var(--panel);
+      display: grid; grid-template-columns: 1fr auto;
+      gap: 12px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 44px;
+      max-height: 160px;
+      padding: 12px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      resize: vertical;
+      outline: none;
+      caret-color: var(--accent);
+    }
+    .send {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .send .btn-send {
+      height: 44px;
+      aspect-ratio: 1.8 / 1;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--btn-bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-weight: 800;
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .send .btn-send:hover { background: var(--btn-bg-hover); }
+    .small { font-size: 12px; color: var(--muted); }
+    .hidden { display: none; }
+    a, a:visited { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <img id="avatar" src="alma.png" alt="Alma" onerror="this.style.display='none'"/>
-    <div class="brand">Alma</div>
-    <div class="status">modo chat • <span id="ns-pill" class="accent"></span></div>
-  </header>
+  <div class="header">
+    <img src="/static/alma.png" alt="Alma" />
+    <div class="title">Alma — console</div>
+    <div class="right">
+      <button id="newSessionBtn" class="btn btn-accent">Nova sessão</button>
+      <button id="clearAllBtn" class="btn">Limpar histórico local</button>
+    </div>
+  </div>
 
-  <div class="main">
+  <div class="container">
     <!-- Sidebar -->
-    <aside class="side">
-      <div class="controls">
-        <button class="btn" id="newSession">+ Nova sessão</button>
-        <div style="height:.55rem"></div>
-        <input id="searchBox" type="search" placeholder="Pesquisar sessões…" />
+    <aside class="sidebar">
+      <div class="side-head">
+        <input id="searchSessions" type="search" placeholder="Pesquisar sessões…" />
       </div>
-      <div class="sessions" id="sessions"></div>
+      <div id="sessionsList" class="sessions"></div>
     </aside>
 
     <!-- Chat -->
-    <section class="chat">
-      <div class="log" id="log"></div>
-      <div class="inputbar">
-        <select id="ns" class="ns" title="namespace">
-          <option value="">default</option>
-          <option value="boasafra">boasafra</option>
-          <option value="interiorguider">interiorguider</option>
-        </select>
-        <div class="input">
-          <textarea id="box" placeholder="Escreve aqui…" spellcheck="true"></textarea>
-          <button class="send" id="send" title="Enviar">&gt;</button>
+    <main class="chat">
+      <div class="chat-head">
+        <span class="badge">ALMA</span>
+        <div id="sessionTitle" style="margin-left:8px;">Sessão atual</div>
+      </div>
+
+      <div id="transcript" class="transcript"></div>
+
+      <div class="composer">
+        <textarea id="input" placeholder="Escreve aqui…"></textarea>
+        <div class="send">
+          <button id="sendBtn" class="btn-send">&gt;</button>
         </div>
-        <span class="pill">Enter para enviar</span>
       </div>
-    </section>
+    </main>
   </div>
-</div>
 
-<script>
-/* ---------- config ---------- */
-const API_BASE = location.origin;            // mesmo host do server
-const ASK_URL  = `${API_BASE}/ask`;
-const NS_DEFAULT = localStorage.getItem('alma_ns') || (new URLSearchParams(location.search).get('ns') || '');
-document.getElementById('ns').value = NS_DEFAULT;
-document.getElementById('ns-pill').textContent = NS_DEFAULT || 'default';
+  <script>
+    // ---------- Storage helpers ----------
+    const LS_KEY = "alma_chat_sessions_v1";
 
-/* ---------- utils ---------- */
-const el = (q)=>document.querySelector(q);
-const fmtTime = (d)=> new Date(d).toLocaleTimeString('pt-PT',{hour:'2-digit',minute:'2-digit'});
-const uid = ()=> Math.random().toString(36).slice(2,10);
+    function loadAll() {
+      try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; }
+      catch { return {}; }
+    }
+    function saveAll(data) {
+      localStorage.setItem(LS_KEY, JSON.stringify(data));
+    }
+    function newId() {
+      return Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+    function summarizeTitle(text) {
+      if (!text) return "Nova sessão";
+      // primeira linha / frase curtinha
+      const line = text.split("\n")[0].trim();
+      const t = line.length > 50 ? line.slice(0, 50) + "…" : line;
+      return t || "Nova sessão";
+    }
 
-/* mini-render: **bold**, __underline__ */
-function renderBasicMarkup(raw){
-  if(!raw) return '';
-  let html = raw
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/__(.+?)__/g, '<u>$1</u>');
-  html = html.replace(/\n/g,'<br>');
-  return html;
-}
+    // ---------- State ----------
+    let sessions = loadAll();      // {id: {title, messages:[{role,content}], created}}
+    let currentId = null;
 
-/* copy to clipboard */
-async function copyText(t){
-  try{ await navigator.clipboard.writeText(t); }catch(e){ console.warn(e); }
-}
+    // ---------- UI nodes ----------
+    const sessionsList = document.getElementById("sessionsList");
+    const searchSessions = document.getElementById("searchSessions");
+    const transcript = document.getElementById("transcript");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("sendBtn");
+    const newSessionBtn = document.getElementById("newSessionBtn");
+    const clearAllBtn = document.getElementById("clearAllBtn");
+    const sessionTitle = document.getElementById("sessionTitle");
 
-/* ---------- session state ---------- */
-let S = {
-  list: JSON.parse(localStorage.getItem('alma_sessions')||'[]'), // [{id,title,ts}]
-  byId: JSON.parse(localStorage.getItem('alma_session_content')||'{}'), // id -> [{role,content,ts}]
-  cur: null
-};
-
-function save(){
-  localStorage.setItem('alma_sessions', JSON.stringify(S.list));
-  localStorage.setItem('alma_session_content', JSON.stringify(S.byId));
-}
-
-function newSession(title="Nova sessão"){
-  const id = uid();
-  const now = Date.now();
-  S.list.unshift({id, title, ts: now});
-  S.byId[id] = [];
-  S.cur = id;
-  save(); drawSessions(); drawLog();
-}
-
-function setTitle(id, title){
-  const it = S.list.find(x=>x.id===id); if(!it) return;
-  it.title = title; save(); drawSessions();
-}
-
-function current(){ return S.byId[S.cur] || []; }
-
-/* ---------- UI: sessions ---------- */
-const sessionsDiv = el('#sessions');
-const searchBox = el('#searchBox');
-searchBox.addEventListener('input', drawSessions);
-
-function drawSessions(){
-  const q = (searchBox.value||'').toLowerCase();
-  sessionsDiv.innerHTML = '';
-  S.list
-    .filter(s => !q || s.title.toLowerCase().includes(q))
-    .forEach(sess=>{
-      const d = document.createElement('div');
-      d.className = 'sess' + (S.cur===sess.id?' active':'');
-      d.innerHTML = `
-        <div class="title" contenteditable="true" data-id="${sess.id}">${sess.title}</div>
-        <div class="meta">${fmtTime(sess.ts)}</div>
-      `;
-      d.onclick = (e)=>{
-        if(e.target.isContentEditable) return;
-        S.cur = sess.id; drawSessions(); drawLog();
+    // ---------- Session CRUD ----------
+    function createSession(prefillQuestion = "") {
+      const id = newId();
+      sessions[id] = {
+        title: summarizeTitle(prefillQuestion || "Nova sessão"),
+        messages: [],
+        created: Date.now()
       };
-      sessionsDiv.appendChild(d);
+      currentId = id;
+      saveAll(sessions);
+      renderSessions();
+      renderTranscript();
+      return id;
+    }
+
+    function deleteSession(id) {
+      if (!sessions[id]) return;
+      delete sessions[id];
+      if (currentId === id) {
+        currentId = Object.keys(sessions)[0] || createSession();
+      }
+      saveAll(sessions);
+      renderSessions();
+      renderTranscript();
+    }
+
+    function setActive(id) {
+      currentId = id;
+      renderSessions();
+      renderTranscript();
+    }
+
+    // ---------- Rendering ----------
+    function renderSessions() {
+      const q = (searchSessions.value || "").toLowerCase();
+      const items = Object.entries(sessions)
+        .sort((a,b)=> (b[1].created||0)-(a[1].created||0))
+        .filter(([id, s]) => !q || (s.title||"").toLowerCase().includes(q));
+
+      sessionsList.innerHTML = "";
+      for (const [id, s] of items) {
+        const div = document.createElement("div");
+        div.className = "session-item" + (id === currentId ? " active" : "");
+        div.onclick = (e) => {
+          // evitar que o click do botão delete selecione a sessão
+          if (e.target.closest(".icon-btn")) return;
+          setActive(id);
+        };
+
+        const title = document.createElement("div");
+        title.className = "session-title";
+        title.textContent = s.title || "Sessão";
+
+        const actions = document.createElement("div");
+        actions.className = "session-actions";
+
+        const delBtn = document.createElement("button");
+        delBtn.className = "icon-btn";
+        delBtn.title = "Apagar sessão";
+        delBtn.textContent = "🗑️";
+        delBtn.onclick = (e) => {
+          e.stopPropagation();
+          if (confirm("Apagar esta sessão?")) {
+            deleteSession(id);
+          }
+        };
+
+        actions.appendChild(delBtn);
+        div.appendChild(title);
+        div.appendChild(actions);
+        sessionsList.appendChild(div);
+      }
+    }
+
+    function renderTranscript() {
+      const s = sessions[currentId];
+      sessionTitle.textContent = s?.title || "Sessão";
+      transcript.innerHTML = "";
+      if (!s || !s.messages || s.messages.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "bubble alma";
+        empty.innerHTML = "<strong>Olá!</strong> Como posso ajudar?";
+        transcript.appendChild(empty);
+        transcript.scrollTop = transcript.scrollHeight;
+        return;
+      }
+      for (const m of s.messages) {
+        const b = document.createElement("div");
+        b.className = "bubble " + (m.role === "user" ? "me" : "alma");
+        b.innerHTML = renderMarkdownish(m.content);
+
+        // barra meta com “copiar”
+        const meta = document.createElement("div");
+        meta.className = "meta";
+
+        const copy = document.createElement("span");
+        copy.className = "copy";
+        copy.textContent = "copiar";
+        copy.onclick = () => {
+          navigator.clipboard.writeText(m.content || "");
+          copy.textContent = "copiado!";
+          setTimeout(()=> copy.textContent = "copiar", 1200);
+        };
+
+        meta.appendChild(copy);
+        b.appendChild(meta);
+        transcript.appendChild(b);
+      }
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+
+    // simples “markdown-ish”: **bold**, __underline__
+    function renderMarkdownish(txt="") {
+      let h = txt
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+      h = h.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+      h = h.replace(/__(.+?)__/g, "<u>$1</u>");
+      h = h.replace(/\n/g, "<br/>");
+      return h;
+    }
+
+    // ---------- Chat flow ----------
+    async function sendMessage() {
+      const q = input.value.trim();
+      if (!q) return;
+
+      // cria sessão se não existir
+      if (!currentId || !sessions[currentId]) {
+        createSession(q);
+      }
+      // atualizar título com resumo da primeira pergunta
+      if ((sessions[currentId].messages||[]).length === 0) {
+        sessions[currentId].title = summarizeTitle(q);
+      }
+
+      sessions[currentId].messages.push({ role: "user", content: q });
+      saveAll(sessions);
+      input.value = "";
+      renderTranscript();
+
+      // mostra placeholder da Alma
+      sessions[currentId].messages.push({ role: "assistant", content: "…" });
+      renderTranscript();
+
+      try {
+        const res = await fetch("/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: q }) // sem namespace
+        });
+        const json = await res.json();
+        const answer = json.answer || JSON.stringify(json, null, 2);
+
+        // substituir placeholder
+        const msgs = sessions[currentId].messages;
+        const idx = msgs.findIndex(m => m.role === "assistant" && m.content === "…");
+        if (idx >= 0) msgs[idx].content = answer; else msgs.push({ role:"assistant", content: answer });
+
+        saveAll(sessions);
+        renderTranscript();
+      } catch (e) {
+        const msgs = sessions[currentId].messages;
+        const idx = msgs.findIndex(m => m.role === "assistant" && m.content === "…");
+        const errTxt = "Desculpa, tive um problema a responder.";
+        if (idx >= 0) msgs[idx].content = errTxt; else msgs.push({ role:"assistant", content: errTxt });
+        saveAll(sessions);
+        renderTranscript();
+      }
+    }
+
+    // ---------- Events ----------
+    sendBtn.addEventListener("click", sendMessage);
+    input.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault(); sendMessage();
+      }
     });
-
-  // edit handlers
-  sessionsDiv.querySelectorAll('.title[contenteditable]').forEach(node=>{
-    node.addEventListener('blur', ()=> setTitle(node.dataset.id, node.textContent.trim()||'Sem título'));
-    node.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); node.blur(); }});
-  });
-}
-
-/* ---------- UI: chat log ---------- */
-const logDiv = el('#log');
-
-function addRow(role, content, ts=Date.now()){
-  const row = document.createElement('div');
-  row.className = 'row '+(role==='user'?'user':'alma');
-  const canCopy = (role==='assistant'||role==='alma');
-  const copyBtn = canCopy ? `<span class="copy">copiar</span>` : '';
-  row.innerHTML = `
-    <div class="bubble">
-      <div class="txt">${renderBasicMarkup(content)}</div>
-      <div class="meta">
-        <span>${role==='user'?'Tu':'Alma'}</span>
-        <span>•</span>
-        <span>${fmtTime(ts)}</span>
-        ${canCopy? `<span>•</span>${copyBtn}` : ''}
-      </div>
-    </div>
-  `;
-  if(canCopy){
-    row.querySelector('.copy').onclick = ()=> copyText(content);
-  }
-  logDiv.appendChild(row);
-  logDiv.scrollTop = logDiv.scrollHeight;
-}
-
-function drawLog(){
-  logDiv.innerHTML = '';
-  (current()).forEach(m=>{
-    addRow(m.role==='assistant'?'alma':m.role, m.content, m.ts);
-  });
-}
-
-/* ---------- sending ---------- */
-const box = el('#box');
-const sendBtn = el('#send');
-const nsSel = el('#ns');
-
-nsSel.addEventListener('change', ()=>{
-  localStorage.setItem('alma_ns', nsSel.value);
-  el('#ns-pill').textContent = nsSel.value || 'default';
-});
-
-function autoTitleFromFirstQuestion(text){
-  const words = text.trim().split(/\s+/).slice(0,12).join(' ');
-  return words + (text.split(/\s+/).length>12?'…':'');
-}
-
-async function send(){
-  const q = box.value.trim(); if(!q) return;
-  if(!S.cur) newSession();
-  // se for a primeira mensagem da sessão, gerar título-resumo
-  if(current().length===0){
-    setTitle(S.cur, autoTitleFromFirstQuestion(q));
-  }
-
-  // append local
-  const ts = Date.now();
-  current().push({role:'user', content:q, ts});
-  save(); addRow('user', q, ts);
-  box.value='';
-
-  const namespace = nsSel.value || '';
-  try{
-    const r = await fetch(ASK_URL, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ question:q, user_id:S.cur, namespace })
+    newSessionBtn.addEventListener("click", ()=> {
+      createSession();
     });
-    const j = await r.json();
-    const a = (j && (j.answer||j.reply||j.content)) || '—';
-    const ts2 = Date.now();
-    current().push({role:'assistant', content:a, ts:ts2});
-    save(); addRow('alma', a, ts2);
-  }catch(err){
-    const msg = 'Erro a contactar o servidor.';
-    current().push({role:'assistant', content:msg, ts:Date.now()});
-    save(); addRow('alma', msg, Date.now());
-  }
-}
+    clearAllBtn.addEventListener("click", ()=> {
+      if (confirm("Limpar todas as sessões guardadas localmente?")) {
+        sessions = {};
+        saveAll(sessions);
+        currentId = createSession();
+        renderSessions();
+        renderTranscript();
+      }
+    });
+    searchSessions.addEventListener("input", renderSessions);
 
-sendBtn.onclick = send;
-box.addEventListener('keydown', (e)=>{
-  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-});
-
-el('#newSession').onclick = ()=> newSession('Nova sessão');
-
-(function boot(){
-  if(!S.list.length) newSession('Nova sessão');
-  else { if(!S.cur) S.cur = S.list[0].id; drawSessions(); drawLog(); }
-})();
-</script>
+    // ---------- boot ----------
+    (function boot(){
+      if (Object.keys(sessions).length === 0) {
+        createSession();
+      } else {
+        currentId = Object.keys(sessions).sort((a,b)=>(sessions[b].created||0)-(sessions[a].created||0))[0];
+      }
+      renderSessions();
+      renderTranscript();
+    })();
+  </script>
 </body>
 </html>
