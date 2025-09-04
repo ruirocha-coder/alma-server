@@ -1,190 +1,250 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Alma</title>
+  <title>Alma — entrada</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
       --bg:#0a0a0b;
       --panel:#0f0f11;
       --panel-2:#141418;
       --fg:#f3f3f3;
-      --fg-dim:#cfcfd3;
-      --border:#26262b;
+      --muted:#b9bac0;
       --accent:#d4a017; /* amarelo torrado */
-      --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25);
+      --tile:#131318;
+      --tile-br:#26262b;
+      --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 20px 60px rgba(0,0,0,.45);
     }
     *{box-sizing:border-box}
     html,body{height:100%}
     body{
-      margin:0;background:radial-gradient(1100px 550px at 80% -10%, rgba(212,160,23,.06), transparent 60%), var(--bg);
-      color:var(--fg);
-      font:15px/1.6 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-      display:flex;align-items:center;justify-content:center;
+      margin:0; background:var(--bg); color:var(--fg);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      display:flex; align-items:center; justify-content:center;
+      overflow:hidden;
     }
-    .wrap{width:100%;max-width:980px;padding:28px}
-    .hero{
-      display:flex;flex-direction:column;align-items:center;gap:18px;
-      background:linear-gradient(180deg,var(--panel),var(--panel-2));
-      border:1px solid var(--border); border-radius:16px; padding:28px;
-      box-shadow: var(--shadow);
-    }
-    .avatar{
-      width:160px;height:160px;border-radius:50%;
-      border:1px solid var(--border); overflow:hidden;
-      display:grid;place-items:center; background:#0b0b0f;
-      box-shadow: var(--shadow);
-      animation: spinOnce 1.6s ease-in-out 1;
-    }
-    .avatar img{width:100%;height:100%;object-fit:cover;display:block;filter:contrast(1.02) saturate(1.05)}
-    @keyframes spinOnce{
-      0%{transform:rotate(0deg)}
-      100%{transform:rotate(360deg)}
+    .wrap{
+      width:min(1200px, 92vw);
+      display:flex; flex-direction:column; align-items:center; gap:28px;
     }
 
-    .typing{
-      width:100%;
-      max-width:560px;
-      background:#101014; border:1px solid var(--border);
-      border-radius:12px; padding:12px 14px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    /* -------- AVATAR “FAKE 3D” (sem depender do React) -------- */
+    .stage{
+      width:min(720px, 92vw);
+      aspect-ratio: 16/9;
+      position:relative;
+      perspective: 1100px;
+      background:
+        radial-gradient(1000px 480px at 80% -10%, rgba(212,160,23,.06), transparent 60%),
+        linear-gradient(180deg,var(--panel),var(--panel-2));
+      border:1px solid var(--tile-br);
+      border-radius:16px;
       box-shadow: var(--shadow);
+      overflow:hidden;
     }
-    .caret{display:inline-block;width:10px;background:var(--fg);margin-left:2px; animation: blink .9s steps(1,end) infinite}
-    @keyframes blink{50%{opacity:0}}
+    .avatar3d{
+      position:absolute; inset:0;
+      transform-style: preserve-3d;
+      display:flex; align-items:center; justify-content:center;
+      animation: faceTurn 2200ms ease-out forwards;
+      will-change: transform, filter;
+    }
+    /* “busto” composto por camadas para dar ilusão */
+    .bust{
+      width:min(360px, 60%); height:auto; aspect-ratio: 3/4;
+      position:relative;
+      transform: translateZ(0); /* baseline */
+      filter: drop-shadow(0 18px 24px rgba(0,0,0,.35));
+    }
+    .head,.torso{
+      position:absolute; left:0; right:0; margin:auto;
+      background: #1b1b21;
+      border:1px solid rgba(255,255,255,.06);
+      border-radius:24px;
+    }
+    .head{
+      top:0; width:100%; height:60%;
+      background:
+        radial-gradient(60% 40% at 50% 30%, #22232a, #1b1b21 70%),
+        #1b1b21;
+      transform: translateZ(20px);
+    }
+    .torso{
+      bottom:0; width:100%; height:52%;
+      background:
+        linear-gradient(180deg,#1d1e25,#17171c);
+      transform: translateZ(-10px);
+    }
+    /* olhos (pontos) e boca que “sorri” quando centra */
+    .eyes{
+      position:absolute; top:34%; left:0; right:0; display:flex; justify-content:center; gap:12%;
+      transform: translateZ(26px);
+      opacity:.9;
+    }
+    .eye{
+      width:12px; height:12px; border-radius:50%;
+      background:#eaeaf0;
+      box-shadow: 0 0 24px rgba(255,255,255,.15);
+    }
+    .mouth{
+      position:absolute; top:52%; left:0; right:0; height:34px;
+      display:flex; align-items:flex-end; justify-content:center;
+      transform: translateZ(26px);
+    }
+    .smile{
+      width:120px; height:36px; border-bottom:4px solid #eaeaf0; border-radius:0 0 90px 90px;
+      transform-origin: 50% 0%;
+      transform: scaleX(.9) scaleY(0); /* “neutra” */
+      transition: transform 500ms ease-out;
+      filter: drop-shadow(0 4px 14px rgba(255,255,255,.2));
+    }
+    .smile.on{ transform: scaleX(1) scaleY(1); }
 
+    @keyframes faceTurn{
+      0%   { transform: rotateY(-35deg) translateZ(0); filter: brightness(.98) saturate(.98); }
+      60%  { transform: rotateY(-8deg)  translateZ(0); }
+      100% { transform: rotateY(0deg)   translateZ(0); filter: brightness(1) saturate(1); }
+    }
+
+    /* -------- TYPEWRITER -------- */
+    .hero-line{
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: .95;
+      font-size: clamp(36px, 8vw, 96px); /* ~5× maior vs normal */
+      text-align:center;
+      user-select:none;
+      white-space: pre-wrap;
+    }
+    .caret{
+      display:inline-block; width:.6ch; border-right: 3px solid var(--accent);
+      transform: translateY(4px);
+      animation: blink 1s steps(2, start) infinite;
+    }
+    @keyframes blink{ 50%{ border-right-color: transparent; } }
+
+    /* -------- TILES -------- */
     .tiles{
-      width:100%; display:grid; gap:14px; margin-top:12px;
-      grid-template-columns: repeat(3, 1fr);
+      width:100%;
+      display:grid; grid-template-columns: repeat(3, 1fr); gap:16px;
     }
-    @media (max-width: 880px){ .tiles{grid-template-columns:1fr} .avatar{width:140px;height:140px} }
+    @media (max-width: 980px){
+      .tiles{ grid-template-columns: 1fr; }
+    }
     .tile{
-      background: #111115; border:1px solid var(--border); border-radius:14px;
-      padding:16px; text-decoration:none; color:var(--fg);
-      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+      background: var(--tile);
+      border:1px solid var(--tile-br);
+      border-radius:14px; padding:18px;
+      text-decoration:none; color:var(--fg);
       box-shadow: var(--shadow);
+      transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease;
     }
-    .tile:hover{ transform: translateY(-1px); border-color: var(--accent); }
-    .tile h3{margin:0 0 6px 0;font-size:1.05rem}
-    .tile p{margin:0;color:var(--fg-dim)}
-    .chip{display:inline-block;background:#1b1b21;border:1px solid #23232a;color:#c7c7cc;border-radius:999px;padding:4px 10px;font-size:.78rem}
-    .status{margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; justify-content:center}
-    .muted{color:#a7a7ae}
-    .ok{color:#7be482}
-    .warn{color:#ffcb6b}
-    .err{color:#ff6b6b}
-    .footer{margin-top:14px; text-align:center; color:var(--fg-dim); font-size:.92rem}
-    .accent{color:var(--accent)}
+    .tile:hover{
+      transform: translateY(-2px);
+      border-color: var(--accent);
+      box-shadow: 0 12px 36px rgba(0,0,0,.45);
+    }
+    .tile h3{ margin:0 0 6px 0; font-size: 18px; }
+    .tile p{ margin:0; color:var(--muted); }
+
+    /* footer invisível (só espaço) */
+    .sp{ height:6px; opacity:0; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <section class="hero">
-      <!-- Avatar -->
-      <div class="avatar">
-        <img src="/static/alma.png" alt="Alma"/>
+    <!-- AVATAR -->
+    <div class="stage" id="stage">
+      <div class="avatar3d" id="avatar">
+        <div class="bust">
+          <div class="head">
+            <div class="eyes">
+              <div class="eye"></div>
+              <div class="eye"></div>
+            </div>
+            <div class="mouth">
+              <div class="smile" id="smile"></div>
+            </div>
+          </div>
+          <div class="torso"></div>
+        </div>
       </div>
+    </div>
 
-      <!-- Typing line -->
-      <div class="typing"><span id="typeTarget"></span><span class="caret">&nbsp;</span></div>
+    <!-- TYPE LINE -->
+    <div class="hero-line" aria-live="polite">
+      <span id="typed"></span><span class="caret"></span>
+    </div>
 
-      <!-- Status / pré-aquecimento -->
-      <div id="warmStatus" class="status">
-        <span class="chip">A preparar serviços…</span>
-      </div>
+    <!-- TILES -->
+    <div class="tiles">
+      <a class="tile" href="/alma-chat">
+        <h3>Escrever com a Alma</h3>
+        <p>Chat rápido com formatação, histórico e cópia por resposta.</p>
+      </a>
+      <a class="tile" href="/app">
+        <h3>Falar com a Alma</h3>
+        <p>Modo voz↔voz com lipsync e TTS pré-carregados.</p>
+      </a>
+      <a class="tile" href="/console">
+        <h3>Adicionar ao Alma Data</h3>
+        <p>Ingere sites, PDFs, texto e pesquisa o RAG.</p>
+      </a>
+    </div>
 
-      <!-- Tiles -->
-      <div class="tiles">
-        <a class="tile" href="/alma-chat">
-          <h3>Escrever com a Alma</h3>
-          <p>Chat em fundo escuro com histórico local e formatação.</p>
-        </a>
-
-        <!-- Ajusta o href para o teu frontend de voz (Next.js).
-             Ex.: href="https://o-teu-frontend.app" ou rota interna se tiveres proxy -->
-        <a class="tile" href="/voice">
-          <h3>Falar com a Alma</h3>
-          <p>Modo voz-voz / texto-voz com transcrição e TTS.</p>
-        </a>
-
-        <a class="tile" href="/console">
-          <h3>Adicionar ao Alma Data</h3>
-          <p>Ingerir URLs, PDFs, Sitemaps e pesquisar (RAG/Qdrant).</p>
-        </a>
-      </div>
-
-      <div class="footer">
-        <span class="muted">Pronto para começar. Escolhe um modo acima.</span>
-      </div>
-    </section>
+    <div class="sp"></div>
   </div>
 
-  <script>
-    // ---- typing effect (> olá)
-    const text = "> olá";
-    const el = document.getElementById("typeTarget");
-    let i = 0;
-    function typeNext(){
-      if(i <= text.length){
-        el.textContent = text.slice(0, i++);
-        setTimeout(typeNext, 90);
-      }
+<script>
+  // -------- anima “sorriso” quando a rotação acaba
+  const smile = document.getElementById('smile');
+  const avatar = document.getElementById('avatar');
+  avatar.addEventListener('animationend', () => {
+    // dá uma pequena pausa e “sorri”
+    setTimeout(()=> smile.classList.add('on'), 160);
+  }, { once: true });
+
+  // -------- typewriter grande: "> olá, sou a Alma"
+  const msg = "> olá, sou a Alma";
+  const out = document.getElementById('typed');
+  let i = 0;
+  function tick(){
+    if (i <= msg.length){
+      out.textContent = msg.slice(0, i);
+      i++;
+      setTimeout(tick, i < 4 ? 240 : 60); // 1ºs chars ligeiramente mais lentos
     }
-    // começa após a rotação (1.6s)
-    setTimeout(typeNext, 1650);
+  }
+  // começa o typing um pouco depois da rotação iniciar
+  setTimeout(tick, 550);
 
-    // ---- pré-aquecimento: /health, /ping_grok e /rag/search (se disponível)
-    const warm = async () => {
-      const box = document.getElementById("warmStatus");
-      const chips = [];
-
-      function addChip(txt, cls){
-        const span = document.createElement("span");
-        span.className = "chip";
-        if (cls) span.classList.add(cls);
-        span.textContent = txt;
-        box.appendChild(span);
-      }
-
-      box.innerHTML = "";
-      addChip("health…");
-
-      // /health
-      let ragOn = false;
-      try{
-        const r = await fetch("/health");
-        const j = await r.json();
-        ragOn = !!j.rag_available;
-        addChip(`modelo: ${j.model||'—'}`, "ok");
-        addChip(`RAG: ${ragOn?'on':'off'}`, ragOn?"ok":"warn");
-      }catch{ addChip("health falhou", "err"); }
-
-      // /ping_grok
-      addChip("grok…");
-      try{
-        const r = await fetch("/ping_grok");
-        const j = await r.json();
-        addChip(j.ok ? "grok ok" : "grok off", j.ok ? "ok" : "err");
-      }catch{ addChip("grok falhou", "err"); }
-
-      // RAG dummy
-      if (ragOn){
-        addChip("rag warm…");
-        try{
-          const r = await fetch("/rag/search?q=ping&namespace=");
-          const j = await r.json();
-          addChip(j.ok ? "rag ok" : "rag off", j.ok ? "ok" : "warn");
-        }catch{ addChip("rag falhou", "err"); }
-      }
-
-      // pré-carregar imagem do avatar (cache)
-      try{
-        const img = new Image();
-        img.src = "/static/alma.png";
-      }catch{}
+  // -------- PRÉ-AQUECIMENTO silencioso (sem etiquetas na UI)
+  (async function warmup(){
+    const silentFetch = async (url, opts) => {
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(()=>ctrl.abort(), 8000);
+        const r = await fetch(url, { ...opts, signal: ctrl.signal });
+        clearTimeout(to);
+        // não mostramos nada; apenas forçamos o connect/compile
+      } catch { /* ignora */ }
     };
-    // dispara logo ao abrir
-    warm();
-  </script>
+    // 1) saúde + ping ao Grok (compila modelos/cloud route)
+    silentFetch('/health');
+    silentFetch('/ping_grok');
+
+    // 2) heygen token (se tiver key configurada) — prepara TTS/avatar externo
+    silentFetch('/heygen/token', { method:'POST' });
+
+    // 3) D-ID /say opcional? -> melhor não sintetizar nada aqui para evitar custos.
+    //    Se quiseres mesmo, poderias chamar com texto curto e ignorar o resultado.
+
+    // 4) aquece o /ask com prompt mínimo mas sem custos de RAG pesados
+    //    (nota: se preferires evitar custo do LLM, comenta esta linha)
+    // silentFetch('/ask', { method:'POST', headers:{'Content-Type':'application/json'},
+    //   body: JSON.stringify({ question: 'ping', user_id: 'warmup' }) });
+  })();
+</script>
 </body>
 </html>
