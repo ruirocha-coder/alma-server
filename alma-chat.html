@@ -107,7 +107,7 @@
     .msg.alma{ justify-content:flex-end; }
     .msg.alma .bubble{
       background:var(--bubble-alma);
-      margin-left:auto;
+      margin-left:auto;           /* encostado à direita */
       max-width:min(90%, 720px);
       text-align:left;
     }
@@ -120,6 +120,15 @@
 
     .bubble b{ font-weight:700; }
     .bubble u{ text-underline-offset: 3px; }
+    .bubble code{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+      font-size:.92em; background:#111; padding:1px 4px; border-radius:4px;
+      border:1px solid rgba(255,255,255,0.06);
+    }
+    .bubble pre{
+      background:#101014; padding:12px; border-radius:10px; overflow:auto;
+      border:1px solid rgba(255,255,255,0.06);
+    }
 
     /* Input (flutuante) */
     .input-bar{
@@ -199,21 +208,13 @@
 
     <div class="input-bar">
       <div class="input-wrap">
-        <input id="prompt" placeholder="Escreve aqui…">
+        <input id="prompt" placeholder="Escreve aqui…" onkeydown="if(event.key==='Enter'){sendMsg()}">
         <button class="send-btn" type="button" onclick="sendMsg()">&#x3e;</button>
       </div>
     </div>
   </main>
 
 <script>
-/* ---------- Debug global: apanha erros JS que podem travar tudo ---------- */
-window.addEventListener('error', e => {
-  console.error('[alma-chat] JS error:', e.message);
-});
-window.addEventListener('unhandledrejection', e => {
-  console.error('[alma-chat] Promise rejection:', e.reason);
-});
-
 /* ---------- Estado local ---------- */
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
@@ -226,36 +227,34 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* Markdown leve → HTML (sem lib externa) */
+/* Markdown leve → HTML (seguro e simples) */
 function mdToHtml(src){
   if(!src) return "";
-  let s = src;
+  // 1) escapar HTML
+  let s = src.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 
-  // Blocos de código ```lang\n...\n``` (captura multi-linha)
-  s = s.replace(/```([\s\S]*?)```/g, (m, code) => {
-    const safe = code.replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    return `<pre><code>${safe}</code></pre>`;
-  });
+  // 2) headings estilo #### título  → <b>título</b>
+  s = s.replace(/^####\s*(.*)$/gm, "<b>$1</b>");
 
-  // Inline code `...`
-  s = s.replace(/`([^`]+)`/g, (m, code)=>`<code>${code.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</code>`);
+  // 3) inline code `...`
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
 
-  // #### Heading → negrito (pedido)
-  s = s.replace(/^####\s*(.*)$/gm, (m, t)=>`<b>${t}</b>`);
+  // 4) **bold**
+  s = s.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
 
-  // **bold**
-  s = s.replace(/\*\*(.*?)\*\*/g,"<b>$1</b>");
-  // __underline__
-  s = s.replace(/__(.*?)__/g,"<u>$1</u>");
+  // 5) __underline__
+  s = s.replace(/__(.*?)__/g, "<u>$1</u>");
 
-  // [texto](url)
-  s = s.replace(/$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?:\\/\\/[^$end:math:text$]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
-
-  // Listas com - ou *
+  // 6) listas simples (- item / * item)
   s = s.replace(/^(?:-|\*)\s+.+(?:\n(?:-|\*)\s+.+)*/gm, block=>{
-    const items = block.split("\n").map(line=>line.replace(/^(?:-|\*)\s+/, "")).map(txt=>`<li>${txt}</li>`).join("");
+    const items = block.split("\n")
+      .map(line=>line.replace(/^(?:-|\*)\s+/, ""))
+      .map(txt=>`<li>${txt}</li>`).join("");
     return `<ul>${items}</ul>`;
   });
+
+  // 7) links [texto](http...)
+  s = s.replace(/$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?:\\/\\/[^$end:math:text$]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
 
   return s;
 }
@@ -381,6 +380,8 @@ async function sendMsg(){
     renderSessions();
     renderMsgs();
 
+    console.log("[alma-chat] enviar pergunta:", txt);
+
     // chamada ao servidor
     const res = await fetch("/ask", {
       method:"POST",
@@ -410,17 +411,6 @@ async function sendMsg(){
     }
   }
 }
-
-/* Enter (sem Shift) envia; Shift+Enter = newline */
-(function bindEnter(){
-  const inp = byId("prompt");
-  inp.addEventListener("keydown", (event)=>{
-    if(event.key === "Enter" && !event.shiftKey){
-      event.preventDefault();
-      sendMsg();
-    }
-  });
-})();
 
 /* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
