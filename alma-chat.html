@@ -314,7 +314,8 @@ function renderMsgs(){
     bubble.className="bubble";
     bubble.innerHTML = (m.content||"")
       .replace(/\*\*(.*?)\*\*/g,"<b>$1</b>")
-      .replace(/__(.*?)__/g,"<u>$1</u>");
+      .replace(/__(.*?)__/g,"<u>$1</u>")
+      .replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");  /* <--- ÚNICA LINHA NOVA */
 
     if(m.role==="alma"){
       const copy=document.createElement("span");
