@@ -1,315 +1,255 @@
 <!DOCTYPE html>
-<html lang="pt-PT">
+<html lang="pt">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>alma</title>
+  <meta charset="utf-8"/>
+  <title>Alma Chat</title>
   <style>
-    :root{
-      --bg:#0b0b0b;--panel:#151515;--panel-2:#1b1b1b;--text:#eaeaea;--muted:#b7b7b7;
-      --accent:#d1a100;--accent-2:#b48a00;--border:#2a2a2a;--btn:#000;--btn-hover:#111;
-      --me:#0f0f0f;--alma:#171717;
+    :root {
+      --bg:#0b0b0b;
+      --fg:#f5f5f5;
+      --accent:#d4a017;
+      --border:#333;
     }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);
-      font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-    /* Header */
-    .header{position:sticky;top:0;z-index:20;display:flex;align-items:flex-end;gap:16px;
-      padding:12px 16px;background:linear-gradient(180deg,#0b0b0b,rgba(11,11,11,.92));
-      border-bottom:1px solid var(--border)}
-    .header img{width:108px;height:108px;border-radius:50%;border:1px solid var(--border);object-fit:cover}
-    .title{font-weight:700;font-size:20px;letter-spacing:.2px}
-    .right{margin-left:auto;display:flex;gap:8px;align-items:center}
-    .btn{background:var(--btn);border:1px solid var(--border);color:var(--text);
-      padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700}
-    .btn:hover{background:var(--btn-hover)}
-    .btn-accent{background:var(--accent);border-color:#000;color:#111}
-    .btn-accent:hover{background:var(--accent-2)}
-    /* Layout */
-    .container{display:grid;grid-template-columns:320px 1fr;min-height:calc(100dvh - 140px)}
-    @media (max-width:900px){.container{grid-template-columns:1fr}.sidebar{order:2}}
-    /* Sidebar */
-    .sidebar{border-right:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column}
-    .side-head{padding:14px 14px 8px;border-bottom:1px solid var(--border)}
-    .side-head input{width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);
-      border-radius:8px;padding:10px 12px;outline:none}
-    .sessions{padding:8px 8px 16px;overflow-y:auto;flex:1}
-    .session-item{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center;
-      padding:10px 10px;border:1px solid var(--border);background:var(--panel-2);
-      border-radius:10px;margin:8px 6px;cursor:pointer}
-    .session-item.active{outline:1px solid var(--accent)}
-    .session-title{font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .icon-btn{background:transparent;color:var(--muted);border:none;cursor:pointer;padding:2px 6px;
-      border-radius:6px;font-size:14px;font-weight:700}
-    .icon-btn:hover{background:#222;color:var(--text)}
-    /* Chat */
-    .chat{display:grid;grid-template-rows:auto 1fr auto}
-    .chat-head{padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel);
-      display:flex;align-items:center;gap:8px}
-    .chat-head .badge{background:var(--accent);color:#111;font-weight:800;font-size:12px;
-      padding:2px 8px;border-radius:999px}
-    .transcript{padding:16px;overflow-y:auto;background:radial-gradient(1200px 800px at 100% -200px,#161616 0%,#0b0b0b 45%)}
-    .bubble{max-width:900px;padding:14px 16px;margin:12px 0;border:1px solid var(--border);
-      border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-    .me{background:var(--me);text-align:left;margin-right:15%}
-    .alma{background:var(--alma);text-align:right;margin-left:15%;border-left:2px solid var(--accent)}
-    .meta{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--muted);margin-top:6px}
-    .copy{cursor:pointer;text-decoration:underline;color:var(--muted)}
-    .copy:hover{color:var(--text)}
-    .composer{border-top:1px solid var(--border);padding:12px;background:var(--panel);
-      display:grid;grid-template-columns:1fr 54px;gap:12px}
-    textarea{width:100%;min-height:48px;max-height:200px;padding:12px;background:var(--panel-2);
-      border:1px solid var(--border);color:var(--text);border-radius:10px;resize:vertical;outline:none;caret-color:var(--accent)}
-    .btn-send{width:100%;height:100%;display:inline-flex;align-items:center;justify-content:center;
-      background:var(--btn);color:var(--text);border:1px solid var(--border);border-radius:10px;
-      font-weight:800;font-size:18px;cursor:pointer}
-    .btn-send:hover{background:var(--btn-hover)}
-    /* Markdown mínimo */
-    .bubble strong{font-weight:800}
-    .bubble em{font-style:italic}
-    .bubble u{text-decoration:underline}
-    code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
-      background:#111;border:1px solid var(--border);padding:.15rem .35rem;border-radius:6px}
+    body {
+      margin:0;
+      font-family:system-ui, sans-serif;
+      background:var(--bg);
+      color:var(--fg);
+      display:flex;
+      height:100vh;
+      overflow:hidden;
+    }
+    .sidebar {
+      width:280px;
+      background:#111;
+      border-right:1px solid var(--border);
+      display:flex;
+      flex-direction:column;
+    }
+    .header {
+      position:sticky;
+      top:0;
+      z-index:20;
+      display:flex;
+      align-items:flex-end; /* alinhado pela base */
+      gap:16px;
+      padding:12px 16px;
+      background:linear-gradient(180deg,#0b0b0b,rgba(11,11,11,.92));
+      border-bottom:1px solid var(--border);
+    }
+    .header img {
+      width:72px;  /* 3x maior */
+      height:72px;
+      border-radius:50%;
+    }
+    .header h1 {
+      font-size:1.4em;
+      font-weight:bold;
+      margin:0;
+    }
+    .sessions {
+      flex:1;
+      overflow-y:auto;
+      padding:8px;
+    }
+    .session {
+      padding:6px 10px;
+      border:1px solid var(--border);
+      margin-bottom:6px;
+      cursor:pointer;
+      border-radius:6px;
+    }
+    .session:hover { background:#222; }
+    .session.active { background:#333; border-color:var(--accent); }
+    .session .del {
+      float:right;
+      color:#999;
+      cursor:pointer;
+      font-size:0.9em;
+      margin-left:8px;
+    }
+    .session .del:hover { color:#f66; }
+    .controls {
+      padding:8px;
+      border-top:1px solid var(--border);
+      display:flex;
+      gap:8px;
+      justify-content:space-between;
+    }
+    .controls button {
+      background:none;
+      border:none;
+      color:var(--fg);
+      cursor:pointer;
+      font-size:1em;
+    }
+    .controls button:hover { color:var(--accent); }
+    .main {
+      flex:1;
+      display:flex;
+      flex-direction:column;
+    }
+    .messages {
+      flex:1;
+      overflow-y:auto;
+      padding:16px;
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+    }
+    .msg {
+      padding:10px 14px;
+      border-radius:8px;
+      max-width:75%;
+      white-space:pre-wrap;
+      line-height:1.4;
+      position:relative;
+    }
+    .msg.user {
+      background:#222;
+      align-self:flex-start;
+    }
+    .msg.alma {
+      background:#333;
+      align-self:flex-end;
+    }
+    .copy-btn {
+      position:absolute;
+      bottom:4px;
+      right:8px;
+      font-size:0.75em;
+      color:#bbb;
+      cursor:pointer;
+    }
+    .copy-btn:hover { color:var(--accent); }
+    .input-bar {
+      display:flex;
+      border-top:1px solid var(--border);
+      background:#111;
+    }
+    .input-bar input {
+      flex:1;
+      padding:12px;
+      background:none;
+      border:none;
+      outline:none;
+      color:var(--fg);
+      font-size:1em;
+    }
+    .input-bar button {
+      background:var(--accent);
+      border:none;
+      color:#000;
+      padding:0 20px;
+      cursor:pointer;
+      font-size:1.2em;
+    }
+    .input-bar button:hover { background:#e0b323; }
   </style>
 </head>
 <body>
-  <div class="header">
-    <img src="/static/alma.png" alt="Alma" />
-    <div class="title">alma – chat</div>
-    <div class="right">
-      <button id="newSessionBtn" class="btn btn-accent" title="Nova sessão">+</button>
-      <button id="clearAllBtn" class="btn" title="Apagar histórico local">Limpar histórico local</button>
+  <div class="sidebar">
+    <div class="header">
+      <img src="/static/alma.png" alt="Alma"/>
+      <h1>Alma - chat</h1>
+    </div>
+    <div class="sessions" id="sessions"></div>
+    <div class="controls">
+      <button onclick="newSession()">+</button>
+      <button onclick="clearLocal()">x</button>
+    </div>
+  </div>
+  <div class="main">
+    <div class="messages" id="messages"></div>
+    <div class="input-bar">
+      <input id="prompt" placeholder="Escreve aqui..."/>
+      <button onclick="sendMsg()">></button>
     </div>
   </div>
 
-  <div class="container">
-    <!-- Sidebar -->
-    <aside class="sidebar">
-      <div class="side-head">
-        <input id="searchBox" type="search" placeholder="Pesquisar sessões…" />
-      </div>
-      <div id="sessions" class="sessions"></div>
-    </aside>
+<script>
+let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
+let activeId = sessions.length? sessions[0].id : null;
+renderSessions();
 
-    <!-- Chat -->
-    <section class="chat">
-      <div class="chat-head">
-        <span class="badge" id="sessionBadge">sessão</span>
-      </div>
-      <div id="transcript" class="transcript"></div>
-      <div class="composer">
-        <textarea id="prompt" placeholder="Escreve aqui…"></textarea>
-        <button id="sendBtn" class="btn-send" aria-label="Enviar mensagem">&gt;</button>
-      </div>
-    </section>
-  </div>
-
-  <script>
-    // --------- Armazenamento local ---------
-    const LS_KEY = "alma_sessions_v1";
-
-    function loadSessions(){
-      try{ return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); }
-      catch{ return {}; }
+function newSession(){
+  const id="s"+Date.now();
+  sessions.unshift({id,title:"Nova sessão",msgs:[]});
+  activeId=id;
+  saveSessions();
+  renderSessions();
+  renderMsgs();
+}
+function delSession(id){
+  sessions=sessions.filter(s=>s.id!==id);
+  if(activeId===id) activeId=sessions.length? sessions[0].id:null;
+  saveSessions();
+  renderSessions();
+  renderMsgs();
+}
+function clearLocal(){
+  if(confirm("Apagar histórico local?")){
+    sessions=[];
+    activeId=null;
+    saveSessions();
+    renderSessions();
+    renderMsgs();
+  }
+}
+function saveSessions(){ localStorage.setItem("alma_sessions",JSON.stringify(sessions)); }
+function renderSessions(){
+  const box=document.getElementById("sessions");
+  box.innerHTML="";
+  sessions.forEach(s=>{
+    const div=document.createElement("div");
+    div.className="session"+(s.id===activeId?" active":"");
+    div.textContent=s.title;
+    const del=document.createElement("span");
+    del.className="del"; del.textContent="x";
+    del.onclick=(ev)=>{ev.stopPropagation(); delSession(s.id);};
+    div.appendChild(del);
+    div.onclick=()=>{activeId=s.id; renderSessions(); renderMsgs();};
+    box.appendChild(div);
+  });
+}
+function renderMsgs(){
+  const s=sessions.find(x=>x.id===activeId);
+  const box=document.getElementById("messages");
+  box.innerHTML="";
+  if(!s) return;
+  s.msgs.forEach(m=>{
+    const div=document.createElement("div");
+    div.className="msg "+m.role;
+    div.innerHTML=m.content
+      .replace(/\*\*(.*?)\*\*/g,"<b>$1</b>")
+      .replace(/__(.*?)__/g,"<u>$1</u>");
+    if(m.role==="alma"){
+      const copy=document.createElement("span");
+      copy.className="copy-btn";
+      copy.textContent="copiar";
+      copy.onclick=()=>navigator.clipboard.writeText(m.content);
+      div.appendChild(copy);
     }
-    function saveSessions(data){ localStorage.setItem(LS_KEY, JSON.stringify(data)); }
-
-    function createSession(){
-      const id = crypto.randomUUID();
-      const at = Date.now();
-      const data = loadSessions();
-      data[id] = { id, created: at, title: "Nova sessão", messages: [] };
-      saveSessions(data);
-      return id;
-    }
-    function deleteSession(id){
-      const data = loadSessions();
-      delete data[id];
-      saveSessions(data);
-    }
-
-    // --------- UI State ---------
-    let currentSessionId = null;
-
-    const elSessions   = document.getElementById("sessions");
-    const elTranscript = document.getElementById("transcript");
-    const elPrompt     = document.getElementById("prompt");
-    const elSend       = document.getElementById("sendBtn");
-    const elNew        = document.getElementById("newSessionBtn");
-    const elClearAll   = document.getElementById("clearAllBtn");
-    const elSearch     = document.getElementById("searchBox");
-    const elBadge      = document.getElementById("sessionBadge");
-
-    function fmtTitleFromFirstUser(msgs){
-      const first = (msgs || []).find(m => m.role === "user");
-      if(!first) return "Sessão";
-      const t = first.content.trim().replace(/\s+/g," ");
-      return t.length > 60 ? t.slice(0,57)+"…" : t;
-    }
-
-    function renderSessions(filter=""){
-      const data = loadSessions();
-      const ids = Object.keys(data).sort((a,b)=> data[b].created - data[a].created);
-      elSessions.innerHTML = "";
-      ids.forEach(id=>{
-        const s = data[id];
-        if(filter && !String(s.title||"").toLowerCase().includes(filter.toLowerCase())) return;
-        const item = document.createElement("div");
-        item.className = "session-item" + (id===currentSessionId ? " active" : "");
-        const title = document.createElement("div");
-        title.className = "session-title";
-        title.textContent = s.title || "Sessão";
-        const del = document.createElement("button");
-        del.className = "icon-btn";
-        del.textContent = "x";
-        del.title = "Apagar sessão";
-        del.addEventListener("click",(e)=>{
-          e.stopPropagation();
-          if(confirm("Apagar esta sessão?")){
-            const next = (id===currentSessionId) ? null : currentSessionId;
-            deleteSession(id);
-            if(next===null){
-              // abrir outra sessão (a mais recente) ou criar nova
-              const rest = loadSessions();
-              const left = Object.keys(rest);
-              if(left.length){
-                setCurrentSession(left.sort((a,b)=> rest[b].created - rest[a].created)[0]);
-              }else{
-                setCurrentSession(createSession());
-              }
-            }else{
-              renderSessions(elSearch.value);
-            }
-          }
-        });
-        item.addEventListener("click", ()=> setCurrentSession(id));
-        item.appendChild(title);
-        item.appendChild(del);
-        elSessions.appendChild(item);
-      });
-    }
-
-    function setCurrentSession(id){
-      currentSessionId = id;
-      const data = loadSessions();
-      const s = data[id];
-      elBadge.textContent = s?.title || "sessão";
-      renderSessions(elSearch.value);
-      renderTranscript();
-    }
-
-    function renderTranscript(){
-      const data = loadSessions();
-      const s = data[currentSessionId];
-      elTranscript.innerHTML = "";
-      if(!s) return;
-      (s.messages||[]).forEach((m, idx)=>{
-        const div = document.createElement("div");
-        div.className = "bubble " + (m.role === "user" ? "me" : "alma");
-        div.innerHTML = renderRich(m.content);
-        // meta com copiar apenas nas respostas da Alma
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        if(m.role !== "user"){
-          const copy = document.createElement("span");
-          copy.className = "copy";
-          copy.textContent = "copiar";
-          copy.addEventListener("click", ()=> {
-            navigator.clipboard.writeText(m.content||"");
-            copy.textContent = "copiado!";
-            setTimeout(()=> copy.textContent = "copiar", 1000);
-          });
-          meta.appendChild(copy);
-        }
-        div.appendChild(meta);
-        elTranscript.appendChild(div);
-      });
-      elTranscript.scrollTop = elTranscript.scrollHeight;
-    }
-
-    // ultra-simples “markdown”
-    function renderRich(t=""){
-      // proteger &
-      let s = (t||"").replace(/&/g,"&amp;");
-      s = s
-        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replace(/__(.+?)__/g, "<u>$1</u>")
-        .replace(/\*(.+?)\*/g, "<em>$1</em>")
-        .replace(/`([^`]+)`/g, "<code>$1</code>");
-      return s;
-    }
-
-    // --------- Envio para o servidor ---------
-    async function sendMessage(){
-      const q = elPrompt.value.trim();
-      if(!q) return;
-      elPrompt.value = "";
-
-      // append user
-      const data = loadSessions();
-      const s = data[currentSessionId];
-      s.messages.push({role:"user", content:q});
-      if(!s.title || s.title==="Nova sessão" || s.title==="Sessão"){
-        s.title = fmtTitleFromFirstUser(s.messages);
-      }
-      saveSessions(data);
-      renderSessions(elSearch.value);
-      renderTranscript();
-
-      // call /ask
-      try{
-        const res = await fetch("/ask", {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          body: JSON.stringify({ question:q, user_id: currentSessionId })
-        });
-        const j = await res.json();
-        const answer = (j && (j.answer || j.reply)) || "Desculpa, não consegui responder.";
-        const d2 = loadSessions();
-        d2[currentSessionId].messages.push({role:"alma", content:answer});
-        saveSessions(d2);
-        renderTranscript();
-      }catch(e){
-        const d2 = loadSessions();
-        d2[currentSessionId].messages.push({role:"alma", content:"[erro] não foi possível contactar o servidor."});
-        saveSessions(d2);
-        renderTranscript();
-      }
-    }
-
-    // --------- Eventos ---------
-    elSend.addEventListener("click", sendMessage);
-    elPrompt.addEventListener("keydown",(e)=>{
-      if(e.key==="Enter" && !e.shiftKey){
-        e.preventDefault();
-        sendMessage();
-      }
-    });
-    elNew.addEventListener("click", ()=>{
-      const id = createSession();
-      setCurrentSession(id);
-    });
-    elClearAll.addEventListener("click", ()=>{
-      if(confirm("Apagar TODO o histórico local de sessões?")){
-        localStorage.removeItem(LS_KEY);
-        const id = createSession();
-        setCurrentSession(id);
-      }
-    });
-    elSearch.addEventListener("input", ()=> renderSessions(elSearch.value));
-
-    // --------- Boot ---------
-    (function init(){
-      const data = loadSessions();
-      if(!Object.keys(data).length){
-        const id = createSession();
-        setCurrentSession(id);
-      }else{
-        // escolhe a mais recente
-        const ids = Object.keys(data).sort((a,b)=> data[b].created - data[a].created);
-        setCurrentSession(ids[0]);
-      }
-    })();
-  </script>
+    box.appendChild(div);
+  });
+  box.scrollTop=box.scrollHeight;
+}
+async function sendMsg(){
+  const inp=document.getElementById("prompt");
+  const txt=inp.value.trim(); if(!txt) return;
+  inp.value="";
+  const s=sessions.find(x=>x.id===activeId);
+  if(!s){ newSession(); return sendMsg(); }
+  s.msgs.push({role:"user",content:txt});
+  renderMsgs();
+  const r=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:txt,user_id:activeId})});
+  const j=await r.json();
+  const ans=j.answer||JSON.stringify(j);
+  s.msgs.push({role:"alma",content:ans});
+  renderMsgs();
+  saveSessions();
+}
+renderMsgs();
+</script>
 </body>
 </html>
