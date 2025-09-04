@@ -3,7 +3,8 @@
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse  
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles   # <--- novo para servir ficheiros estáticos
 
 import os
 import requests
@@ -12,21 +13,6 @@ import uvicorn
 import time
 import re
 from typing import Dict, List, Tuple, Optional
-
-app = FastAPI(title="Alma Server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-# --- servir a imagem da Alma ---
-@app.get("/alma.png")
-def serve_alma_png():
-    path = "alma.png"  # mesmo diretório do main.py
-    if not os.path.exists(path):
-        return HTMLResponse("<h1>alma.png não encontrado</h1>", status_code=404)
-    return FileResponse(path, media_type="image/png")
 
 # ---------------------------------------------------------------------------------------
 # FastAPI & CORS
@@ -37,6 +23,9 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+# --- servir a pasta static (onde fica o alma.png) ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------------------------------------------------------------------------------------
 # Logging / Versão
