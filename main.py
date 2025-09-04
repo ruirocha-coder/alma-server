@@ -277,8 +277,17 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS
 # ---------------------------------------------------------------------------------------
-@app.get("/")
-def root():
+# NOVO: "/" serve a landing page (index.html). O JSON antigo foi movido para /status.
+@app.get("/", response_class=HTMLResponse)
+def serve_index():
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return HTMLResponse("<h1>index.html não encontrado</h1>", status_code=404)
+
+@app.get("/status")
+def status_json():
     return {
         "status": "ok",
         "version": APP_VERSION,
@@ -379,8 +388,6 @@ def serve_alma_chat():
             return f.read()
     except Exception:
         return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
-
-
 
 # ---------------------------------------------------------------------------------------
 # 🔗 Pipeline Alma: Mem0 → RAG → Grok
