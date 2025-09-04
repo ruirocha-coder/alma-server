@@ -1,522 +1,429 @@
 <!doctype html>
 <html lang="pt">
 <head>
-  <meta charset="utf-8" />
-  <title>Alma — Console RAG</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {
-      --bg: #0f1115;
-      --panel: #151922;
-      --panel-2: #10131a;
-      --text: #e6e6e6;
-      --muted: #a9b1c0;
-      --accent: #7c5cff;
-      --ok: #21d07a;
-      --warn: #ffbf47;
-      --err: #ff5978;
-      --chip: #1c2230;
-      --chip-2: #0e1420;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      --radius: 12px;
-    }
-    html, body {
-      background: var(--bg);
-      color: var(--text);
-      margin: 0; padding: 0;
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
-    }
-    .wrap { max-width: 1200px; margin: 20px auto; padding: 0 16px; }
-    header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px rgba(33,208,122,.15); }
-    h1 { font-size: 18px; font-weight: 600; margin: 0; }
-    .topbar {
-      background: var(--panel);
-      border: 1px solid #20283a;
-      padding: 14px 16px;
-      border-radius: var(--radius);
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .chip {
-      background: var(--chip);
-      color: var(--text);
-      border: 1px solid #2a3347;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-    }
-    .chip.bad { color: #ffd0d9; border-color: #3a1e2a; background: #2a1420; }
-    .chip.ok  { color: #c9ffe5; border-color: #1f3a2b; background: #11261a; }
-    .chip .k { color: var(--muted); margin-right: 6px; }
-    .grid {
-      display: grid;
-      grid-template-columns: 320px 1fr;
-      gap: 16px;
-      margin-top: 16px;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid #20283a;
-      border-radius: var(--radius);
-      padding: 14px;
-    }
-    .card h3 { margin: 0 0 10px 0; font-size: 14px; font-weight: 600; }
-    .subtle { color: var(--muted); font-size: 12px; }
-    label { display:block; font-size:12px; color:var(--muted); margin: 8px 0 6px; }
-    input, select, textarea {
-      width: 100%;
-      padding: 10px 12px;
-      background: var(--panel-2);
-      border: 1px solid #21283a;
-      border-radius: 10px;
-      color: var(--text);
-      outline: none;
-      font-size: 14px;
-      font-family: inherit;
-    }
-    textarea.mono { font-family: var(--mono); font-size: 12px; min-height: 150px; white-space: pre; }
-    .row { display: flex; gap: 10px; }
-    .row > * { flex: 1; }
-    button {
-      padding: 10px 12px;
-      border: 1px solid #2a3347;
-      background: #202635;
-      color: #e9e9ff;
-      border-radius: 10px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    button.primary { background: var(--accent); border-color: #5c3cff; }
-    button.ghost { background: #161a23; color: #cbd3e6; }
-    .muted { color: var(--muted); }
-    .result {
-      background: #0e1320;
-      border: 1px solid #20283a;
-      border-radius: 10px;
-      padding: 10px;
-      font-family: var(--mono);
-      font-size: 12px;
-      color: #d4e2ff;
-      overflow: auto;
-      max-height: 240px;
-      white-space: pre;
-    }
-    .caps { text-transform: uppercase; letter-spacing: .08em; font-weight: 600; font-size: 11px; color: var(--muted); }
-    .stack { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-    .stack .card { min-height: 210px; }
-    .aside { position: sticky; top: 10px; height: fit-content; }
-    .kv { display:flex; align-items:center; gap:6px; flex-wrap:wrap }
-    .kv .v { font-weight:600; }
-    .timer { margin-left: auto; }
-    .pill { padding:6px 10px; border-radius:999px; background:#111725; border:1px solid #28314a; color:#cfe1ff; font-size:12px; }
-    .hr { height:1px; background:#20283a; margin:12px 0; }
-    .live { font-family: var(--mono); font-size: 12px; color: #a8c6ff; }
-    .live .lab { color: #6b7896; margin-right:6px; }
-    .actions { display:flex; gap:8px; flex-wrap: wrap; }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Alma Data — Console RAG</title>
+<style>
+  :root{
+    --bg:#0f1115;
+    --panel:#141820;
+    --panel-2:#11151c;
+    --text:#e8ecf2;
+    --muted:#9aa7b3;
+    --ok:#39d98a;
+    --err:#ff6b6b;
+    --chip:#1b2230;
+    --chip-br:#243045;
+    --tile-gap:16px;
+    --accent:#c79300;          /* amarelo torrado */
+    --accent-700:#a67a00;
+    --accent-800:#8a6700;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji";
+  }
+  .container{max-width:1200px;margin:0 auto;padding:20px}
+  header{
+    display:flex;align-items:center;justify-content:space-between;margin-bottom:14px
+  }
+  header .brand{font-weight:700;font-size:20px}
+  header .status{font-size:12px;color:var(--muted)}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+
+  /* RESULT PANEL (sempre no topo) */
+  .result{
+    background:var(--panel);border:1px solid var(--chip-br);border-radius:10px;
+    padding:14px; margin-bottom:14px; position:relative;
+  }
+  .result h2{margin:0 0 8px 0;font-size:16px}
+  .result pre{
+    margin:0;background:var(--panel-2);border:1px solid var(--chip-br);
+    color:var(--text);border-radius:8px;padding:10px;overflow:auto;max-height:38vh
+  }
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 0 0}
+  .badge{
+    background:var(--chip);border:1px solid var(--chip-br);border-radius:999px;
+    padding:4px 10px;font-size:12px;color:var(--muted);
+  }
+
+  /* PARAM BAR */
+  .param-bar{
+    display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px
+  }
+  .field{display:flex;flex-direction:column;gap:6px;min-width:160px}
+  label{font-size:12px;color:var(--muted)}
+  input[type=text], input[type=number], textarea{
+    background:var(--panel);border:1px solid var(--chip-br);color:var(--text);
+    border-radius:8px;padding:10px 12px;outline:none;width:100%;
+  }
+  textarea{min-height:110px;resize:vertical}
+
+  /* BUTTONS */
+  .btn{
+    background:var(--accent);color:#121212;border:none;border-radius:10px;
+    padding:10px 14px;font-weight:700;cursor:pointer;transition:.12s;
+    box-shadow:0 1px 0 #000 inset, 0 0 0 1px rgba(0,0,0,.15);
+  }
+  .btn:hover{background:var(--accent-700)}
+  .btn:active{background:var(--accent-800);transform:translateY(1px)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+
+  /* TILES */
+  .grid{
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:var(--tile-gap);
+  }
+  @media (max-width: 980px){
+    .grid{grid-template-columns:1fr}
+  }
+  .tile{
+    background:var(--panel);border:1px solid var(--chip-br);border-radius:12px;
+    padding:14px;display:flex;flex-direction:column;gap:12px
+  }
+  .tile h3{margin:0 0 2px 0;font-size:15px}
+  .tile .res{
+    background:var(--panel-2);border:1px solid var(--chip-br);border-radius:8px;
+    padding:10px;min-height:44px;color:var(--muted);font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    white-space:pre-wrap;word-break:break-word
+  }
+  .inline{display:flex;gap:10px}
+  .inline > *{flex:1}
+  .tiny{font-size:12px;color:var(--muted)}
+  .right{margin-left:auto}
+  .timer{font-size:12px;color:var(--muted)}
+  .chip-ok{color:var(--ok)}
+  .chip-err{color:var(--err)}
+</style>
 </head>
 <body>
-  <div class="wrap">
+  <div class="container">
     <header>
-      <div class="dot"></div>
-      <h1>Alma — Console RAG</h1>
-      <span class="pill" id="srvver">versão servidor: ...</span>
-      <span class="pill" id="ragstat">RAG: ...</span>
-      <span class="pill" id="mem0stat">Mem0: ...</span>
-      <span class="pill timer" id="taskTimer" hidden>⏱️ 00:00</span>
+      <div class="brand">Alma Data</div>
+      <div class="status tiny">Versão do servidor: <span id="sv-version">—</span> &nbsp;•&nbsp; RAG: <span id="sv-rag">—</span> &nbsp;•&nbsp; Mem0: <span id="sv-mem">—</span></div>
     </header>
 
-    <div class="topbar" id="topbar">
-      <span class="chip"><span class="k">Resultado</span> <span id="resTitle">•</span></span>
-      <span class="chip"><span class="k">Sitemap:</span> <span id="chipSitemap">-</span></span>
-      <span class="chip"><span class="k">namespace:</span> <span id="chipNs">-</span></span>
-      <span class="chip"><span class="k">Total no sitemap:</span> <span id="chipTotal">-</span></span>
-      <span class="chip"><span class="k">Ingeridas:</span> <span id="chipOk">-</span></span>
-      <span class="chip"><span class="k">Falhadas:</span> <span id="chipFail">-</span></span>
-      <span class="chip"><span class="k">Bloqueadas:</span> <span id="chipBlock">-</span></span>
-      <span class="chip"><span class="k">Duplicadas:</span> <span id="chipDupe">-</span></span>
-      <span class="chip"><span class="k">deadline_s:</span> <span id="chipDl">-</span></span>
-      <span class="chip"><span class="k">max_pages:</span> <span id="chipMx">-</span></span>
-      <span class="chip" id="chipCursor" hidden><span class="k">cursor:</span> <span id="valCursor">-</span></span>
-      <span class="live" id="liveItem" style="margin-left:auto;"></span>
-    </div>
+    <!-- RESULTADO NO TOPO -->
+    <section class="result">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2>Resultado</h2>
+        <div class="timer" id="globalTimer">⏱︎ 00:00</div>
+      </div>
+      <div class="badges" id="summaryBadges"></div>
+      <pre id="resultBox">{}</pre>
+    </section>
 
-    <div class="grid">
-      <!-- Lado esquerdo -->
-      <aside class="aside">
-        <div class="card">
-          <h3>Parâmetros por omissão para tarefas</h3>
-          <label>Namespace</label>
-          <input id="namespace" placeholder="ex.: boasafra" />
-          <div class="row">
-            <div>
-              <label>max_pages (crawler)</label>
-              <input id="max_pages" type="number" value="500" />
-            </div>
-            <div>
-              <label>deadline_s</label>
-              <input id="deadline_s" type="number" value="900" />
-            </div>
-            <div>
-              <label>max_depth (crawler)</label>
-              <input id="max_depth" type="number" value="4" />
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div class="kv">
-            <span class="caps">Tarefa atual</span>
-            <span id="taskName" class="pill">—</span>
-            <button class="ghost" id="btnClearLog" style="margin-left:auto;">Limpar logs</button>
-          </div>
-          <div class="result" id="logBox" style="margin-top:8px; max-height:180px;"></div>
+    <!-- PARÂMETROS EM BARRA HORIZONTAL -->
+    <section class="param-bar">
+      <div class="field" style="min-width:240px">
+        <label>Namespace (default)</label>
+        <input type="text" id="ns" placeholder="ex.: boasafra">
+      </div>
+      <div class="field">
+        <label>max_pages</label>
+        <input type="number" id="max_pages" min="1" value="500">
+      </div>
+      <div class="field">
+        <label>deadline_s</label>
+        <input type="number" id="deadline_s" min="10" value="900">
+      </div>
+      <div class="field">
+        <label>max_depth (crawler)</label>
+        <input type="number" id="max_depth" min="0" value="4">
+      </div>
+      <div class="right tiny">Tarefa atual: <span id="taskLabel">—</span></div>
+      <button class="btn right" id="clearLogsBtn" title="Limpa o painel de resultado">Limpar resultado</button>
+    </section>
+
+    <!-- 6 TILES -->
+    <section class="grid">
+
+      <!-- Ingestão via Sitemap -->
+      <div class="tile">
+        <h3>Ingestão via Sitemap</h3>
+        <div class="inline">
+          <input id="sitemap_url" type="text" placeholder="https://exemplo.com/sitemap.xml">
+          <button id="btnIngestSitemap" class="btn">Ingerir Sitemap</button>
         </div>
-      </aside>
+        <div class="res" id="resSitemap">{}</div>
+      </div>
 
-      <!-- Lado direito -->
-      <main style="display:flex; flex-direction:column; gap:16px;">
-        <div class="stack">
-          <!-- Ingestão via Sitemap -->
-          <div class="card">
-            <h3>Ingestão via Sitemap</h3>
-            <label>Sitemap URL</label>
-            <input id="sitemap_url" placeholder="https://exemplo.com/sitemap.xml" />
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runIngestSitemap()">Ingerir Sitemap</button>
-              <button class="ghost" id="btnNextCursor" onclick="runIngestSitemap(true)" hidden>Continuar (cursor)</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="sitemap_result">{}</pre>
-          </div>
-
-          <!-- Crawler -->
-          <div class="card">
-            <h3>Crawler (mesmo domínio)</h3>
-            <label>Seed URL</label>
-            <input id="seed_url" placeholder="https://exemplo.com/" />
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runCrawler()">Rastrear &amp; Ingerir</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="crawl_result">{}</pre>
-          </div>
-
-          <!-- URL individual -->
-          <div class="card">
-            <h3>Ingestão de URL individual</h3>
-            <label>URL</label>
-            <input id="single_url" placeholder="https://exemplo.com/pagina/" />
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runIngestUrl()">Ingerir URL</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="single_result">{}</pre>
-          </div>
+      <!-- Crawler (mesmo domínio) -->
+      <div class="tile">
+        <h3>Crawler (mesmo domínio)</h3>
+        <div class="inline">
+          <input id="seed_url" type="text" placeholder="https://exemplo.com/">
+          <button id="btnCrawl" class="btn">Rastrear & Ingerir</button>
         </div>
+        <div class="res" id="resCrawl">{}</div>
+      </div>
 
-        <div class="stack">
-          <!-- Ingestão de Texto -->
-          <div class="card">
-            <h3>Ingestão de Texto</h3>
-            <div class="row">
-              <div>
-                <label>Título do bloco</label>
-                <input id="txt_title" placeholder="Título" />
-              </div>
-            </div>
-            <label>Texto</label>
-            <textarea id="txt_body" class="mono" placeholder="Cola aqui o texto a indexar..."></textarea>
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runIngestText()">Ingerir Texto</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="txt_result">{}</pre>
-          </div>
+      <!-- Ingestão de URL individual -->
+      <div class="tile">
+        <h3>Ingestão de URL individual</h3>
+        <input id="single_url" type="text" placeholder="https://exemplo.com/pagina/  (aceita Google Drive)">
+        <button id="btnIngestURL" class="btn">Ingerir URL</button>
+        <div class="res" id="resURL">{}</div>
+        <div class="tiny">Dica: cola links do Google Drive (view/open/file). Convertimos automaticamente para download direto.</div>
+      </div>
 
-          <!-- Ingestão de PDF -->
-          <div class="card">
-            <h3>Ingestão de PDF (URL)</h3>
-            <label>PDF URL (público ou direct download)</label>
-            <input id="pdf_url" placeholder="https://.../ficheiro.pdf  •  (Google Drive: https://drive.google.com/uc?export=download&id=...)" />
-            <label>Título (opcional)</label>
-            <input id="pdf_title" placeholder="ex.: Estrategia Expoente 2025" />
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runIngestPdf()">Ingerir PDF</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="pdf_result">{}</pre>
-          </div>
+      <!-- Ingestão de Texto -->
+      <div class="tile">
+        <h3>Ingestão de Texto</h3>
+        <input id="text_title" type="text" placeholder="Título do bloco">
+        <textarea id="text_body" placeholder="Texto a indexar…"></textarea>
+        <button id="btnIngestText" class="btn">Ingerir Texto</button>
+        <div class="res" id="resText">{}</div>
+      </div>
 
-          <!-- Pesquisar -->
-          <div class="card">
-            <h3>Pesquisar (RAG)</h3>
-            <label>Query</label>
-            <input id="search_q" placeholder="ex.: catálogo Boa Safra • 'Expoente 2025' • 'arco chair'" />
-            <div class="row">
-              <div>
-                <label>top_k</label>
-                <input id="search_k" type="number" value="6" />
-              </div>
-            </div>
-            <div class="actions" style="margin-top:10px;">
-              <button class="primary" onclick="runSearch()">Pesquisar</button>
-            </div>
-            <label style="margin-top:12px;">Resultado</label>
-            <pre class="result" id="search_result">{}</pre>
-          </div>
-        </div>
-      </main>
-    </div>
+      <!-- Ingestão de PDF (URL) -->
+      <div class="tile">
+        <h3>Ingestão de PDF (URL)</h3>
+        <input id="pdf_url" type="text" placeholder="https://…/ficheiro.pdf  (aceita Google Drive)">
+        <input id="pdf_title" type="text" placeholder="Título (opcional)">
+        <button id="btnIngestPDF" class="btn">Ingerir PDF</button>
+        <div class="res" id="resPDF">{}</div>
+        <div class="tiny">Para Google Drive, podes colar o link “view” — fazemos a conversão para download direto.</div>
+      </div>
+
+      <!-- Pesquisar (RAG) -->
+      <div class="tile">
+        <h3>Pesquisar (RAG)</h3>
+        <input id="search_q" type="text" placeholder="ex.: diretora da Boa Safra">
+        <input id="search_topk" type="number" value="6" min="1" max="50" />
+        <button id="btnSearch" class="btn">Pesquisar</button>
+        <div class="res" id="resSearch">{}</div>
+      </div>
+
+    </section>
   </div>
 
-  <script>
-    // ---------- Helpers UI ----------
-    const $ = (id) => document.getElementById(id);
-    function setTopChips(o) {
-      if (!o) return;
-      $('resTitle').textContent = o.title || '•';
-      $('chipSitemap').textContent = o.sitemap || '-';
-      $('chipNs').textContent = o.namespace || $('namespace').value || '-';
-      $('chipTotal').textContent = (o.total_locs ?? o.total ?? '-');
-      $('chipOk').textContent = (o.pages_ingested ?? o.visited ?? o.ok ?? '-');
-      $('chipFail').textContent = (o.pages_failed ?? o.fail ?? '0');
-      $('chipBlock').textContent = (o.skipped_blocked ? o.skipped_blocked.length : 0);
-      $('chipDupe').textContent = (o.skipped_dupe ? o.skipped_dupe.length : 0);
-      $('chipDl').textContent = o.limits?.deadline_s ?? $('deadline_s').value ?? '-';
-      $('chipMx').textContent = o.limits?.max_pages ?? $('max_pages').value ?? '-';
+<script>
+(function(){
+  // -------- util ----------
+  const $ = sel => document.querySelector(sel);
+  const resultBox = $('#resultBox');
+  const badgesBox = $('#summaryBadges');
+  const taskLabel = $('#taskLabel');
+  const svVersion = $('#sv-version');
+  const svRag = $('#sv-rag');
+  const svMem = $('#sv-mem');
 
-      // cursor
-      if (o.next_cursor !== undefined && o.next_cursor !== null) {
-        $('chipCursor').hidden = false;
-        $('valCursor').textContent = o.next_cursor;
-        $('btnNextCursor').hidden = false;
-        $('btnNextCursor').dataset.cursor = o.next_cursor;
-      } else {
-        $('chipCursor').hidden = true;
-        $('btnNextCursor').hidden = true;
-        $('btnNextCursor').dataset.cursor = '';
-      }
+  let timerInterval = null;
+  function startTimer(){
+    const t0 = Date.now();
+    const el = $('#globalTimer');
+    clearInterval(timerInterval);
+    timerInterval = setInterval(()=>{
+      const s = Math.floor((Date.now()-t0)/1000);
+      const mm = String(Math.floor(s/60)).padStart(2,'0');
+      const ss = String(s%60).padStart(2,'0');
+      el.textContent = `⏱︎ ${mm}:${ss}`;
+    }, 200);
+  }
+  function stopTimer(){ clearInterval(timerInterval); }
+
+  function setTask(t){ taskLabel.textContent = t || '—'; }
+  function setBadges(list){
+    badgesBox.innerHTML = '';
+    (list||[]).forEach(txt=>{
+      const b = document.createElement('div');
+      b.className = 'badge';
+      b.textContent = txt;
+      badgesBox.appendChild(b);
+    });
+  }
+  function printResult(obj){
+    resultBox.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
+  }
+  function smallRes(el, obj){
+    el.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
+  }
+
+  // -------- status /health ----------
+  async function loadHealth(){
+    try{
+      const r = await fetch('/health');
+      const j = await r.json();
+      svVersion.textContent = (j.model || '—');
+      svRag.textContent = j.rag_available ? 'disponível' : 'off';
+      svMem.textContent = j.mem0_enabled ? 'on' : 'off';
+    }catch(e){
+      svVersion.textContent = '—';
+      svRag.textContent = '—';
+      svMem.textContent = '—';
     }
-    function j(el, obj) { el.textContent = JSON.stringify(obj, null, 2); }
-    function log(s) {
-      const el = $('logBox');
-      el.textContent += (el.textContent ? "\n" : "") + s;
-      el.scrollTop = el.scrollHeight;
-    }
-    $('btnClearLog').onclick = () => { $('logBox').textContent = ""; };
+  }
+  loadHealth();
 
-    // ---------- Health badges ----------
-    async function pollHealth() {
-      try {
-        const r = await fetch('/health');
-        const h = await r.json();
-        $('srvver').textContent = `versão servidor: ${h.model || '—'}`;
-        $('ragstat').textContent = `RAG: ${h.rag_available ? 'disponível' : 'off'}`;
-        $('mem0stat').textContent = `Mem0: ${h.mem0_enabled ? 'on' : 'off'}`;
-      } catch(e) { /* ignore */ }
-      setTimeout(pollHealth, 6000);
-    }
-    pollHealth();
+  // -------- Google Drive normalização ----------
+  // Aceita formatos:
+  // - https://drive.google.com/file/d/<ID>/view?...
+  // - https://drive.google.com/open?id=<ID>
+  // - https://drive.google.com/uc?export=download&id=<ID>  (já é direto)
+  function normalizeGoogleDriveLink(url){
+    try{
+      const u = new URL(url);
+      if (u.hostname !== 'drive.google.com') return url;
 
-    // ---------- Timer ----------
-    let tStart = 0, tInt = null;
-    function startTimer(name) {
-      $('taskName').textContent = name;
-      $('taskTimer').hidden = false;
-      tStart = Date.now();
-      tInt = setInterval(() => {
-        const s = Math.floor((Date.now() - tStart)/1000);
-        const mm = String(Math.floor(s/60)).padStart(2,'0');
-        const ss = String(s%60).padStart(2,'0');
-        $('taskTimer').textContent = `⏱️ ${mm}:${ss}`;
-      }, 500);
-    }
-    function stopTimer() {
-      if (tInt) clearInterval(tInt);
-      $('taskTimer').hidden = true;
-    }
-
-    // ---------- Default namespace from server (if any) ----------
-    (async () => {
-      try {
-        const r = await fetch('/');
-        const js = await r.json();
-        $('namespace').value = js.rag?.namespace || '';
-      } catch {}
-    })();
-
-    // ---------- APIs ----------
-    async function runIngestSitemap(continueWithCursor=false) {
-      const sitemap_url = $('sitemap_url').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
-      const deadline_s = parseInt($('deadline_s').value || '900', 10);
-      const max_pages = parseInt($('max_pages').value || '500', 10);
-
-      const body = { sitemap_url, namespace, deadline_s, max_pages };
-      if (continueWithCursor) {
-        const c = $('btnNextCursor').dataset.cursor;
-        if (c) body.cursor = parseInt(c, 10);
+      // já direto
+      if (u.pathname === '/uc' && (u.searchParams.get('id') || u.searchParams.get('export'))){
+        return url;
       }
 
-      $('liveItem').innerHTML = `<span class="lab">item:</span> ${sitemap_url}`;
-      startTimer('ação: ingest-sitemap');
-      try {
-        const r = await fetch('/rag/ingest-sitemap', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(body)
-        });
-        const js = await r.json();
-        setTopChips({ ...js, title: 'ação: ingest-sitemap' });
-        j($('sitemap_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] ingest-sitemap -> ingested=${js.pages_ingested} failed=${js.pages_failed}`);
-      } catch (e) {
-        j($('sitemap_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] ingest-sitemap ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
+      // /file/d/<id>/...
+      const m = u.pathname.match(/\/file\/d\/([^/]+)/);
+      if (m && m[1]) {
+        const id = m[1];
+        return `https://drive.google.com/uc?export=download&id=${id}`;
       }
-    }
 
-    async function runCrawler() {
-      const seed_url = $('seed_url').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
-      const deadline_s = parseInt($('deadline_s').value || '900', 10);
-      const max_pages = parseInt($('max_pages').value || '500', 10);
-      const max_depth = parseInt($('max_depth').value || '3', 10);
-
-      $('liveItem').innerHTML = `<span class="lab">item:</span> ${seed_url}`;
-      startTimer('ação: crawl');
-      try {
-        const r = await fetch('/rag/crawl', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ seed_url, namespace, deadline_s, max_pages, max_depth })
-        });
-        const js = await r.json();
-        setTopChips({ ...js, title: 'ação: crawl' });
-        j($('crawl_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] crawl -> visited=${js.visited} ok_chunks=${js.ok_chunks} fail=${js.fail}`);
-      } catch (e) {
-        j($('crawl_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] crawl ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
+      // /open?id=...
+      if (u.pathname === '/open' && u.searchParams.get('id')){
+        const id = u.searchParams.get('id');
+        return `https://drive.google.com/uc?export=download&id=${id}`;
       }
+
+      // fallback: retorna original
+      return url;
+    }catch(e){
+      return url;
     }
+  }
 
-    async function runIngestUrl() {
-      const url = $('single_url').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
-      const deadline_s = parseInt($('deadline_s').value || '900', 10);
+  // -------- params ----------
+  function readCommon(){
+    return {
+      namespace: $('#ns').value.trim() || undefined,
+      max_pages: parseInt($('#max_pages').value || '0', 10) || undefined,
+      deadline_s: parseInt($('#deadline_s').value || '0', 10) || undefined,
+      max_depth: parseInt($('#max_depth').value || '0', 10) || undefined,
+    };
+  }
 
-      $('liveItem').innerHTML = `<span class="lab">item:</span> ${url}`;
-      startTimer('ação: ingest-url');
-      try {
-        const r = await fetch('/rag/ingest-url', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ page_url: url, namespace, deadline_s })
-        });
-        const js = await r.json();
-        setTopChips({ title: 'ação: ingest-url', namespace });
-        j($('single_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] ingest-url -> url=${js.url} ok=${js.ok}`);
-      } catch (e) {
-        j($('single_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] ingest-url ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
-      }
-    }
+  // -------- chamadas ----------
+  async function postJSON(path, payload){
+    const r = await fetch(path, {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload || {})
+    });
+    return r.json();
+  }
 
-    async function runIngestPdf() {
-      const pdf_url = $('pdf_url').value.trim();
-      const title = $('pdf_title').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
+  // Ingest Sitemap
+  $('#btnIngestSitemap').addEventListener('click', async ()=>{
+    const sitemap_url = $('#sitemap_url').value.trim();
+    if (!sitemap_url) return;
+    const p = readCommon();
+    setTask(`ação: ingest-sitemap   item: ${sitemap_url}`);
+    setBadges([`Sitemap: ${sitemap_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`]);
+    startTimer();
+    $('#btnIngestSitemap').disabled = true;
+    const res = await postJSON('/rag/ingest-sitemap', { sitemap_url, namespace:p.namespace, max_pages:p.max_pages, deadline_s:p.deadline_s });
+    stopTimer();
+    $('#btnIngestSitemap').disabled = false;
+    printResult(res);
+    smallRes($('#resSitemap'), res);
+  });
 
-      $('liveItem').innerHTML = `<span class="lab">item:</span> ${pdf_url}`;
-      startTimer('ação: ingest-pdf-url');
-      try {
-        const body = { pdf_url, namespace };
-        if (title) body.title = title;
+  // Crawl
+  $('#btnCrawl').addEventListener('click', async ()=>{
+    const seed_url = $('#seed_url').value.trim();
+    if (!seed_url) return;
+    const p = readCommon();
+    setTask(`ação: crawl   seed: ${seed_url}`);
+    setBadges([`Seed: ${seed_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`, `max_depth: ${p.max_depth||'—'}`]);
+    startTimer();
+    $('#btnCrawl').disabled = true;
+    const res = await postJSON('/rag/crawl', { seed_url, namespace:p.namespace, max_pages:p.max_pages, max_depth:p.max_depth, deadline_s:p.deadline_s });
+    stopTimer();
+    $('#btnCrawl').disabled = false;
+    printResult(res);
+    smallRes($('#resCrawl'), res);
+  });
 
-        const r = await fetch('/rag/ingest-pdf-url', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(body)
-        });
-        const js = await r.json();
-        setTopChips({ title: 'ação: ingest-pdf-url', namespace });
-        j($('pdf_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] ingest-pdf-url -> url=${js.url} ok=${js.ok}`);
-      } catch (e) {
-        j($('pdf_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] ingest-pdf-url ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
-      }
-    }
+  // URL individual (com normalização de Drive)
+  $('#btnIngestURL').addEventListener('click', async ()=>{
+    let page_url = $('#single_url').value.trim();
+    if (!page_url) return;
+    page_url = normalizeGoogleDriveLink(page_url);
+    $('#single_url').value = page_url; // mostra conversão
+    const p = readCommon();
+    setTask(`ação: ingest-url   item: ${page_url}`);
+    setBadges([`URL: ${page_url}`, `namespace: ${p.namespace||'default'}`]);
+    startTimer();
+    $('#btnIngestURL').disabled = true;
+    const res = await postJSON('/rag/ingest-url', { page_url, namespace:p.namespace, deadline_s:p.deadline_s });
+    stopTimer();
+    $('#btnIngestURL').disabled = false;
+    printResult(res);
+    smallRes($('#resURL'), res);
+  });
 
-    async function runIngestText() {
-      const title = $('txt_title').value.trim() || 'Bloco';
-      const text = $('txt_body').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
-      if (!text) { alert('Escreve algum texto.'); return; }
+  // Texto
+  $('#btnIngestText').addEventListener('click', async ()=>{
+    const title = $('#text_title').value.trim();
+    const text  = $('#text_body').value.trim();
+    if (!title || !text) return;
+    const p = readCommon();
+    setTask(`ação: ingest-text   título: ${title}`);
+    setBadges([`Título: ${title}`, `namespace: ${p.namespace||'default'}`]);
+    startTimer();
+    $('#btnIngestText').disabled = true;
+    const res = await postJSON('/rag/ingest-text', { title, text, namespace:p.namespace });
+    stopTimer();
+    $('#btnIngestText').disabled = false;
+    printResult(res);
+    smallRes($('#resText'), res);
+  });
 
-      $('liveItem').innerHTML = `<span class="lab">item:</span> [texto] ${title}`;
-      startTimer('ação: ingest-text');
-      try {
-        const r = await fetch('/rag/ingest-text', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ title, text, namespace })
-        });
-        const js = await r.json();
-        setTopChips({ title: 'ação: ingest-text', namespace });
-        j($('txt_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] ingest-text -> count=${js.count}`);
-      } catch (e) {
-        j($('txt_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] ingest-text ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
-      }
-    }
+  // PDF (URL) — também normaliza Drive
+  $('#btnIngestPDF').addEventListener('click', async ()=>{
+    let pdf_url = $('#pdf_url').value.trim();
+    const title = $('#pdf_title').value.trim() || null;
+    if (!pdf_url) return;
+    pdf_url = normalizeGoogleDriveLink(pdf_url);
+    $('#pdf_url').value = pdf_url;
+    const p = readCommon();
+    setTask(`ação: ingest-pdf-url   item: ${pdf_url}`);
+    setBadges([`PDF: ${pdf_url}`, `namespace: ${p.namespace||'default'}`]);
+    startTimer();
+    $('#btnIngestPDF').disabled = true;
+    const res = await postJSON('/rag/ingest-pdf-url', { pdf_url, title, namespace:p.namespace });
+    stopTimer();
+    $('#btnIngestPDF').disabled = false;
+    printResult(res);
+    smallRes($('#resPDF'), res);
+  });
 
-    async function runSearch() {
-      const query = $('search_q').value.trim();
-      const namespace = $('namespace').value.trim() || 'default';
-      const top_k = parseInt($('search_k').value || '6', 10);
-      if (!query) { alert('Escreve a query.'); return; }
+  // Search
+  $('#btnSearch').addEventListener('click', async ()=>{
+    const query = $('#search_q').value.trim();
+    const top_k = parseInt($('#search_topk').value || '6', 10);
+    const p = readCommon();
+    if (!query) return;
+    setTask(`ação: search   q: ${query}`);
+    setBadges([`q: ${query}`, `namespace: ${p.namespace||'default'}`, `top_k: ${top_k}`]);
+    startTimer();
+    $('#btnSearch').disabled = true;
+    const res = await postJSON('/rag/search', { query, namespace:p.namespace, top_k });
+    stopTimer();
+    $('#btnSearch').disabled = false;
+    printResult(res);
+    smallRes($('#resSearch'), res);
+  });
 
-      $('liveItem').innerHTML = `<span class="lab">item:</span> search "${query}"`;
-      startTimer('ação: search');
-      try {
-        const r = await fetch('/rag/search', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ query, namespace, top_k })
-        });
-        const js = await r.json();
-        setTopChips({ title: 'ação: search', namespace });
-        j($('search_result'), js);
-        log(`[${new Date().toLocaleTimeString()}] search -> ok=${js.ok} matches=${js.matches?.length ?? 0}`);
-      } catch (e) {
-        j($('search_result'), {error:String(e)});
-        log(`[${new Date().toLocaleTimeString()}] search ERROR ${String(e)}`);
-      } finally {
-        stopTimer();
-        $('liveItem').textContent = '';
-      }
-    }
-  </script>
+  // Limpar
+  $('#clearLogsBtn').addEventListener('click', ()=>{
+    printResult('{}'); setBadges([]); setTask('—');
+  });
+
+})();
+</script>
 </body>
 </html>
