@@ -5,74 +5,96 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Alma Data — Console RAG</title>
 <style>
+  /* ======= PALETA alinhada ao alma-chat (apenas estilo) ======= */
   :root{
-    --bg:#0f1115;
-    --panel:#141820;
-    --panel-2:#11151c;
-    --text:#e8ecf2;
-    --muted:#9aa7b3;
+    --bg:#0a0a0b;
+    --panel:#0f0f11;
+    --panel-2:#141418;
+    --text:#f3f3f3;
+    --muted:#cfcfd3;
     --ok:#39d98a;
     --err:#ff6b6b;
-    --chip:#1b2230;
-    --chip-br:#243045;
+    --chip:#101217;
+    --chip-br:#26262b;
     --tile-gap:16px;
-    --accent:#c79300;          /* amarelo torrado */
-    --accent-700:#a67a00;
-    --accent-800:#8a6700;
+    --accent:#d4a017;          /* amarelo torrado */
+    --accent-700:#be8f13;
+    --accent-800:#a47c12;
+    --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 10px 28px rgba(0,0,0,.35);
   }
   *{box-sizing:border-box}
   html,body{height:100%}
   body{
     margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji";
+    font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji";
   }
   .container{max-width:1200px;margin:0 auto;padding:20px}
+
+  /* ======= HEADER ======= */
   header{
     display:flex;align-items:center;justify-content:space-between;margin-bottom:14px
   }
-  header .brand{font-weight:700;font-size:20px}
-  header .status{font-size:12px;color:var(--muted)}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-
-  /* RESULT PANEL (sempre no topo) */
-  .result{
-    background:var(--panel);border:1px solid var(--chip-br);border-radius:10px;
-    padding:14px; margin-bottom:14px; position:relative;
+  header .brand{
+    font-weight:800;font-size:20px;letter-spacing:.2px
   }
-  .result h2{margin:0 0 8px 0;font-size:16px}
+  header .status{font-size:12px;color:var(--muted);opacity:.9}
+
+  /* ======= RESULT PANEL (sempre no topo) ======= */
+  .result{
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--chip-br);border-radius:14px;
+    padding:16px; margin-bottom:16px; position:relative;
+    box-shadow:var(--shadow);
+  }
+  .result h2{margin:0 0 10px 0;font-size:16px;letter-spacing:.2px}
   .result pre{
     margin:0;background:var(--panel-2);border:1px solid var(--chip-br);
-    color:var(--text);border-radius:8px;padding:10px;overflow:auto;max-height:38vh
+    color:var(--text);border-radius:10px;padding:12px;overflow:auto;max-height:38vh;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
   }
-  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 0 0}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0 0}
   .badge{
-    background:var(--chip);border:1px solid var(--chip-br);border-radius:999px;
-    padding:4px 10px;font-size:12px;color:var(--muted);
+    background:var(--chip);
+    border:1px solid var(--chip-br);
+    border-radius:999px;
+    padding:6px 12px;
+    font-size:12px;color:var(--muted);
   }
 
-  /* PARAM BAR */
+  /* ======= PARAM BAR ======= */
   .param-bar{
-    display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px
+    display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px
   }
   .field{display:flex;flex-direction:column;gap:6px;min-width:160px}
   label{font-size:12px;color:var(--muted)}
   input[type=text], input[type=number], textarea{
-    background:var(--panel);border:1px solid var(--chip-br);color:var(--text);
-    border-radius:8px;padding:10px 12px;outline:none;width:100%;
+    background:#101014;border:1px solid var(--chip-br);color:var(--text);
+    border-radius:10px;padding:12px 12px;outline:none;width:100%;
+    transition:border-color .12s, box-shadow .12s;
+  }
+  input[type=text]:focus, input[type=number]:focus, textarea:focus{
+    border-color:#32323a; box-shadow:0 0 0 3px rgba(212,160,23,.12);
   }
   textarea{min-height:110px;resize:vertical}
 
-  /* BUTTONS */
+  /* ======= BUTTONS ======= */
   .btn{
-    background:var(--accent);color:#121212;border:none;border-radius:10px;
-    padding:10px 14px;font-weight:700;cursor:pointer;transition:.12s;
-    box-shadow:0 1px 0 #000 inset, 0 0 0 1px rgba(0,0,0,.15);
+    background:var(--accent);color:#121212;border:none;border-radius:12px;
+    padding:11px 16px;font-weight:800;cursor:pointer;transition:.12s;
+    box-shadow:0 1px 0 rgba(0,0,0,.35) inset, 0 0 0 1px rgba(0,0,0,.25);
+    letter-spacing:.2px;
   }
   .btn:hover{background:var(--accent-700)}
   .btn:active{background:var(--accent-800);transform:translateY(1px)}
   .btn:disabled{opacity:.45;cursor:not-allowed}
 
-  /* TILES */
+  /* ======= LAYOUT COMUM ======= */
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .right{margin-left:auto}
+  .tiny{font-size:12px;color:var(--muted)}
+  .timer{font-size:12px;color:var(--muted)}
+
+  /* ======= TILES ======= */
   .grid{
     display:grid;
     grid-template-columns:repeat(3,1fr);
@@ -82,22 +104,36 @@
     .grid{grid-template-columns:1fr}
   }
   .tile{
-    background:var(--panel);border:1px solid var(--chip-br);border-radius:12px;
-    padding:14px;display:flex;flex-direction:column;gap:12px
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--chip-br);border-radius:14px;
+    padding:16px;display:flex;flex-direction:column;gap:12px;
+    box-shadow:var(--shadow);
   }
-  .tile h3{margin:0 0 2px 0;font-size:15px}
+  .tile h3{margin:0 0 4px 0;font-size:15px;letter-spacing:.2px}
   .tile .res{
-    background:var(--panel-2);border:1px solid var(--chip-br);border-radius:8px;
-    padding:10px;min-height:44px;color:var(--muted);font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;
+    padding:12px;min-height:46px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
     white-space:pre-wrap;word-break:break-word
   }
   .inline{display:flex;gap:10px}
   .inline > *{flex:1}
-  .tiny{font-size:12px;color:var(--muted)}
-  .right{margin-left:auto}
-  .timer{font-size:12px;color:var(--muted)}
+
   .chip-ok{color:var(--ok)}
   .chip-err{color:var(--err)}
+
+  /* ======= Scrollbars discretos (WebKit) ======= */
+  .result pre::-webkit-scrollbar,
+  .tile .res::-webkit-scrollbar{
+    width:10px;height:10px;
+  }
+  .result pre::-webkit-scrollbar-thumb,
+  .tile .res::-webkit-scrollbar-thumb{
+    background:#2a2a31;border-radius:10px;
+  }
+  .result pre::-webkit-scrollbar-track,
+  .tile .res::-webkit-scrollbar-track{
+    background:transparent;
+  }
 </style>
 </head>
 <body>
@@ -261,34 +297,26 @@
   loadHealth();
 
   // -------- Google Drive normalização ----------
-  // Aceita formatos:
-  // - https://drive.google.com/file/d/<ID>/view?...
-  // - https://drive.google.com/open?id=<ID>
-  // - https://drive.google.com/uc?export=download&id=<ID>  (já é direto)
   function normalizeGoogleDriveLink(url){
     try{
       const u = new URL(url);
       if (u.hostname !== 'drive.google.com') return url;
 
-      // já direto
       if (u.pathname === '/uc' && (u.searchParams.get('id') || u.searchParams.get('export'))){
         return url;
       }
 
-      // /file/d/<id>/...
       const m = u.pathname.match(/\/file\/d\/([^/]+)/);
       if (m && m[1]) {
         const id = m[1];
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
 
-      // /open?id=...
       if (u.pathname === '/open' && u.searchParams.get('id')){
         const id = u.searchParams.get('id');
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
 
-      // fallback: retorna original
       return url;
     }catch(e){
       return url;
@@ -352,7 +380,7 @@
     let page_url = $('#single_url').value.trim();
     if (!page_url) return;
     page_url = normalizeGoogleDriveLink(page_url);
-    $('#single_url').value = page_url; // mostra conversão
+    $('#single_url').value = page_url;
     const p = readCommon();
     setTask(`ação: ingest-url   item: ${page_url}`);
     setBadges([`URL: ${page_url}`, `namespace: ${p.namespace||'default'}`]);
