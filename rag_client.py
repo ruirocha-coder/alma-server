@@ -225,16 +225,55 @@ def ingest_url(page_url: str, namespace: str = "default", deadline_s: int = 55) 
     return {"ok": False, "error": f"fetch_failed: {err}", "url": u}
 
 def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default") -> Dict:
+    """
+    Ingest de um PDF remoto. Suporta Google Drive:
+    - https://drive.google.com/file/d/<ID>/view  ->  https://drive.google.com/uc?export=download&id=<ID>
+    - https://drive.google.com/uc?export=download&id=<ID> (mantém)
+    IMPORTANTE: NÃO usar _clean_url aqui, para não perder query params (id=...).
+    """
+    import re
     import fitz
+
+    if not pdf_url:
+        return {"ok": False, "error": "missing_pdf_url"}
+
+    u = pdf_url.strip()
+
+    # Reescrever Google Drive /file/d/.../view => /uc?export=download&id=...
+    if "drive.google.com" in u:
+        if "/uc?" not in u or "id=" not in u:
+            m = re.search(r"/d/([A-Za-z0-9_-]{20,})", u) or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", u)
+            if m:
+                file_id = m.group(1)
+                u = f"https://drive.google.com/uc?export=download&id={file_id}"
+
     try:
-        r = requests.get(pdf_url, timeout=FETCH_TIMEOUT_S + 10, headers=DEFAULT_HEADERS)
+        # NÃO usar _clean_url; manter os query params
+        r = requests.get(u, timeout=FETCH_TIMEOUT_S + 30, headers=DEFAULT_HEADERS, allow_redirects=True)
         r.raise_for_status()
     except Exception as e:
-        return {"ok": False, "error": f"fetch_pdf_failed: {e}", "url": pdf_url}
-    doc = fitz.open("pdf", r.content)
-    full = " ".join(page.get_text() for page in doc)
+        return {"ok": False, "error": f"fetch_failed: {e}", "url": u}
+
+    # Abrir PDF
+    try:
+        doc = fitz.open("pdf", r.content)
+    except Exception as e:
+        return {"ok": False, "error": f"pdf_open_failed: {e}", "url": u}
+
+    # Extrair texto (se o PDF for “scan” sem texto, devolve aviso)
+    pages_text = []
+    for page in doc:
+        try:
+            pages_text.append(page.get_text() or "")
+        except Exception:
+            pages_text.append("")
+    full = " ".join(pages_text).strip()
+
+    if not full:
+        return {"ok": True, "url": u, "count": 0, "warning": "pdf_has_no_extractable_text"}
+
     count = _ingest(namespace, pdf_url, title or pdf_url, full)
-    return {"ok": True, "url": pdf_url, "count": count}
+    return {"ok": True, "url": u, "count": count}
 
 # ====================== Sitemap (com cursor/limite) ================
 def ingest_sitemap(
