@@ -107,9 +107,9 @@
     .msg.alma{ justify-content:flex-end; }
     .msg.alma .bubble{
       background:var(--bubble-alma);
-      margin-left:auto;           /* garante encosto à direita */
+      margin-left:auto;
       max-width:min(90%, 720px);
-      text-align:left;            /* texto normal, apenas balão à direita */
+      text-align:left;
     }
 
     .copy-btn{
@@ -120,20 +120,12 @@
 
     .bubble b{ font-weight:700; }
     .bubble u{ text-underline-offset: 3px; }
-    .bubble code{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      background:#2a2a31; padding:0 .35rem; border-radius:6px;
-    }
-    .bubble pre{
-      background:#1c1c22; padding:12px; border-radius:10px; overflow:auto;
-      border:1px solid rgba(255,255,255,0.06);
-    }
-    .bubble a{ color:#ffd36a; text-decoration:underline; text-underline-offset: 2px; }
 
-    /* Input */
+    /* Input (flutuante) */
     .input-bar{
       padding:12px; border-top:1px solid var(--border);
       background:linear-gradient(180deg,var(--panel-2),var(--panel));
+      position:sticky; bottom:0; z-index:25;
     }
     .input-wrap{
       display:flex; max-width:980px; margin:0 auto;
@@ -145,7 +137,7 @@
       padding:14px 14px; font-size:1rem; border:none; outline:none;
     }
     .send-btn{
-      min-width:64px; /* altura visual compatível com a barra */
+      min-width:64px;
       background:var(--accent); color:#000; border:none; font-size:1.2rem;
       display:flex; align-items:center; justify-content:center; cursor:pointer;
       padding:0 22px;
@@ -158,22 +150,20 @@
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
 
-    /* --- Responsivo (mobile / iPad) --- */
+    /* Responsivo */
     @media (max-width: 1024px){
       .sidebar{ width:280px; }
       .side-header img{ width:64px; height:64px; }
       .messages{ padding:14px 14px 20px; }
     }
-    @media (max-width: 820px){ /* iPad portrait / tablets pequenos */
+    @media (max-width: 820px){
       body{ flex-direction:column; }
-      .sidebar{
-        width:100%; max-width:none; border-right:none; border-bottom:1px solid var(--border);
-      }
+      .sidebar{ width:100%; border-right:none; border-bottom:1px solid var(--border); }
       .sessions{ max-height:40vh; }
       .messages{ padding:14px; }
       .input-wrap{ margin:0 6px; }
     }
-    @media (max-width: 480px){ /* telemóvel */
+    @media (max-width: 480px){
       .side-header img{ width:54px; height:54px; }
       .session-search{ padding:8px; }
       .side-actions{ padding:8px; }
@@ -209,13 +199,21 @@
 
     <div class="input-bar">
       <div class="input-wrap">
-        <input id="prompt" placeholder="Escreve aqui…" onkeydown="if(event.key==='Enter'){sendMsg()}">
-        <button class="send-btn" onclick="sendMsg()">&#x3e;</button>
+        <input id="prompt" placeholder="Escreve aqui…">
+        <button class="send-btn" type="button" onclick="sendMsg()">&#x3e;</button>
       </div>
     </div>
   </main>
 
 <script>
+/* ---------- Debug global: apanha erros JS que podem travar tudo ---------- */
+window.addEventListener('error', e => {
+  console.error('[alma-chat] JS error:', e.message);
+});
+window.addEventListener('unhandledrejection', e => {
+  console.error('[alma-chat] Promise rejection:', e.reason);
+});
+
 /* ---------- Estado local ---------- */
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
@@ -228,43 +226,35 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* Markdown → HTML (leve e seguro para chat) */
-function escapeHtml(s){
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
+/* Markdown leve → HTML (sem lib externa) */
 function mdToHtml(src){
-  let s = String(src||"");
+  if(!src) return "";
+  let s = src;
 
-  // proteger blocos de código ``` ``` primeiro
-  const codeBlocks = [];
-  s = s.replace(/```([\s\S]*?)```/g, (m, p1) => {
-    codeBlocks.push(p1);
-    return `\u0000CODEBLOCK${codeBlocks.length-1}\u0000`;
+  // Blocos de código ```lang\n...\n``` (captura multi-linha)
+  s = s.replace(/```([\s\S]*?)```/g, (m, code) => {
+    const safe = code.replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    return `<pre><code>${safe}</code></pre>`;
   });
 
-  // escapar HTML cru (evitar injeção), depois vamos reintroduzir <a>, <b>, etc. via substituições
-  s = escapeHtml(s);
+  // Inline code `...`
+  s = s.replace(/`([^`]+)`/g, (m, code)=>`<code>${code.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</code>`);
 
-  // headings (# ...): transformar linha inteira em <b>…</b>
-  s = s.replace(/^#{1,6}\s*(.*?)$/gm, "<b>$1</b>");
+  // #### Heading → negrito (pedido)
+  s = s.replace(/^####\s*(.*)$/gm, (m, t)=>`<b>${t}</b>`);
 
-  // bold ** ** e underline __ __
-  s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-  s = s.replace(/__(.+?)__/g, "<u>$1</u>");
+  // **bold**
+  s = s.replace(/\*\*(.*?)\*\*/g,"<b>$1</b>");
+  // __underline__
+  s = s.replace(/__(.*?)__/g,"<u>$1</u>");
 
-  // inline code `code`
-  s = s.replace(/`([^`]+?)`/g, "<code>$1</code>");
+  // [texto](url)
+  s = s.replace(/$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?:\\/\\/[^$end:math:text$]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
 
-  // links [txt](url)
-  s = s.replace(/$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?:\\/\\/[^\\s)]+)$end:math:text$/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-
-  // simples listas: prefixo "- " ou "* " → • texto (mantendo linhas)
-  s = s.replace(/^(?:-|\*)\s+(.*)$/gm, "• $1");
-
-  // repor blocos de código
-  s = s.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (m, idx) => {
-    const body = escapeHtml(codeBlocks[Number(idx)] || "");
-    return `<pre><code>${body}</code></pre>`;
+  // Listas com - ou *
+  s = s.replace(/^(?:-|\*)\s+.+(?:\n(?:-|\*)\s+.+)*/gm, block=>{
+    const items = block.split("\n").map(line=>line.replace(/^(?:-|\*)\s+/, "")).map(txt=>`<li>${txt}</li>`).join("");
+    return `<ul>${items}</ul>`;
   });
 
   return s;
@@ -375,38 +365,62 @@ function updateSessionTitleFromFirstUserMsg(sess){
 
 /* ---------- Enviar ---------- */
 async function sendMsg(){
-  const inp = byId("prompt");
-  const txt = (inp.value||"").trim();
-  if(!txt) return;
-  inp.value = "";
-
-  let s = sessions.find(x=>x.id===activeId);
-  if(!s){ newSession(); s = sessions.find(x=>x.id===activeId); }
-
-  // push user msg
-  s.msgs.push({role:"user", content:txt});
-  if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
-  saveSessions();
-  renderSessions();
-  renderMsgs();
-
-  // chamada ao servidor
   try{
+    const inp = byId("prompt");
+    const txt = (inp.value||"").trim();
+    if(!txt) return;
+    inp.value = "";
+
+    let s = sessions.find(x=>x.id===activeId);
+    if(!s){ newSession(); s = sessions.find(x=>x.id===activeId); }
+
+    // push user msg
+    s.msgs.push({role:"user", content:txt});
+    if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
+    saveSessions();
+    renderSessions();
+    renderMsgs();
+
+    // chamada ao servidor
     const res = await fetch("/ask", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
-    const j = await res.json();
-    const ans = j.answer || JSON.stringify(j);
+
+    let ans = "";
+    try{
+      const j = await res.json();
+      ans = j.answer || JSON.stringify(j);
+    }catch(parseErr){
+      console.error("Falha a ler JSON da resposta:", parseErr);
+      ans = "Desculpa — resposta inválida do servidor.";
+    }
+
     s.msgs.push({role:"alma", content: ans});
-  }catch(err){
-    s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
-  }finally{
     saveSessions();
     renderMsgs();
+  }catch(err){
+    console.error("Erro no sendMsg:", err);
+    let s = sessions.find(x=>x.id===activeId);
+    if(s){
+      s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
+      saveSessions();
+      renderMsgs();
+    }
   }
 }
+
+/* Enter (sem Shift) envia; Shift+Enter = newline */
+(function bindEnter(){
+  const inp = byId("prompt");
+  inp.addEventListener("keydown", (event)=>{
+    if(event.key === "Enter" && !event.shiftKey){
+      event.preventDefault();
+      sendMsg();
+    }
+  });
+})();
 
 /* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
