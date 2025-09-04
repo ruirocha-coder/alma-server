@@ -364,6 +364,19 @@ def serve_console():
         return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
 
 # ---------------------------------------------------------------------------------------
+# Alma Chat (modo consola full)
+# ---------------------------------------------------------------------------------------
+@app.get("/alma-chat", response_class=HTMLResponse)
+def serve_alma_chat():
+    try:
+        with open("alma-chat.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
+
+
+
+# ---------------------------------------------------------------------------------------
 # 🔗 Pipeline Alma: Mem0 → RAG → Grok
 # ---------------------------------------------------------------------------------------
 def build_messages_with_memory_and_rag(
