@@ -233,31 +233,6 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* ---------- Markdown leve → HTML (minimal, não parte nada) ---------- */
-function mdToHtml(src){
-  if(!src) return "";
-  // escapar HTML
-  let s = src.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  // #### heading -> <b>
-  s = s.replace(/^####\s*(.*)$/gm, "<b>$1</b>");
-  // inline code
-  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
-  // **bold**
-  s = s.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
-  // __underline__
-  s = s.replace(/__(.*?)__/g, "<u>$1</u>");
-  // listas simples (- ou *)
-  s = s.replace(/^(?:-|\*)\s+.+(?:\n(?:-|\*)\s+.+)*/gm, block=>{
-    const items = block.split("\n")
-      .map(line=>line.replace(/^(?:-|\*)\s+/, ""))
-      .map(t=>`<li>${t}</li>`).join("");
-    return `<ul>${items}</ul>`;
-  });
-  // links [txt](http...)
-  s = s.replace(/$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?:\\/\\/[^$end:math:text$]+)\)/g, `<a href="$2" target="_blank" rel="noopener">$1</a>`);
-  return s;
-}
-
 /* ---------- Sessões ---------- */
 function newSession(){
   const id = "s"+Date.now();
@@ -337,7 +312,9 @@ function renderMsgs(){
 
     const bubble=document.createElement("div");
     bubble.className="bubble";
-    bubble.innerHTML = mdToHtml(m.content||"");
+    bubble.innerHTML = (m.content||"")
+      .replace(/\*\*(.*?)\*\*/g,"<b>$1</b>")
+      .replace(/__(.*?)__/g,"<u>$1</u>");
 
     if(m.role==="alma"){
       const copy=document.createElement("span");
