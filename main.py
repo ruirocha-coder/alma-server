@@ -123,9 +123,9 @@ def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
     if not (MEM0_ENABLE and mem0_client):
         return
     try:
-        if hasattr(mem0_client, "memories"):  # API antiga
+        if hasattr(mem0_client, "memories"):  # API com namespace .memories
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
-        else:  # API nova
+        else:  # API com métodos diretos
             mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
     except Exception as e:
         log.warning(f"[mem0] create falhou: {e}")
