@@ -1,8 +1,10 @@
 # main.py — Alma Server (Grok + Memória de Curto Prazo + Memória Contextual + RAG/Qdrant)
 # ---------------------------------------------------------------------------------------
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse  
+
 import os
 import requests
 import logging
@@ -10,6 +12,21 @@ import uvicorn
 import time
 import re
 from typing import Dict, List, Tuple, Optional
+
+app = FastAPI(title="Alma Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+# --- servir a imagem da Alma ---
+@app.get("/alma.png")
+def serve_alma_png():
+    path = "alma.png"  # mesmo diretório do main.py
+    if not os.path.exists(path):
+        return HTMLResponse("<h1>alma.png não encontrado</h1>", status_code=404)
+    return FileResponse(path, media_type="image/png")
 
 # ---------------------------------------------------------------------------------------
 # FastAPI & CORS
