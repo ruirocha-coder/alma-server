@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Alma</title>
+  <style>
+    :root{
+      --bg:#0a0a0b;
+      --panel:#0f0f11;
+      --panel-2:#141418;
+      --fg:#f3f3f3;
+      --fg-dim:#cfcfd3;
+      --border:#26262b;
+      --accent:#d4a017; /* amarelo torrado */
+      --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;background:radial-gradient(1100px 550px at 80% -10%, rgba(212,160,23,.06), transparent 60%), var(--bg);
+      color:var(--fg);
+      font:15px/1.6 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      display:flex;align-items:center;justify-content:center;
+    }
+    .wrap{width:100%;max-width:980px;padding:28px}
+    .hero{
+      display:flex;flex-direction:column;align-items:center;gap:18px;
+      background:linear-gradient(180deg,var(--panel),var(--panel-2));
+      border:1px solid var(--border); border-radius:16px; padding:28px;
+      box-shadow: var(--shadow);
+    }
+    .avatar{
+      width:160px;height:160px;border-radius:50%;
+      border:1px solid var(--border); overflow:hidden;
+      display:grid;place-items:center; background:#0b0b0f;
+      box-shadow: var(--shadow);
+      animation: spinOnce 1.6s ease-in-out 1;
+    }
+    .avatar img{width:100%;height:100%;object-fit:cover;display:block;filter:contrast(1.02) saturate(1.05)}
+    @keyframes spinOnce{
+      0%{transform:rotate(0deg)}
+      100%{transform:rotate(360deg)}
+    }
+
+    .typing{
+      width:100%;
+      max-width:560px;
+      background:#101014; border:1px solid var(--border);
+      border-radius:12px; padding:12px 14px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      box-shadow: var(--shadow);
+    }
+    .caret{display:inline-block;width:10px;background:var(--fg);margin-left:2px; animation: blink .9s steps(1,end) infinite}
+    @keyframes blink{50%{opacity:0}}
+
+    .tiles{
+      width:100%; display:grid; gap:14px; margin-top:12px;
+      grid-template-columns: repeat(3, 1fr);
+    }
+    @media (max-width: 880px){ .tiles{grid-template-columns:1fr} .avatar{width:140px;height:140px} }
+    .tile{
+      background: #111115; border:1px solid var(--border); border-radius:14px;
+      padding:16px; text-decoration:none; color:var(--fg);
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+      box-shadow: var(--shadow);
+    }
+    .tile:hover{ transform: translateY(-1px); border-color: var(--accent); }
+    .tile h3{margin:0 0 6px 0;font-size:1.05rem}
+    .tile p{margin:0;color:var(--fg-dim)}
+    .chip{display:inline-block;background:#1b1b21;border:1px solid #23232a;color:#c7c7cc;border-radius:999px;padding:4px 10px;font-size:.78rem}
+    .status{margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; justify-content:center}
+    .muted{color:#a7a7ae}
+    .ok{color:#7be482}
+    .warn{color:#ffcb6b}
+    .err{color:#ff6b6b}
+    .footer{margin-top:14px; text-align:center; color:var(--fg-dim); font-size:.92rem}
+    .accent{color:var(--accent)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <!-- Avatar -->
+      <div class="avatar">
+        <img src="/static/alma.png" alt="Alma"/>
+      </div>
+
+      <!-- Typing line -->
+      <div class="typing"><span id="typeTarget"></span><span class="caret">&nbsp;</span></div>
+
+      <!-- Status / pré-aquecimento -->
+      <div id="warmStatus" class="status">
+        <span class="chip">A preparar serviços…</span>
+      </div>
+
+      <!-- Tiles -->
+      <div class="tiles">
+        <a class="tile" href="/alma-chat">
+          <h3>Escrever com a Alma</h3>
+          <p>Chat em fundo escuro com histórico local e formatação.</p>
+        </a>
+
+        <!-- Ajusta o href para o teu frontend de voz (Next.js).
+             Ex.: href="https://o-teu-frontend.app" ou rota interna se tiveres proxy -->
+        <a class="tile" href="/voice">
+          <h3>Falar com a Alma</h3>
+          <p>Modo voz-voz / texto-voz com transcrição e TTS.</p>
+        </a>
+
+        <a class="tile" href="/console">
+          <h3>Adicionar ao Alma Data</h3>
+          <p>Ingerir URLs, PDFs, Sitemaps e pesquisar (RAG/Qdrant).</p>
+        </a>
+      </div>
+
+      <div class="footer">
+        <span class="muted">Pronto para começar. Escolhe um modo acima.</span>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    // ---- typing effect (> olá)
+    const text = "> olá";
+    const el = document.getElementById("typeTarget");
+    let i = 0;
+    function typeNext(){
+      if(i <= text.length){
+        el.textContent = text.slice(0, i++);
+        setTimeout(typeNext, 90);
+      }
+    }
+    // começa após a rotação (1.6s)
+    setTimeout(typeNext, 1650);
+
+    // ---- pré-aquecimento: /health, /ping_grok e /rag/search (se disponível)
+    const warm = async () => {
+      const box = document.getElementById("warmStatus");
+      const chips = [];
+
+      function addChip(txt, cls){
+        const span = document.createElement("span");
+        span.className = "chip";
+        if (cls) span.classList.add(cls);
+        span.textContent = txt;
+        box.appendChild(span);
+      }
+
+      box.innerHTML = "";
+      addChip("health…");
+
+      // /health
+      let ragOn = false;
+      try{
+        const r = await fetch("/health");
+        const j = await r.json();
+        ragOn = !!j.rag_available;
+        addChip(`modelo: ${j.model||'—'}`, "ok");
+        addChip(`RAG: ${ragOn?'on':'off'}`, ragOn?"ok":"warn");
+      }catch{ addChip("health falhou", "err"); }
+
+      // /ping_grok
+      addChip("grok…");
+      try{
+        const r = await fetch("/ping_grok");
+        const j = await r.json();
+        addChip(j.ok ? "grok ok" : "grok off", j.ok ? "ok" : "err");
+      }catch{ addChip("grok falhou", "err"); }
+
+      // RAG dummy
+      if (ragOn){
+        addChip("rag warm…");
+        try{
+          const r = await fetch("/rag/search?q=ping&namespace=");
+          const j = await r.json();
+          addChip(j.ok ? "rag ok" : "rag off", j.ok ? "ok" : "warn");
+        }catch{ addChip("rag falhou", "err"); }
+      }
+
+      // pré-carregar imagem do avatar (cache)
+      try{
+        const img = new Image();
+        img.src = "/static/alma.png";
+      }catch{}
+    };
+    // dispara logo ao abrir
+    warm();
+  </script>
+</body>
+</html>
