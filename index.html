@@ -15,17 +15,19 @@
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:28px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* STAGE (avatar) */
+  /* STAGE (avatar) — agora ~1/3 da viewport, sempre centrado */
   .stage{
-    width:min(1100px, 100%); height:520px;
-    background: radial-gradient(1200px 600px at 80% -10%, rgba(212,160,23,.05), transparent 60%), #0b0b0d;
+    width: clamp(320px, 34vw, 520px);
+    height: clamp(260px, 34vw, 420px);
+    margin: 4px auto 0 auto;
+    background: radial-gradient(900px 450px at 80% -10%, rgba(212,160,23,.05), transparent 60%), #0b0b0d;
     border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
     position:relative; overflow:hidden;
   }
   #avatarCanvas{position:absolute; inset:0}
   .spinner{position:absolute; inset:0; display:grid; place-items:center}
   .spinner::before{
-    content:""; width:40px; height:40px; border-radius:50%;
+    content:""; width:38px; height:38px; border-radius:50%;
     border:4px solid rgba(212,160,23,.25); border-top-color:var(--accent);
     animation:spin 1s linear infinite;
   }
@@ -122,7 +124,7 @@
   const warmEl = document.getElementById('warm');
 
   // typewriter
-  const text = "Olá, sou a Alma";         // conteúdo (sem '> ')
+  const text = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   let i = 0;
   (function typeTick(){
@@ -157,7 +159,7 @@
   const dir = new THREE.DirectionalLight(0xffffff, 1.1);
   dir.position.set(2,4,2); scene.add(dir);
 
-  // loaders (KTX2 + meshopt)
+  // loaders
   const ktx2 = new KTX2Loader()
     .setTranscoderPath('https://unpkg.com/three@0.160.1/examples/jsm/libs/basis/')
     .detectSupport(renderer);
@@ -167,8 +169,8 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // fit util (menos “zoom” para não cortar cabeça)
-  function fitCameraToObject(object, {padding=1.1, yBias=0.70, zoom=0.95}={}){
+  // fit util — mais “zoom out” e centrado
+  function fitCameraToObject(object, {padding=1.10, yBias=0.68, zoom=1.35}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size = new THREE.Vector3(), center = new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
@@ -190,6 +192,7 @@
     AVATAR_URL,
     (gltf)=>{
       avatar = gltf.scene;
+      avatar.position.set(0,0,0);            // garantir centro na origem
       // esconder mãos e afinar materiais
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
@@ -202,9 +205,9 @@
       // normalizar ~1.75m
       const b=new THREE.Box3().setFromObject(avatar); const s=new THREE.Vector3(); b.getSize(s);
       avatar.scale.setScalar(1.75/(s.y||1));
-      avatar.rotation.y = -Math.PI/2;                // começa virada à esquerda
+      avatar.rotation.y = -Math.PI/2;        // começa virada à esquerda
       scene.add(avatar);
-      fitCameraToObject(avatar, {padding:1.08, yBias:0.72, zoom:1.05});
+      fitCameraToObject(avatar, {padding:1.06, yBias:0.71, zoom:1.28});
 
       // sorriso
       const smileTargets=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
