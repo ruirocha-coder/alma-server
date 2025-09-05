@@ -1,224 +1,333 @@
 <!doctype html>
 <html lang="pt">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Alma — entrada</title>
 <style>
-  :root{ --bg:#0b0b0c; --fg:#f2f3f7; --muted:#a9afbb; --accent:#c79300; --border:#23252b; }
-  *{box-sizing:border-box} html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-  .wrap{max-width:1200px;margin:0 auto;padding:28px 16px;display:flex;flex-direction:column;align-items:center}
+  :root{
+    --bg:#0b0b0c;
+    --fg:#f3f3f4;
+    --muted:#aeb0b7;
+    --panel:#111216;
+    --accent:#d4a017;         /* amarelo torrado */
+    --border:#24262d;
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 24px 48px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.5 ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+  }
+  .wrap{
+    max-width:1200px;margin:0 auto;padding:28px 20px 60px;
+  }
+  /* STAGE — sem borda, fundido com a página */
+  .stage{
+    width:min(720px, 92vw);
+    height: min(44vh, 420px);
+    margin: 16px auto 18px;
+    position:relative;
+    border-radius:18px;
+    background:
+      radial-gradient(900px 400px at 50% -10%, rgba(212,160,23,.08), transparent 60%),
+      rgba(0,0,0,0.10);
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    overflow:hidden;
+  }
+  canvas{display:block; width:100%; height:100%}
+  .spin{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  }
+  .spin:after{
+    content:""; width:34px; height:34px; border-radius:50%;
+    border:3px solid rgba(212,160,23,.25); border-top-color:var(--accent);
+    animation: r .9s linear infinite;
+  }
+  @keyframes r{to{transform:rotate(360deg)}}
 
-  .stage{width:clamp(320px,36vw,520px);height:clamp(260px,36vw,420px);
-         position:relative;margin:6px auto 0; border-radius:18px; overflow:hidden}
-  #canvas{position:absolute;inset:0}
-  .spinner{position:absolute;inset:0;display:grid;place-items:center}
-  .spinner::before{content:"";width:40px;height:40px;border-radius:50%;
-    border:4px solid rgba(199,147,0,.25);border-top-color:var(--accent);animation:spin 1s linear infinite}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .err{position:absolute;inset:0;display:none;place-items:center;color:#ff9c9c;font-size:14px}
+  /* Typewriter grande, só aparece depois */
+  .type{
+    margin: 6px auto 18px;
+    text-align:center; font-weight:900; letter-spacing:.5px;
+    font-size: clamp(28px, 6.8vw, 64px);
+    line-height: 1.05;
+  }
+  .type .prompt{opacity:.95}
+  .type .cursor{display:inline-block; width:.6ch; background:currentColor; opacity:.75; animation:blink 1s steps(1,end) infinite}
+  @keyframes blink{50%{opacity:.15}}
 
-  .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
-  .type{font-weight:900; letter-spacing:-0.5px; line-height:1.06;
-        font-size:clamp(34px,7vw,76px); white-space:pre-wrap; margin:0}
-  .type .prompt{opacity:.6}
-  .cursor{display:inline-block;width:.6ch;background:currentColor;animation:blink 1s steps(1,end) infinite}
-  @keyframes blink{50%{opacity:0}}
-
-  .tiles{width:min(1100px,100%);display:grid;grid-template-columns:repeat(3,1fr);
-         gap:16px;margin:22px auto 8px}
-  @media (max-width:900px){ .tiles{grid-template-columns:1fr} }
-  .tile{display:flex;flex-direction:column;gap:6px;padding:18px;border-radius:14px;
-        background:linear-gradient(180deg,#101114,#15171b);border:1px solid var(--border);
-        text-decoration:none;color:var(--fg);transition:border-color .15s ease}
-  .tile:hover{border-color:var(--accent)}
-  .tile h3{margin:0 0 4px 0;font-size:18px}
-  .tile p{margin:0;color:var(--muted);font-size:14px}
+  /* Tiles */
+  .tiles{
+    display:grid; gap:16px; grid-template-columns: repeat(3, 1fr);
+    max-width: 1100px; margin: 8px auto 0;
+  }
+  @media (max-width: 980px){ .tiles{ grid-template-columns: 1fr; max-width:720px; } }
+  .tile{
+    background: linear-gradient(180deg, #12141a, #0f1116);
+    border:1px solid rgba(255,255,255,.06);
+    border-radius:14px; padding:16px 18px;
+    box-shadow: var(--shadow);
+    text-decoration:none; color:var(--fg);
+    transition: border-color .12s, transform .12s, box-shadow .12s;
+  }
+  .tile:hover{ border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,.35);}
+  .tile h3{margin:0 0 6px 0; font-size:17px}
+  .tile p{margin:0; color:var(--muted); font-size:14px}
+  .status{ text-align:center; margin-top:10px; font-size:12px; color:#b7bac2; opacity:.8;}
 </style>
-
-<script type="module" src="https://unpkg.com/three@0.160.1/build/three.module.js"></script>
-<script type="module" src="https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js"></script>
 </head>
 <body>
-<div class="wrap">
-  <section class="stage" aria-label="Alma avatar 3D">
-    <canvas id="canvas"></canvas>
-    <div class="spinner" id="spin"></div>
-    <div class="err" id="err">⚠️ Não consegui carregar o avatar.</div>
-  </section>
+  <div class="wrap">
+    <!-- AVATAR -->
+    <div class="stage">
+      <canvas id="almaCanvas"></canvas>
+      <div id="spinner" class="spin" aria-hidden="true"></div>
+    </div>
 
-  <div class="typewrap">
-    <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
+    <!-- TYPEWRITER -->
+    <div id="type" class="type" style="visibility:hidden;"></div>
+
+    <!-- TILES -->
+    <div class="tiles">
+      <a class="tile" href="/alma-chat">
+        <h3>Escrever com a Alma</h3>
+        <p>Chat em modo consola, rápido e minimal.</p>
+      </a>
+      <a class="tile" href="/alma-frontend">
+        <h3>Falar com a Alma</h3>
+        <p>Voz→voz e texto→voz, com lipsync.</p>
+      </a>
+      <a class="tile" href="/console">
+        <h3>Adicionar ao Alma Data</h3>
+        <p>Sitemaps, páginas, PDFs e texto para o RAG.</p>
+      </a>
+    </div>
+
+    <div id="prep" class="status">a preparar…</div>
   </div>
 
-  <nav class="tiles">
-    <a class="tile" href="/alma-chat"><h3>Escrever com a Alma</h3><p>Chat em modo consola, rápido e minimal.</p></a>
-    <a class="tile" href="/alma-frontend"><h3>Falar com a Alma</h3><p>Voz→voz e texto→voz, com lipsync.</p></a>
-    <a class="tile" href="/console"><h3>Adicionar ao Alma Data</h3><p>Sitemaps, páginas, PDFs e texto para o RAG.</p></a>
-  </nav>
-</div>
+  <!-- THREE -->
+  <script type="module">
+  // Evita múltiplas inicializações se o módulo for reexecutado.
+  if (!window.__ALMA_ENTRY_INIT__) {
+    window.__ALMA_ENTRY_INIT__ = true;
 
-<script type="module">
-  import * as THREE from 'https://unpkg.com/three@0.160.1/build/three.module.js';
-  import { GLTFLoader } from 'https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js';
+    import * as THREE from 'https://unpkg.com/three@0.160.1/build/three.module.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js';
 
-  // ---------- CONFIG ----------
-  const qs = new URLSearchParams(location.search);
-  const AVATAR_URL = qs.get('avatar')
-    || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
-  const TYPE_TEXT = "Olá, sou a Alma";
+    // ========= Parâmetros =========
+    const qs = new URLSearchParams(location.search);
+    const AVATAR_URL = qs.get('avatar')
+      || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
+    const TYPE_TEXT = "Olá, sou a Alma";
 
-  // ---------- TYPEWRITER ----------
-  const typeEl = document.getElementById('type');
-  let typedOnce = false;
-  function startTypewriter(){
-    if (typedOnce) return; typedOnce = true;
-    let i=0;
-    (function tick(){
-      if (i <= TYPE_TEXT.length){
-        typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT.slice(0,i)}<span class="cursor">&nbsp;</span>`;
-        i++; setTimeout(tick, i<3 ? 120 : 42);
-      } else {
-        typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT}`;
-      }
-    })();
-  }
+    // ========= Typewriter =========
+    const typeEl = document.getElementById('type');
+    function startTypewriter(){
+      typeEl.style.visibility = 'visible';
+      let i=0;
+      const tick = ()=>{
+        if (i<=TYPE_TEXT.length) {
+          typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT.slice(0,i)}<span class="cursor">&nbsp;</span>`;
+          i++; setTimeout(tick, i<3?120:42);
+        } else {
+          typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT}`;
+        }
+      };
+      tick();
+    }
 
-  // ---------- HELPERS ----------
-  const lerp = (a,b,t)=> a + (b-a)*Math.max(0,Math.min(1,t));
-  function findMorphIndex(mesh, names){
-    if (!mesh.morphTargetDictionary) return -1;
-    for (const n of names){ const i=mesh.morphTargetDictionary[n]; if (typeof i==='number') return i; }
-    return -1;
-  }
-  function fitCameraToObject(camera, object, renderer,
-    {padding=0.95,yFocusBias=0.72,zoomFactor=0.58}={}
-  ){
-    const box = new THREE.Box3().setFromObject(object);
-    const size = new THREE.Vector3(); const center = new THREE.Vector3();
-    box.getSize(size); box.getCenter(center);
-    const target = center.clone(); target.y += size.y*(yFocusBias-0.5);
+    // ========= Helpers (iguais ao AvatarCanvas) =========
+    const lerp = (a,b,t)=> a + (b-a)*Math.max(0,Math.min(1,t));
+    function findMorphIndex(mesh, names){
+      if (!mesh.morphTargetDictionary) return -1;
+      for (const n of names){ const idx = mesh.morphTargetDictionary[n]; if (typeof idx==='number') return idx; }
+      return -1;
+    }
+    function fitCameraToObject(camera, object, renderer,
+      {padding=0.95, yFocusBias=0.72, zoomFactor=0.58}={}
+    ){
+      const box = new THREE.Box3().setFromObject(object);
+      const size = new THREE.Vector3(); const center = new THREE.Vector3();
+      box.getSize(size); box.getCenter(center);
 
-    const fov = (camera.fov*Math.PI)/180;
-    const height = size.y*padding, width=size.x*padding;
-    const distH = height/(2*Math.tan(fov/2));
-    const distW = width /(2*Math.tan((fov*camera.aspect)/2));
-    const dist = Math.max(distH,distW)*zoomFactor;
+      const target = center.clone();
+      target.y += size.y * (yFocusBias - 0.5);
 
-    const dir = new THREE.Vector3(0,0.12,1).normalize();
-    const pos = target.clone().add(dir.multiplyScalar(dist));
-    camera.position.copy(pos);
-    camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
-    camera.lookAt(target); renderer.render(object.parent||scene,camera);
-  }
+      const fov = (camera.fov*Math.PI)/180;
+      const height = size.y*padding;
+      const width  = size.x*padding;
+      const distForHeight = height/(2*Math.tan(fov/2));
+      const distForWidth  = width /(2*Math.tan((fov*camera.aspect)/2));
+      const distance = Math.max(distForHeight, distForWidth) * zoomFactor;
 
-  // ---------- SCENE ----------
-  const stage = document.querySelector('.stage');
-  const canvas = document.getElementById('canvas');
-  const spin = document.getElementById('spin');
-  const errBox = document.getElementById('err');
+      const dir = new THREE.Vector3(0, 0.12, 1).normalize();
+      const newPos = target.clone().add(dir.multiplyScalar(distance));
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+      camera.position.copy(newPos);
+      camera.near = Math.max(0.01, distance/100);
+      camera.far  = distance*100;
+      camera.updateProjectionMatrix();
+      camera.lookAt(target);
+      renderer.render(object.parent||scene, camera);
+    }
 
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-  camera.position.set(0,1.6,2.0);
+    // ========= Scene base =========
+    const stage   = document.querySelector('.stage');
+    const canvas  = document.getElementById('almaCanvas');
+    const spinner = document.getElementById('spinner');
 
-  function resize(){
-    const w = stage.clientWidth, h = stage.clientHeight;
-    renderer.setSize(w,h,false);
-    camera.aspect = w/h; camera.updateProjectionMatrix();
-    if (avatarGroup) fitCameraToObject(camera, avatarGroup, renderer);
-  }
-  // Evitar múltiplos handlers
-  window.addEventListener('resize', resize, { passive:true, once:false });
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(stage.clientWidth, stage.clientHeight, false);
+    // SRGB compat
+    if (renderer.outputColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
 
-  scene.add(new THREE.HemisphereLight(0xffffff,0x222233,1.0));
-  const d = new THREE.DirectionalLight(0xffffff,1.0); d.position.set(2,4,2); scene.add(d);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, stage.clientWidth/stage.clientHeight, 0.1, 100);
+    camera.position.set(0,1.6,2.0);
 
-  // ---------- LOAD AVATAR (guardas anti-loop) ----------
-  const loader = new GLTFLoader(); loader.setCrossOrigin('anonymous');
-  let avatarGroup=null, exprMeshes=[], idxSmileL=[], idxSmileR=[];
-  let loadedOnce=false, spunOnce=false;
+    // luzes
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.0));
+    const d = new THREE.DirectionalLight(0xffffff, 1.0); d.position.set(2,4,2); scene.add(d);
 
-  function beginIntroOnce(){
-    if (spunOnce || !avatarGroup) return; spunOnce = true;
-    avatarGroup.rotation.y = -Math.PI*0.90;
-    const t0 = performance.now(); const dur = 1100;
-    (function spinIn(){
-      const t = Math.min(1,(performance.now()-t0)/dur);
-      const e = 1 - Math.pow(1-t,3);
-      avatarGroup.rotation.y = -Math.PI*0.90*(1-e);
-      for (let i=0;i<exprMeshes.length;i++){
-        const infl = exprMeshes[i].morphTargetInfluences;
-        if (idxSmileL[i]>=0) infl[idxSmileL[i]] = lerp(infl[idxSmileL[i]]||0, 0.35*e, 0.25);
-        if (idxSmileR[i]>=0) infl[idxSmileR[i]] = lerp(infl[idxSmileR[i]]||0, 0.35*e, 0.25);
-      }
-      if (t<1) requestAnimationFrame(spinIn);
-      else { spin.style.display='none'; startTypewriter(); }
-    })();
-  }
+    // resize responsivo
+    function onResize(){
+      const w = stage.clientWidth, h = stage.clientHeight;
+      renderer.setSize(w,h,false);
+      camera.aspect = w/h; camera.updateProjectionMatrix();
+      if (avatarGroup) fitCameraToObject(camera, avatarGroup, renderer);
+    }
+    new ResizeObserver(onResize).observe(stage);
+    window.addEventListener('orientationchange', ()=>setTimeout(onResize, 300), {passive:true});
 
-  function loadAvatarOnce(){
-    if (loadedOnce) return; loadedOnce = true;
+    // ========= Carregar avatar (port fiel ao AvatarCanvas) =========
+    const loader = new GLTFLoader(); loader.crossOrigin = 'anonymous';
 
-    loader.load(
-      AVATAR_URL,
-      (gltf)=>{
-        const avatar = gltf.scene;
-        avatar.traverse((o)=>{
-          const n=(o.name||'').toLowerCase();
-          if (n.includes('hand')||n.includes('wrist')||n.includes('wolf3d_hands')) o.visible=false;
-          if (o.isMesh && o.material?.isMeshStandardMaterial){ o.material.roughness=0.75; o.material.metalness=0.05; }
-        });
+    const mouthCandidates = ["jawOpen","mouthOpen","viseme_aa","MouthOpen","mouthOpen_BS","CC_Base_BlendShape.MouthOpen","Wolf3D_Avatar.MouthOpen"];
+    const browUpCandidates=["browInnerUp","browOuterUpLeft","browOuterUpRight"];
+    const smileLCandidates=["mouthSmileLeft"], smileRCandidates=["mouthSmileRight"];
+    const eyeBlinkLCandidates=["eyeBlinkLeft"], eyeBlinkRCandidates=["eyeBlinkRight"];
+    const eyeWideLCandidates=["eyeWideLeft"],   eyeWideRCandidates=["eyeWideRight"];
 
-        // normalização e recentragem
-        const box = new THREE.Box3().setFromObject(avatar);
-        const size = new THREE.Vector3(); const min = new THREE.Vector3(); const ctr = new THREE.Vector3();
-        box.getSize(size); box.getMin(min); box.getCenter(ctr);
-        avatar.scale.setScalar(1.75/(size.y||1));
-        avatar.position.x -= ctr.x; avatar.position.z -= ctr.z; avatar.position.y -= min.y;
+    let avatarGroup = null;
+    let mouthMeshes=[], mouthIdx=[];
+    let exprMeshes=[], idxBrowUp=[], idxSmileL=[], idxSmileR=[], idxBlinkL=[], idxBlinkR=[], idxWideL=[], idxWideR=[];
 
-        avatarGroup = new THREE.Group(); avatarGroup.add(avatar); scene.add(avatarGroup);
+    loader.load(AVATAR_URL, (gltf)=>{
+      avatarGroup = gltf.scene;
 
-        exprMeshes=[]; idxSmileL=[]; idxSmileR=[];
-        avatar.traverse((obj)=>{
-          if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-            const sL = findMorphIndex(obj, ["mouthSmileLeft","smileLeft","MouthSmileLeft"]);
-            const sR = findMorphIndex(obj, ["mouthSmileRight","smileRight","MouthSmileRight"]);
-            if (sL>=0 || sR>=0){ exprMeshes.push(obj); idxSmileL.push(sL); idxSmileR.push(sR); }
+      // esconder mãos + ajuste materiais (como no teu componente)
+      avatarGroup.traverse((o)=>{
+        const n=(o.name||"").toLowerCase();
+        if (n.includes('hand') || n.includes('wrist') || n.includes('wolf3d_hands')) o.visible=false;
+        if (o.isMesh && o.material?.isMeshStandardMaterial){
+          o.castShadow=false; o.receiveShadow=false;
+          o.material.roughness = 0.75; o.material.metalness = 0.05;
+        }
+      });
+
+      // normalizar escala ~1.75m
+      const tmpBox = new THREE.Box3().setFromObject(avatarGroup);
+      const tmpSize = new THREE.Vector3(); tmpBox.getSize(tmpSize);
+      const heightM = tmpSize.y || 1; const desired = 1.75;
+      avatarGroup.scale.setScalar(desired / heightM);
+
+      scene.add(avatarGroup);
+
+      // localizar morphs (boca + expressões)
+      mouthMeshes=[]; mouthIdx=[]; exprMeshes=[];
+      idxBrowUp=[]; idxSmileL=[]; idxSmileR=[]; idxBlinkL=[]; idxBlinkR=[]; idxWideL=[]; idxWideR=[];
+
+      avatarGroup.traverse((obj)=>{
+        if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
+          const m = obj;
+          const mi = findMorphIndex(m, mouthCandidates);
+          if (mi>=0){ mouthMeshes.push(m); mouthIdx.push(mi); }
+
+          const bUp = findMorphIndex(m, browUpCandidates);
+          const sL  = findMorphIndex(m, smileLCandidates);
+          const sR  = findMorphIndex(m, smileRCandidates);
+          const blL = findMorphIndex(m, eyeBlinkLCandidates);
+          const blR = findMorphIndex(m, eyeBlinkRCandidates);
+          const wL  = findMorphIndex(m, eyeWideLCandidates);
+          const wR  = findMorphIndex(m, eyeWideRCandidates);
+
+          if (bUp>=0 || sL>=0 || sR>=0 || blL>=0 || blR>=0 || wL>=0 || wR>=0){
+            exprMeshes.push(m);
+            idxBrowUp.push(bUp); idxSmileL.push(sL); idxSmileR.push(sR);
+            idxBlinkL.push(blL); idxBlinkR.push(blR); idxWideL.push(wL); idxWideR.push(wR);
           }
-        });
+        }
+      });
 
-        resize();           // ajusta à caixa atual
-        beginIntroOnce();   // anima 1x
-      },
-      undefined,
-      (err)=>{ console.warn('Falha GLB:', err); spin.style.display='none'; errBox.style.display='grid'; startTypewriter(); }
-    );
-  }
+      // Enquadrar e centrar
+      fitCameraToObject(camera, avatarGroup, renderer);
 
-  // arranque
-  resize();
-  loadAvatarOnce();
+      // Intro: começar virada ligeiramente para a esquerda e rodar até à frente
+      avatarGroup.rotation.y = -Math.PI * 0.55; // esquerda
+      introActive = true;
+      spinner.style.display='none';
+    }, undefined, (e)=>{
+      spinner.style.display='none';
+      document.getElementById('prep').textContent = '⚠️ Não consegui carregar o avatar.';
+      console.error('Falha a carregar GLB:', e);
+    });
 
-  // render loop único
-  (function RAF(){ renderer.render(scene,camera); requestAnimationFrame(RAF); })();
+    // ========= Loop de animação & intro =========
+    let introActive = false;
+    let smileT = 0;
+    renderer.setAnimationLoop(()=>{
+      if (!avatarGroup){ renderer.render(scene,camera); return; }
 
-  // ---------- WARM-UP (sem retries, sem heygen) ----------
-  (async ()=>{
-    try{ await fetch('/health',{cache:'no-store'}); }catch{}
-    try{
-      await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({question:'ping',user_id:'warmup'})});
-    }catch{}
-    // best-effort para o frontend; não repetimos
-    fetch('/api/stt',{method:'OPTIONS'}).catch(()=>{});
-    fetch('/api/tts',{method:'OPTIONS'}).catch(()=>{});
-  })();
-</script>
+      // Intro: rodar y até 0 e sorrir
+      if (introActive){
+        const y = avatarGroup.rotation.y;
+        const targetY = 0;
+        const ny = lerp(y, targetY, 0.06);
+        avatarGroup.rotation.y = ny;
+
+        // sorriso (0 → 0.35)
+        smileT = Math.min(1, smileT + 0.02);
+        const smile = 0.35 * (0.5 - 0.5*Math.cos(Math.PI*smileT)); // ease-in
+
+        for (let i=0;i<exprMeshes.length;i++){
+          const infl = exprMeshes[i].morphTargetInfluences;
+          if (idxSmileL[i]>=0) infl[idxSmileL[i]] = lerp(infl[idxSmileL[i]]||0, smile, 0.15);
+          if (idxSmileR[i]>=0) infl[idxSmileR[i]] = lerp(infl[idxSmileR[i]]||0, smile, 0.15);
+          if (idxBrowUp[i]>=0) infl[idxBrowUp[i]] = lerp(infl[idxBrowUp[i]]||0, 0.12, 0.08);
+          if (idxWideL[i]>=0)  infl[idxWideL[i]]  = lerp(infl[idxWideL[i]] ||0, 0.06, 0.06);
+          if (idxWideR[i]>=0)  infl[idxWideR[i]]  = lerp(infl[idxWideR[i]] ||0, 0.06, 0.06);
+        }
+
+        // quando estiver praticamente centrado, termina e dispara o typewriter
+        if (Math.abs(ny - targetY) < 0.0025){
+          avatarGroup.rotation.y = 0;
+          introActive = false;
+          setTimeout(startTypewriter, 180);
+        }
+      }
+
+      renderer.render(scene, camera);
+    });
+
+    // ========= Pré-aquecimento discreto =========
+    (async ()=>{
+      const s = (t)=>fetch(t,{method:'GET',mode:'cors',cache:'no-store'}).catch(()=>{});
+      const p = document.getElementById('prep');
+      try{
+        await s('/health');
+        await s('/ping_grok');          // aquece o acesso ao Grok
+        s('/alma-chat');                 // aquece HTML estático
+        s('/console');
+        p.textContent = 'pronto';
+        setTimeout(()=>p.style.display='none', 800);
+      }catch{ p.style.display='none'; }
+    })();
+
+  } // guard
+  </script>
 </body>
 </html>
