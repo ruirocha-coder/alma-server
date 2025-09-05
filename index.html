@@ -241,15 +241,9 @@
         const t=Math.min(1,(performance.now()-t0)/dur);
         const e=1-Math.pow(1-t,3);
         pivot.rotation.y = -Math.PI/2*(1-e);
-     
-       
-       for (let i=0; i<smileMeshes.length; i++) {
-  const infl = smileMeshes[i].morphTargetInfluences;
-  const v = Math.min(0.45, e*0.55); // mais aberto/expressivo
-  if (idxSmileL[i] >= 0) infl[idxSmileL[i]] = v;
-  if (idxSmileR[i] >= 0) infl[idxSmileR[i]] = v;
-  if (idxSmileBoth[i] >= 0) infl[idxSmileBoth[i]] = v; // fallback 1 canal
-}
+      for(let i=0;i<mMeshes.length;i++){
+      mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.35, e*0.4);
+      }
         
         
         
