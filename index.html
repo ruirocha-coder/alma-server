@@ -1,4 +1,4 @@
-<!doctype html>
+<<!doctype html>
 <html lang="pt">
 <head>
 <meta charset="utf-8">
@@ -26,6 +26,8 @@
     box-shadow:var(--glow);
   }
   #avatarCanvas{position:absolute; inset:0}
+  /* ⬇ garante que o canvas ocupa 100% da caixa e não distorce */
+  #avatarCanvas canvas{position:absolute; inset:0; width:100%; height:100%; display:block}
   .spinner{position:absolute; inset:0; display:grid; place-items:center}
   .spinner::before{
     content:""; width:38px; height:38px; border-radius:50%;
@@ -109,14 +111,11 @@
   import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
   import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-  // ---- config
   const AVATAR_URL = 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
-
   const stage = document.querySelector('.stage');
   const container = document.getElementById('avatarCanvas');
   const spinner = document.getElementById('spin');
 
-  // ---- typewriter (só arranca no fim da rotação)
   const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   function startTypewriter(){
@@ -131,7 +130,7 @@
     })();
   }
 
-  // ---- three setup (igual)
+  // three
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#0b0b0d');
 
@@ -144,7 +143,7 @@
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
-    renderer.setSize(w,h,false);
+    renderer.setSize(w, h, true);               // ⬅ atualiza também o tamanho CSS
     camera.aspect = w/h; camera.updateProjectionMatrix();
   }
   resize(); addEventListener('resize', resize, {passive:true});
@@ -153,7 +152,6 @@
   const dir = new THREE.DirectionalLight(0xffffff,1.1);
   dir.position.set(2,4,2); scene.add(dir);
 
-  // loaders
   const ktx2 = new KTX2Loader()
     .setTranscoderPath('https://unpkg.com/three@0.160.1/examples/jsm/libs/basis/')
     .detectSupport(renderer);
@@ -163,13 +161,11 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // util para “focar” o rosto
   function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.28}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
 
-    // alvo ~olhos
     const target=center.clone();
     target.y += size.y*(yBias-0.5);
 
@@ -185,8 +181,8 @@
     return target;
   }
 
-  // ====== LOAD & CENTER (única alteração relevante) ======
-  let pivot = new THREE.Group();     // pivô no (0,0,0)
+  // pivot no 0,0,0 para rodar e manter centro
+  const pivot = new THREE.Group();
   scene.add(pivot);
 
   loader.load(
@@ -194,7 +190,6 @@
     (gltf)=>{
       const avatar = gltf.scene;
 
-      // materiais + esconder mãos (igual)
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
         if(nm.includes('hand')||nm.includes('wrist')||nm.includes('wolf3d_hands')) o.visible=false;
@@ -208,18 +203,17 @@
       const s1=new THREE.Vector3(); b1.getSize(s1);
       avatar.scale.setScalar(1.75/(s1.y||1));
 
-      // **recentrar pelo centro da bounding box** → fica mesmo no centro do pivot
+      // **recentrar**: move o modelo para que o centro geométrico fique no (0,0,0)
       const b2 = new THREE.Box3().setFromObject(avatar);
       const c2 = b2.getCenter(new THREE.Vector3());
       avatar.position.sub(c2);
 
-      // meter dentro do pivot e à cena
       pivot.add(avatar);
 
-      // focar no rosto do objeto já centrado
+      // foca o rosto (target devolvido) — garante centralização na CAIXA
       const focusTarget = fitCameraToObject(pivot,{padding:1.06,yBias:0.72,zoom:1.30});
 
-      // sorriso morphs
+      // sorriso
       const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
       const mMeshes=[], mIdx=[];
       avatar.traverse(obj=>{
@@ -231,7 +225,7 @@
         }
       });
 
-      // rotação Y no pivot (esquerda → frente) + sorriso
+      // rotação Y no pivot (esquerda -> frente) + sorriso
       pivot.rotation.y = -Math.PI/2;
       const t0=performance.now(), dur=1100;
       function anim(){
@@ -266,4 +260,4 @@
   })();
 </script>
 </body>
-</html>
+</html
