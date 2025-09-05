@@ -6,62 +6,61 @@
 <title>Alma — entrada</title>
 <style>
   :root{
-    --bg:#0a0a0b; --panel:#0f0f11; --panel2:#141418;
-    --fg:#f3f3f3; --muted:#b9bbc2; --accent:#d4a017; --border:#26262b;
-    --shadow:0 1px 0 rgba(255,255,255,.03), 0 12px 40px rgba(0,0,0,.35);
+    --bg:#0a0a0b; --panel:#0b0b0d;
+    --fg:#f3f3f3; --muted:#b9bbc2;
+    --accent:#d4a017; --border:#24242a;
+    --glow:0 14px 40px rgba(0,0,0,.40);
   }
   *{box-sizing:border-box} html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
-  .wrap{max-width:1200px;margin:0 auto;padding:28px 18px;display:flex;flex-direction:column;align-items:center}
+  .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* STAGE (avatar) — agora ~1/3 da viewport, sempre centrado */
+  /* ===== Avatar stage (sem moldura) ===== */
   .stage{
-    width: clamp(320px, 34vw, 520px);
-    height: clamp(260px, 34vw, 420px);
-    margin: 4px auto 0 auto;
-    background: radial-gradient(900px 450px at 80% -10%, rgba(212,160,23,.05), transparent 60%), #0b0b0d;
-    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
-    position:relative; overflow:hidden;
+    width:clamp(320px,34vw,520px);
+    height:clamp(260px,34vw,420px);
+    margin:8px auto 0;
+    position:relative; overflow:hidden; border-radius:18px;
+    background:radial-gradient(900px 450px at 80% -10%, rgba(212,160,23,.05), transparent 60%), var(--panel);
+    box-shadow:var(--glow);
   }
   #avatarCanvas{position:absolute; inset:0}
   .spinner{position:absolute; inset:0; display:grid; place-items:center}
   .spinner::before{
     content:""; width:38px; height:38px; border-radius:50%;
     border:4px solid rgba(212,160,23,.25); border-top-color:var(--accent);
-    animation:spin 1s linear infinite;
+    animation:spin 1s linear infinite
   }
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  /* TYPEWRITER */
-  .typewrap{width:min(1000px,100%); margin:16px auto 8px auto; text-align:center}
+  /* ===== Typewriter ===== */
+  .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
   .type{
-    font-weight:900; letter-spacing:-0.5px; line-height:1.05;
-    font-size: clamp(32px, 7vw, 72px); white-space:pre-wrap; user-select:none; margin:0;
+    font-weight:900; letter-spacing:-0.5px; line-height:1.06;
+    font-size:clamp(32px,7vw,72px); white-space:pre-wrap; user-select:none; margin:0;
   }
   .type .prompt{opacity:.6}
-  .cursor{display:inline-block; width:.6ch; background:currentColor; animation:blink 1s steps(1,end) infinite}
+  .cursor{display:inline-block;width:.6ch;background:currentColor;animation:blink 1s steps(1,end) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* TILES ROW */
+  /* ===== Tiles ===== */
   .tiles{
     width:min(1100px,100%);
-    display:grid; gap:16px; grid-template-columns:repeat(3, 1fr);
-    margin:18px auto 6px;
+    display:grid; grid-template-columns:repeat(3,1fr); gap:16px;
+    margin:22px auto 6px;
   }
-  @media (max-width: 900px){ .tiles{grid-template-columns:1fr} }
+  @media (max-width:900px){ .tiles{grid-template-columns:1fr} }
   .tile{
-    display:flex; align-items:center; gap:14px; padding:16px 18px;
-    background:linear-gradient(180deg,var(--panel),var(--panel2));
-    border:1px solid var(--border); border-radius:14px; box-shadow:var(--shadow);
-    text-decoration:none; color:var(--fg);
+    display:flex; flex-direction:column; gap:6px;
+    padding:18px; border-radius:14px; text-decoration:none; color:var(--fg);
+    background:linear-gradient(180deg,#0f0f11,#141418);
+    border:1px solid var(--border); box-shadow:var(--glow);
+    transition:border-color .15s ease;
   }
-  .chip{background:#1c1c20;border:1px solid #2a2a31;border-radius:999px;padding:6px 10px;font-size:12px;color:#d7b252;min-width:78px;text-align:center}
-  .tile h3{margin:0;font-size:18px}
-  .tile p{margin:2px 0 0 0;color:var(--muted);font-size:14px}
-  .go{margin-left:auto;width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:var(--accent);color:#151515;font-weight:900}
-
-  .warm{color:var(--muted); font-size:12px; margin-top:6px; text-align:center}
+  .tile:hover{ border-color: var(--accent); }
+  .tile h3{margin:0 0 4px 0; font-size:18px}
+  .tile p{margin:0; color:var(--muted); font-size:14px}
 </style>
 
 <!-- three + addons -->
@@ -77,33 +76,29 @@
 <body>
   <div class="wrap">
     <!-- AVATAR -->
-    <section class="stage">
-      <div id="avatarCanvas" aria-label="Alma avatar 3D"></div>
+    <section class="stage" aria-label="Alma avatar 3D">
+      <div id="avatarCanvas"></div>
       <div class="spinner" id="spin"></div>
     </section>
 
-    <!-- TYPEWRITER -->
+    <!-- TYPEWRITER (arranca só após animação do avatar) -->
     <div class="typewrap">
       <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
-      <div class="warm" id="warm">a preparar…</div>
     </div>
 
-    <!-- TILES -->
+    <!-- TILES (texto apenas) -->
     <nav class="tiles">
       <a class="tile" href="/alma-chat">
-        <span class="chip">Escrever</span>
-        <div><h3>Escrever com a Alma</h3><p>Chat em modo consola, rápido e minimal.</p></div>
-        <div class="go">›</div>
+        <h3>Escrever com a Alma</h3>
+        <p>Chat em modo consola, rápido e minimal.</p>
       </a>
       <a class="tile" href="/alma-frontend">
-        <span class="chip">Falar</span>
-        <div><h3>Falar com a Alma</h3><p>Voz→voz e texto→voz, com lipsync.</p></div>
-        <div class="go">›</div>
+        <h3>Falar com a Alma</h3>
+        <p>Voz→voz e texto→voz, com lipsync.</p>
       </a>
       <a class="tile" href="/console">
-        <span class="chip">Data</span>
-        <div><h3>Adicionar ao Alma Data</h3><p>Sitemaps, páginas, PDFs e texto para o RAG.</p></div>
-        <div class="go">›</div>
+        <h3>Adicionar ao Alma Data</h3>
+        <p>Sitemaps, páginas, PDFs e texto para o RAG.</p>
       </a>
     </nav>
   </div>
@@ -114,34 +109,35 @@
   import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
   import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-  // -------- config / helpers
+  // ---- config
   const qs = new URLSearchParams(location.search);
   const AVATAR_URL = qs.get('avatar') || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
 
   const stage = document.querySelector('.stage');
   const container = document.getElementById('avatarCanvas');
   const spinner = document.getElementById('spin');
-  const warmEl = document.getElementById('warm');
 
-  // typewriter
-  const text = "Olá, sou a Alma";
+  // ---- typewriter (arranca via callback)
+  const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
-  let i = 0;
-  (function typeTick(){
-    if (i <= text.length){
-      typeEl.innerHTML = `<span class="prompt">&gt; </span>${text.slice(0,i)}<span class="cursor">&nbsp;</span>`;
-      i++; setTimeout(typeTick, i<3 ? 120 : 42);
-    } else {
-      typeEl.innerHTML = `<span class="prompt">&gt; </span>${text}`;
-    }
-  })();
+  function startTypewriter(){
+    let i=0;
+    (function tick(){
+      if (i <= TYPE_TEXT.length){
+        typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT.slice(0,i)}<span class="cursor">&nbsp;</span>`;
+        i++; setTimeout(tick, i<3 ? 120 : 42);
+      } else {
+        typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT}`;
+      }
+    })();
+  }
 
-  // three setup
+  // ---- three setup
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#0b0b0d');
 
-  const renderer = new THREE.WebGLRenderer({ antialias:true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   container.appendChild(renderer.domElement);
 
   const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
@@ -149,14 +145,14 @@
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
-    renderer.setSize(w, h, false);
+    renderer.setSize(w,h,false);
     camera.aspect = w/h; camera.updateProjectionMatrix();
   }
   resize(); addEventListener('resize', resize, {passive:true});
 
-  // lights
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.0));
-  const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+  // luzes
+  scene.add(new THREE.HemisphereLight(0xffffff,0x222233,1.0));
+  const dir = new THREE.DirectionalLight(0xffffff,1.1);
   dir.position.set(2,4,2); scene.add(dir);
 
   // loaders
@@ -169,21 +165,25 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // fit util — mais “zoom out” e centrado
-  function fitCameraToObject(object, {padding=1.10, yBias=0.68, zoom=1.35}={}){
+  // util para “focar” o rosto e centrar na caixa
+  function fitCameraToObject(object, {padding=1.06, yBias=0.71, xBias=0.00, zoom=1.28}={}){
     const box = new THREE.Box3().setFromObject(object);
-    const size = new THREE.Vector3(), center = new THREE.Vector3();
+    const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
 
-    const target = center.clone(); target.y += size.y*(yBias-0.5);
-    const fov = (camera.fov*Math.PI)/180;
-    const distH = (size.y*padding)/(2*Math.tan(fov/2));
-    const distW = (size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
-    const dist = Math.max(distH, distW) * zoom;
+    // alvo ligeiramente acima do centro geométrico → foca rosto
+    const target=center.clone();
+    target.y += size.y*(yBias-0.5);
+    target.x += size.x*(xBias);
 
-    const dirV = new THREE.Vector3(0,0.12,1).normalize();
+    const fov=(camera.fov*Math.PI)/180;
+    const distH=(size.y*padding)/(2*Math.tan(fov/2));
+    const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
+    const dist=Math.max(distH,distW)*zoom;
+
+    const dirV=new THREE.Vector3(0,0.10,1).normalize(); // ligeiro “top-down”
     camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
-    camera.near = Math.max(0.01, dist/100); camera.far = dist*100; camera.updateProjectionMatrix();
+    camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
     camera.lookAt(target);
   }
 
@@ -191,8 +191,8 @@
   loader.load(
     AVATAR_URL,
     (gltf)=>{
-      avatar = gltf.scene;
-      avatar.position.set(0,0,0);            // garantir centro na origem
+      avatar=gltf.scene;
+
       // esconder mãos e afinar materiais
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
@@ -202,54 +202,61 @@
         }
       });
 
-      // normalizar ~1.75m
+      // normalizar altura e recentrar
       const b=new THREE.Box3().setFromObject(avatar); const s=new THREE.Vector3(); b.getSize(s);
       avatar.scale.setScalar(1.75/(s.y||1));
-      avatar.rotation.y = -Math.PI/2;        // começa virada à esquerda
+      avatar.position.set(0,0,0);
       scene.add(avatar);
-      fitCameraToObject(avatar, {padding:1.06, yBias:0.71, zoom:1.28});
 
-      // sorriso
-      const smileTargets=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
-      const meshes=[], idxs=[];
+      // focar
+      fitCameraToObject(avatar,{padding:1.06,yBias:0.72,zoom:1.30});
+
+      // preparar sorriso morphs
+      const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
+      const mMeshes=[], mIdx=[];
       avatar.traverse(obj=>{
         if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-          for(const n of smileTargets){
-            const id = obj.morphTargetDictionary[n];
-            if(typeof id==='number'){ meshes.push(obj); idxs.push(id); break; }
+          for(const n of smileNames){
+            const id=obj.morphTargetDictionary[n];
+            if(typeof id==='number'){ mMeshes.push(obj); mIdx.push(id); break; }
           }
         }
       });
 
-      // animação rotação Y → frente + sorriso
-      const t0 = performance.now(), dur = 1100;
+      // anima: rodar da esquerda → frente e sorrir
+      avatar.rotation.y = -Math.PI/2; // começa virada à esquerda
+      const t0=performance.now(), dur=1100;
       function anim(){
-        const t = Math.min(1,(performance.now()-t0)/dur);
-        const e = 1 - Math.pow(1-t,3);
+        const t=Math.min(1,(performance.now()-t0)/dur);
+        const e=1-Math.pow(1-t,3);
         avatar.rotation.y = -Math.PI/2*(1-e);
-        for(let i=0;i<meshes.length;i++){
-          meshes[i].morphTargetInfluences[idxs[i]] = Math.min(0.35, e*0.4);
+        for(let i=0;i<mMeshes.length;i++){
+          mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.35, e*0.4);
         }
-        if(t<1) requestAnimationFrame(anim); else spinner.style.display='none';
+        // durante a animação, manter o alvo centrado
+        camera.lookAt(0, 1.5, 0);
+        if(t<1){ requestAnimationFrame(anim); }
+        else{ spinner.style.display='none'; startTypewriter(); }
       }
       requestAnimationFrame(anim);
     },
     undefined,
-    (err)=>{ console.warn('GLB falhou:', err); spinner.style.display='none'; warmEl.textContent="não foi possível carregar o avatar."; }
+    (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
   );
 
-  // render
-  function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); }
-  requestAnimationFrame(tick);
+  // render loop
+  (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
-  // pré-aquecimento discreto
+  // pré-aquecimento silencioso
   (async ()=>{
     try{
-      await Promise.race([fetch('/health',{cache:'no-store'}).then(r=>r.ok&&r.json()), new Promise(r=>setTimeout(r,1500))]);
-      await Promise.race([fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:'Ping.',user_id:'warmup'})}), new Promise(r=>setTimeout(r,1800))]);
+      await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]);
+      await Promise.race([
+        fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:'ping',user_id:'warmup'})}),
+        new Promise(r=>setTimeout(r,1500))
+      ]);
       fetch('/heygen/token',{method:'POST'}).catch(()=>{});
-      warmEl.textContent="pronto."; setTimeout(()=>warmEl.style.display='none', 1200);
-    }catch{ warmEl.style.display='none'; }
+    }catch{}
   })();
 </script>
 </body>
