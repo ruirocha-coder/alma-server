@@ -161,7 +161,7 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
-def grok_chat(messages, timeout=30):
+def grok_chat(messages, timeout=120):
     if not XAI_API_KEY:
         raise RuntimeError("Falta XAI_API_KEY")
     headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
