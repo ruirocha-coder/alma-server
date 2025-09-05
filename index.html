@@ -16,7 +16,7 @@
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* ===== Avatar stage (sem moldura) ===== */
+  /* ===== Avatar stage ===== */
   .stage{
     width:clamp(320px,34vw,520px);
     height:clamp(260px,34vw,420px);
@@ -63,7 +63,7 @@
   .tile p{margin:0; color:var(--muted); font-size:14px}
 </style>
 
-<!-- three + addons (mantidos) -->
+<!-- three + addons -->
 <script type="importmap">
 {
   "imports": {
@@ -81,12 +81,12 @@
       <div class="spinner" id="spin"></div>
     </section>
 
-    <!-- TYPEWRITER (arranca só após animação do avatar) -->
+    <!-- TYPEWRITER -->
     <div class="typewrap">
       <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
     </div>
 
-    <!-- TILES (texto apenas) -->
+    <!-- TILES -->
     <nav class="tiles">
       <a class="tile" href="/alma-chat">
         <h3>Escrever com a Alma</h3>
@@ -109,17 +109,13 @@
   import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
   import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-  // ---------- config ----------
-  const qs = new URLSearchParams(location.search);
-  const AVATAR_URL =
-    qs.get('avatar') ||
-    'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
-
+  // config
+  const AVATAR_URL = 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
   const stage = document.querySelector('.stage');
   const container = document.getElementById('avatarCanvas');
   const spinner = document.getElementById('spin');
 
-  // ---------- typewriter (começa depois da animação) ----------
+  // typewriter
   const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   function startTypewriter(){
@@ -134,16 +130,14 @@
     })();
   }
 
-  // ---------- THREE setup (centragem igual ao AvatarCanvas) ----------
+  // three setup
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#0b0b0d');
-
   const renderer = new THREE.WebGLRenderer({antialias:true});
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   container.appendChild(renderer.domElement);
-
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-  camera.position.set(0, 1.6, 2.0);
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  camera.position.set(0, 1.55, 2.4);
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
@@ -152,12 +146,10 @@
   }
   resize(); addEventListener('resize', resize, {passive:true});
 
-  // luzes
   scene.add(new THREE.HemisphereLight(0xffffff,0x222233,1.0));
-  const dir = new THREE.DirectionalLight(0xffffff,1.0);
+  const dir = new THREE.DirectionalLight(0xffffff,1.1);
   dir.position.set(2,4,2); scene.add(dir);
 
-  // loaders
   const ktx2 = new KTX2Loader()
     .setTranscoderPath('https://unpkg.com/three@0.160.1/examples/jsm/libs/basis/')
     .detectSupport(renderer);
@@ -167,113 +159,84 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // helpers
-  function lerp(a,b,t){ return a + (b-a) * Math.max(0, Math.min(1,t)); }
-
-  function fitCameraToObject(object, {padding=0.95, yFocusBias=0.72, zoomFactor=0.58}={}){
+  // focagem
+  function fitCameraToObject(object, {padding=1.06, yBias=0.71, xBias=0.00, zoom=1.28}={}){
     const box = new THREE.Box3().setFromObject(object);
-    const size = new THREE.Vector3(); const center = new THREE.Vector3();
+    const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
-
-    const target = center.clone();
-    target.y += size.y * (yFocusBias - 0.5);
-
-    const fov = (camera.fov * Math.PI) / 180;
-    const distForHeight = (size.y * padding) / (2 * Math.tan(fov / 2));
-    const distForWidth  = (size.x * padding) / (2 * Math.tan((fov * camera.aspect) / 2));
-    const distance = Math.max(distForHeight, distForWidth) * zoomFactor;
-
-    const dir = new THREE.Vector3(0, 0.12, 1).normalize();
-    const newPos = target.clone().add(dir.multiplyScalar(distance));
-
-    camera.position.copy(newPos);
-    camera.near = Math.max(0.01, distance / 100);
-    camera.far  = distance * 100;
-    camera.updateProjectionMatrix();
+    const target=center.clone();
+    target.y += size.y*(yBias-0.5);
+    target.x += size.x*(xBias);
+    const fov=(camera.fov*Math.PI)/180;
+    const distH=(size.y*padding)/(2*Math.tan(fov/2));
+    const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
+    const dist=Math.max(distH,distW)*zoom;
+    const dirV=new THREE.Vector3(0,0.10,1).normalize();
+    camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
+    camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
     camera.lookAt(target);
+    return target;
   }
 
-  // ---------- load avatar ----------
   let avatar=null;
-
   loader.load(
     AVATAR_URL,
     (gltf)=>{
-      avatar = gltf.scene;
-
-      // esconder mãos & afinar materiais
-      avatar.traverse((o)=>{
-        const n=(o.name||'').toLowerCase();
-        if (n.includes('hand') || n.includes('wrist') || n.includes('wolf3d_hands')) o.visible=false;
-        if (o.isMesh && o.material?.isMeshStandardMaterial){
+      avatar=gltf.scene;
+      avatar.traverse(o=>{
+        const nm=(o.name||'').toLowerCase();
+        if(nm.includes('hand')||nm.includes('wrist')||nm.includes('wolf3d_hands')) o.visible=false;
+        if(o.isMesh && o.material?.isMeshStandardMaterial){
           o.material.roughness=0.75; o.material.metalness=0.05;
         }
       });
-
-      // === normalizar altura e recentrar como no AvatarCanvas ===
-      // 1) bounding box / scale para ~1.75m
-      const tmpBox = new THREE.Box3().setFromObject(avatar);
-      const tmpSize = new THREE.Vector3(); const tmpCenter = new THREE.Vector3();
-      tmpBox.getSize(tmpSize); tmpBox.getCenter(tmpCenter);
-      const heightM = tmpSize.y || 1;
-      const desired = 1.75;
-      avatar.scale.setScalar(desired / heightM);
-
-      // 2) trazer o centro do modelo para a origem (ficar “bem no meio”)
-      avatar.position.sub(tmpCenter);
-
-      // 3) meter na cena
+      const b=new THREE.Box3().setFromObject(avatar); const s=new THREE.Vector3(); b.getSize(s);
+      avatar.scale.setScalar(1.75/(s.y||1));
+      avatar.position.set(0,0,0);
       scene.add(avatar);
 
-      // focar rosto e enquadrar
-      fitCameraToObject(avatar, {padding:0.95, yFocusBias:0.72, zoomFactor:0.58});
+      const focusTarget = fitCameraToObject(avatar,{padding:1.06,yBias:0.72,zoom:1.30});
 
-      // preparar sorriso (morphs ARKit)
-      const smileNames = ["mouthSmileLeft", "mouthSmileRight", "smileLeft", "smileRight"];
-      const mMeshes=[]; const mIdx=[];
+      const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
+      const mMeshes=[], mIdx=[];
       avatar.traverse(obj=>{
-        if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
+        if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
           for(const n of smileNames){
-            const id = obj.morphTargetDictionary[n];
-            if (typeof id === "number"){ mMeshes.push(obj); mIdx.push(id); break; }
+            const id=obj.morphTargetDictionary[n];
+            if(typeof id==='number'){ mMeshes.push(obj); mIdx.push(id); break; }
           }
         }
       });
 
-      // animação: vira da esquerda -> frente e, no fim, sorri
-      avatar.rotation.y = -Math.PI/2; // esquerda
-      const t0 = performance.now(); const dur = 1200;
-      (function anim(){
-        const t = Math.min(1, (performance.now()-t0)/dur);
-        const e = 1 - Math.pow(1-t, 3); // easeOutCubic
-        avatar.rotation.y = -Math.PI/2 * (1-e);
+      avatar.rotation.y = -Math.PI/2;
+      const t0=performance.now(), dur=1100;
+      function anim(){
+        const t=Math.min(1,(performance.now()-t0)/dur);
+        const e=1-Math.pow(1-t,3);
+        avatar.rotation.y = -Math.PI/2*(1-e);
         for(let i=0;i<mMeshes.length;i++){
-          const infl = mMeshes[i].morphTargetInfluences;
-          infl[mIdx[i]] = lerp(infl[mIdx[i]]||0, Math.min(0.35, e*0.4), 0.2);
+          mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.35, e*0.4);
         }
-        camera.lookAt(0, 1.5, 0);
-        if (t<1) requestAnimationFrame(anim);
-        else { spinner.style.display='none'; startTypewriter(); }
-      })();
+        camera.lookAt(focusTarget);
+        if(t<1){ requestAnimationFrame(anim); }
+        else{ spinner.style.display='none'; startTypewriter(); }
+      }
+      requestAnimationFrame(anim);
     },
     undefined,
-    (err)=>{ console.warn('GLB falhou:', err); spinner.style.display='none'; startTypewriter(); }
+    (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
   );
 
-  // render loop
   (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
-  // ---------- pré-aquecimento silencioso ----------
+  // pré-aquecimento
   (async ()=>{
-    try{ await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1000))]); }catch{}
-    try{ await Promise.race([fetch('/ping_grok',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]); }catch{}
-    try{ fetch('/alma-chat',{cache:'no-store'}).catch(()=>{}); }catch{}
     try{
-      fetch('/ask',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({question:'(warmup) diz "ok"', user_id:'warmup'})
-      }).catch(()=>{});
+      await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]);
+      await Promise.race([
+        fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:'ping',user_id:'warmup'})}),
+        new Promise(r=>setTimeout(r,1500))
+      ]);
     }catch{}
   })();
 </script>
