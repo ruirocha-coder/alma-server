@@ -6,12 +6,8 @@
 <title>Alma — entrada</title>
 <style>
   :root{
-    --bg:#0b0b0c;
-    --fg:#f3f3f4;
-    --muted:#aeb0b7;
-    --panel:#111216;
-    --accent:#d4a017;         /* amarelo torrado */
-    --border:#24262d;
+    --bg:#0b0b0c; --fg:#f3f3f4; --muted:#aeb0b7;
+    --panel:#111216; --accent:#d4a017; --border:#24262d;
     --shadow: 0 1px 0 rgba(255,255,255,.03), 0 24px 48px rgba(0,0,0,.35);
   }
   *{box-sizing:border-box}
@@ -20,59 +16,44 @@
     margin:0;background:var(--bg);color:var(--fg);
     font:16px/1.5 ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
   }
-  .wrap{
-    max-width:1200px;margin:0 auto;padding:28px 20px 60px;
-  }
-  /* STAGE — sem borda, fundido com a página */
+  .wrap{max-width:1200px;margin:0 auto;padding:28px 20px 60px;}
   .stage{
     width:min(720px, 92vw);
-    height: min(44vh, 420px);
-    margin: 16px auto 18px;
-    position:relative;
-    border-radius:18px;
-    background:
-      radial-gradient(900px 400px at 50% -10%, rgba(212,160,23,.08), transparent 60%),
-      rgba(0,0,0,0.10);
+    height:min(44vh, 420px);
+    margin:16px auto 18px;
+    position:relative; border-radius:18px; overflow:hidden;
+    background: radial-gradient(900px 400px at 50% -10%, rgba(212,160,23,.08), transparent 60%), rgba(0,0,0,.10);
     box-shadow: 0 10px 30px rgba(0,0,0,.35);
-    overflow:hidden;
   }
   canvas{display:block; width:100%; height:100%}
-  .spin{
-    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-  }
+  .spin{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;}
   .spin:after{
     content:""; width:34px; height:34px; border-radius:50%;
     border:3px solid rgba(212,160,23,.25); border-top-color:var(--accent);
-    animation: r .9s linear infinite;
+    animation:r .9s linear infinite;
   }
   @keyframes r{to{transform:rotate(360deg)}}
 
-  /* Typewriter grande, só aparece depois */
   .type{
-    margin: 6px auto 18px;
-    text-align:center; font-weight:900; letter-spacing:.5px;
-    font-size: clamp(28px, 6.8vw, 64px);
-    line-height: 1.05;
+    margin:6px auto 18px; text-align:center; font-weight:900; letter-spacing:.5px;
+    font-size:clamp(28px, 6.8vw, 64px); line-height:1.05;
   }
-  .type .prompt{opacity:.95}
-  .type .cursor{display:inline-block; width:.6ch; background:currentColor; opacity:.75; animation:blink 1s steps(1,end) infinite}
+  .type .cursor{display:inline-block;width:.6ch;background:currentColor;opacity:.75;animation:blink 1s steps(1,end) infinite}
   @keyframes blink{50%{opacity:.15}}
 
-  /* Tiles */
   .tiles{
-    display:grid; gap:16px; grid-template-columns: repeat(3, 1fr);
-    max-width: 1100px; margin: 8px auto 0;
+    display:grid; gap:16px; grid-template-columns:repeat(3,1fr);
+    max-width:1100px; margin:8px auto 0;
   }
-  @media (max-width: 980px){ .tiles{ grid-template-columns: 1fr; max-width:720px; } }
+  @media (max-width:980px){ .tiles{grid-template-columns:1fr; max-width:720px;} }
   .tile{
-    background: linear-gradient(180deg, #12141a, #0f1116);
+    background:linear-gradient(180deg,#12141a,#0f1116);
     border:1px solid rgba(255,255,255,.06);
-    border-radius:14px; padding:16px 18px;
-    box-shadow: var(--shadow);
+    border-radius:14px; padding:16px 18px; box-shadow:var(--shadow);
     text-decoration:none; color:var(--fg);
-    transition: border-color .12s, transform .12s, box-shadow .12s;
+    transition:border-color .12s, transform .12s, box-shadow .12s;
   }
-  .tile:hover{ border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,.35);}
+  .tile:hover{ border-color:var(--accent); transform:translateY(-2px); box-shadow:0 14px 30px rgba(0,0,0,.35); }
   .tile h3{margin:0 0 6px 0; font-size:17px}
   .tile p{margin:0; color:var(--muted); font-size:14px}
   .status{ text-align:center; margin-top:10px; font-size:12px; color:#b7bac2; opacity:.8;}
@@ -80,254 +61,224 @@
 </head>
 <body>
   <div class="wrap">
-    <!-- AVATAR -->
     <div class="stage">
       <canvas id="almaCanvas"></canvas>
       <div id="spinner" class="spin" aria-hidden="true"></div>
     </div>
 
-    <!-- TYPEWRITER -->
     <div id="type" class="type" style="visibility:hidden;"></div>
 
-    <!-- TILES -->
     <div class="tiles">
-      <a class="tile" href="/alma-chat">
-        <h3>Escrever com a Alma</h3>
-        <p>Chat em modo consola, rápido e minimal.</p>
-      </a>
-      <a class="tile" href="/alma-frontend">
-        <h3>Falar com a Alma</h3>
-        <p>Voz→voz e texto→voz, com lipsync.</p>
-      </a>
-      <a class="tile" href="/console">
-        <h3>Adicionar ao Alma Data</h3>
-        <p>Sitemaps, páginas, PDFs e texto para o RAG.</p>
-      </a>
+      <a class="tile" href="/alma-chat"><h3>Escrever com a Alma</h3><p>Chat em modo consola, rápido e minimal.</p></a>
+      <a class="tile" href="/alma-frontend"><h3>Falar com a Alma</h3><p>Voz→voz e texto→voz, com lipsync.</p></a>
+      <a class="tile" href="/console"><h3>Adicionar ao Alma Data</h3><p>Sitemaps, páginas, PDFs e texto para o RAG.</p></a>
     </div>
 
     <div id="prep" class="status">a preparar…</div>
   </div>
 
-  <!-- THREE -->
   <script type="module">
-  // Evita múltiplas inicializações se o módulo for reexecutado.
-  if (!window.__ALMA_ENTRY_INIT__) {
-    window.__ALMA_ENTRY_INIT__ = true;
+    // === Guards globais para evitar re-inicializações e loops ===
+    if (window.__ALMA_ENTRY_INIT__) {
+      // Já inicializado — não repete.
+    } else {
+      window.__ALMA_ENTRY_INIT__ = true;
 
-    import * as THREE from 'https://unpkg.com/three@0.160.1/build/three.module.js';
-    import { GLTFLoader } from 'https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js';
+      import * as THREE from 'https://unpkg.com/three@0.160.1/build/three.module.js';
+      import { GLTFLoader } from 'https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js';
 
-    // ========= Parâmetros =========
-    const qs = new URLSearchParams(location.search);
-    const AVATAR_URL = qs.get('avatar')
-      || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
-    const TYPE_TEXT = "Olá, sou a Alma";
+      const TYPE_TEXT = "Olá, sou a Alma";
+      const AVATAR_URL = new URLSearchParams(location.search).get('avatar')
+        || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
 
-    // ========= Typewriter =========
-    const typeEl = document.getElementById('type');
-    function startTypewriter(){
-      typeEl.style.visibility = 'visible';
-      let i=0;
-      const tick = ()=>{
-        if (i<=TYPE_TEXT.length) {
-          typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT.slice(0,i)}<span class="cursor">&nbsp;</span>`;
-          i++; setTimeout(tick, i<3?120:42);
-        } else {
-          typeEl.innerHTML = `<span class="prompt">&gt; </span>${TYPE_TEXT}`;
-        }
-      };
-      tick();
-    }
-
-    // ========= Helpers (iguais ao AvatarCanvas) =========
-    const lerp = (a,b,t)=> a + (b-a)*Math.max(0,Math.min(1,t));
-    function findMorphIndex(mesh, names){
-      if (!mesh.morphTargetDictionary) return -1;
-      for (const n of names){ const idx = mesh.morphTargetDictionary[n]; if (typeof idx==='number') return idx; }
-      return -1;
-    }
-    function fitCameraToObject(camera, object, renderer,
-      {padding=0.95, yFocusBias=0.72, zoomFactor=0.58}={}
-    ){
-      const box = new THREE.Box3().setFromObject(object);
-      const size = new THREE.Vector3(); const center = new THREE.Vector3();
-      box.getSize(size); box.getCenter(center);
-
-      const target = center.clone();
-      target.y += size.y * (yFocusBias - 0.5);
-
-      const fov = (camera.fov*Math.PI)/180;
-      const height = size.y*padding;
-      const width  = size.x*padding;
-      const distForHeight = height/(2*Math.tan(fov/2));
-      const distForWidth  = width /(2*Math.tan((fov*camera.aspect)/2));
-      const distance = Math.max(distForHeight, distForWidth) * zoomFactor;
-
-      const dir = new THREE.Vector3(0, 0.12, 1).normalize();
-      const newPos = target.clone().add(dir.multiplyScalar(distance));
-
-      camera.position.copy(newPos);
-      camera.near = Math.max(0.01, distance/100);
-      camera.far  = distance*100;
-      camera.updateProjectionMatrix();
-      camera.lookAt(target);
-      renderer.render(object.parent||scene, camera);
-    }
-
-    // ========= Scene base =========
-    const stage   = document.querySelector('.stage');
-    const canvas  = document.getElementById('almaCanvas');
-    const spinner = document.getElementById('spinner');
-
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    renderer.setSize(stage.clientWidth, stage.clientHeight, false);
-    // SRGB compat
-    if (renderer.outputColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
-
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45, stage.clientWidth/stage.clientHeight, 0.1, 100);
-    camera.position.set(0,1.6,2.0);
-
-    // luzes
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.0));
-    const d = new THREE.DirectionalLight(0xffffff, 1.0); d.position.set(2,4,2); scene.add(d);
-
-    // resize responsivo
-    function onResize(){
-      const w = stage.clientWidth, h = stage.clientHeight;
-      renderer.setSize(w,h,false);
-      camera.aspect = w/h; camera.updateProjectionMatrix();
-      if (avatarGroup) fitCameraToObject(camera, avatarGroup, renderer);
-    }
-    new ResizeObserver(onResize).observe(stage);
-    window.addEventListener('orientationchange', ()=>setTimeout(onResize, 300), {passive:true});
-
-    // ========= Carregar avatar (port fiel ao AvatarCanvas) =========
-    const loader = new GLTFLoader(); loader.crossOrigin = 'anonymous';
-
-    const mouthCandidates = ["jawOpen","mouthOpen","viseme_aa","MouthOpen","mouthOpen_BS","CC_Base_BlendShape.MouthOpen","Wolf3D_Avatar.MouthOpen"];
-    const browUpCandidates=["browInnerUp","browOuterUpLeft","browOuterUpRight"];
-    const smileLCandidates=["mouthSmileLeft"], smileRCandidates=["mouthSmileRight"];
-    const eyeBlinkLCandidates=["eyeBlinkLeft"], eyeBlinkRCandidates=["eyeBlinkRight"];
-    const eyeWideLCandidates=["eyeWideLeft"],   eyeWideRCandidates=["eyeWideRight"];
-
-    let avatarGroup = null;
-    let mouthMeshes=[], mouthIdx=[];
-    let exprMeshes=[], idxBrowUp=[], idxSmileL=[], idxSmileR=[], idxBlinkL=[], idxBlinkR=[], idxWideL=[], idxWideR=[];
-
-    loader.load(AVATAR_URL, (gltf)=>{
-      avatarGroup = gltf.scene;
-
-      // esconder mãos + ajuste materiais (como no teu componente)
-      avatarGroup.traverse((o)=>{
-        const n=(o.name||"").toLowerCase();
-        if (n.includes('hand') || n.includes('wrist') || n.includes('wolf3d_hands')) o.visible=false;
-        if (o.isMesh && o.material?.isMeshStandardMaterial){
-          o.castShadow=false; o.receiveShadow=false;
-          o.material.roughness = 0.75; o.material.metalness = 0.05;
-        }
-      });
-
-      // normalizar escala ~1.75m
-      const tmpBox = new THREE.Box3().setFromObject(avatarGroup);
-      const tmpSize = new THREE.Vector3(); tmpBox.getSize(tmpSize);
-      const heightM = tmpSize.y || 1; const desired = 1.75;
-      avatarGroup.scale.setScalar(desired / heightM);
-
-      scene.add(avatarGroup);
-
-      // localizar morphs (boca + expressões)
-      mouthMeshes=[]; mouthIdx=[]; exprMeshes=[];
-      idxBrowUp=[]; idxSmileL=[]; idxSmileR=[]; idxBlinkL=[]; idxBlinkR=[]; idxWideL=[]; idxWideR=[];
-
-      avatarGroup.traverse((obj)=>{
-        if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-          const m = obj;
-          const mi = findMorphIndex(m, mouthCandidates);
-          if (mi>=0){ mouthMeshes.push(m); mouthIdx.push(mi); }
-
-          const bUp = findMorphIndex(m, browUpCandidates);
-          const sL  = findMorphIndex(m, smileLCandidates);
-          const sR  = findMorphIndex(m, smileRCandidates);
-          const blL = findMorphIndex(m, eyeBlinkLCandidates);
-          const blR = findMorphIndex(m, eyeBlinkRCandidates);
-          const wL  = findMorphIndex(m, eyeWideLCandidates);
-          const wR  = findMorphIndex(m, eyeWideRCandidates);
-
-          if (bUp>=0 || sL>=0 || sR>=0 || blL>=0 || blR>=0 || wL>=0 || wR>=0){
-            exprMeshes.push(m);
-            idxBrowUp.push(bUp); idxSmileL.push(sL); idxSmileR.push(sR);
-            idxBlinkL.push(blL); idxBlinkR.push(blR); idxWideL.push(wL); idxWideR.push(wR);
-          }
-        }
-      });
-
-      // Enquadrar e centrar
-      fitCameraToObject(camera, avatarGroup, renderer);
-
-      // Intro: começar virada ligeiramente para a esquerda e rodar até à frente
-      avatarGroup.rotation.y = -Math.PI * 0.55; // esquerda
-      introActive = true;
-      spinner.style.display='none';
-    }, undefined, (e)=>{
-      spinner.style.display='none';
-      document.getElementById('prep').textContent = '⚠️ Não consegui carregar o avatar.';
-      console.error('Falha a carregar GLB:', e);
-    });
-
-    // ========= Loop de animação & intro =========
-    let introActive = false;
-    let smileT = 0;
-    renderer.setAnimationLoop(()=>{
-      if (!avatarGroup){ renderer.render(scene,camera); return; }
-
-      // Intro: rodar y até 0 e sorrir
-      if (introActive){
-        const y = avatarGroup.rotation.y;
-        const targetY = 0;
-        const ny = lerp(y, targetY, 0.06);
-        avatarGroup.rotation.y = ny;
-
-        // sorriso (0 → 0.35)
-        smileT = Math.min(1, smileT + 0.02);
-        const smile = 0.35 * (0.5 - 0.5*Math.cos(Math.PI*smileT)); // ease-in
-
-        for (let i=0;i<exprMeshes.length;i++){
-          const infl = exprMeshes[i].morphTargetInfluences;
-          if (idxSmileL[i]>=0) infl[idxSmileL[i]] = lerp(infl[idxSmileL[i]]||0, smile, 0.15);
-          if (idxSmileR[i]>=0) infl[idxSmileR[i]] = lerp(infl[idxSmileR[i]]||0, smile, 0.15);
-          if (idxBrowUp[i]>=0) infl[idxBrowUp[i]] = lerp(infl[idxBrowUp[i]]||0, 0.12, 0.08);
-          if (idxWideL[i]>=0)  infl[idxWideL[i]]  = lerp(infl[idxWideL[i]] ||0, 0.06, 0.06);
-          if (idxWideR[i]>=0)  infl[idxWideR[i]]  = lerp(infl[idxWideR[i]] ||0, 0.06, 0.06);
-        }
-
-        // quando estiver praticamente centrado, termina e dispara o typewriter
-        if (Math.abs(ny - targetY) < 0.0025){
-          avatarGroup.rotation.y = 0;
-          introActive = false;
-          setTimeout(startTypewriter, 180);
-        }
+      const lerp=(a,b,t)=>a+(b-a)*Math.max(0,Math.min(1,t));
+      function findMorphIndex(mesh, names){
+        if (!mesh.morphTargetDictionary) return -1;
+        for (const n of names){ const i=mesh.morphTargetDictionary[n]; if (typeof i==="number") return i; }
+        return -1;
+      }
+      function fitCameraToObject(camera, object, renderer, {padding=0.95,yFocusBias=0.72,zoomFactor=0.58}={}){
+        const box=new THREE.Box3().setFromObject(object), size=new THREE.Vector3(), center=new THREE.Vector3();
+        box.getSize(size); box.getCenter(center);
+        const target=center.clone(); target.y+=size.y*(yFocusBias-0.5);
+        const fov=(camera.fov*Math.PI)/180, height=size.y*padding, width=size.x*padding;
+        const dH=height/(2*Math.tan(fov/2)), dW=width/(2*Math.tan((fov*camera.aspect)/2));
+        const dist=Math.max(dH,dW)*zoomFactor;
+        const dir=new THREE.Vector3(0,0.12,1).normalize();
+        const pos=target.clone().add(dir.multiplyScalar(dist));
+        camera.position.copy(pos);
+        camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
+        camera.lookAt(target);
+        renderer.render(object.parent||scene,camera);
       }
 
-      renderer.render(scene, camera);
-    });
+      const stage = document.querySelector('.stage');
+      const canvas = document.getElementById('almaCanvas');
+      const spinner = document.getElementById('spinner');
+      const typeEl = document.getElementById('type');
 
-    // ========= Pré-aquecimento discreto =========
-    (async ()=>{
-      const s = (t)=>fetch(t,{method:'GET',mode:'cors',cache:'no-store'}).catch(()=>{});
-      const p = document.getElementById('prep');
-      try{
-        await s('/health');
-        await s('/ping_grok');          // aquece o acesso ao Grok
-        s('/alma-chat');                 // aquece HTML estático
-        s('/console');
-        p.textContent = 'pronto';
-        setTimeout(()=>p.style.display='none', 800);
-      }catch{ p.style.display='none'; }
-    })();
+      function startTypewriterOnce(){
+        if (window.__ALMA_TYPE_DONE__) return;
+        window.__ALMA_TYPE_DONE__ = true;
+        typeEl.style.visibility='visible';
+        let i=0;
+        const tick=()=>{
+          if (i<=TYPE_TEXT.length){
+            typeEl.innerHTML = `&gt; ${TYPE_TEXT.slice(0,i)}<span class="cursor">&nbsp;</span>`;
+            i++; setTimeout(tick, i<3?120:42);
+          } else {
+            typeEl.innerHTML = `&gt; ${TYPE_TEXT}`;
+          }
+        };
+        tick();
+      }
 
-  } // guard
+      const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+      renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+      renderer.setSize(stage.clientWidth, stage.clientHeight, false);
+      if (renderer.outputColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(45, stage.clientWidth/stage.clientHeight, 0.1, 100);
+      camera.position.set(0,1.6,2.0);
+
+      scene.add(new THREE.HemisphereLight(0xffffff,0x222233,1.0));
+      const dl=new THREE.DirectionalLight(0xffffff,1.0); dl.position.set(2,4,2); scene.add(dl);
+
+      let avatarGroup=null;
+      let exprMeshes=[], idxSmileL=[], idxSmileR=[], idxBrowUp=[], idxWideL=[], idxWideR=[];
+      const mouthCandidates=["jawOpen","mouthOpen","viseme_aa","MouthOpen","mouthOpen_BS","CC_Base_BlendShape.MouthOpen","Wolf3D_Avatar.MouthOpen"];
+      const browUpCandidates=["browInnerUp","browOuterUpLeft","browOuterUpRight"];
+      const smileLCandidates=["mouthSmileLeft"], smileRCandidates=["mouthSmileRight"];
+      const eyeWideLCandidates=["eyeWideLeft"], eyeWideRCandidates=["eyeWideRight"];
+      const eyeBlinkLCandidates=["eyeBlinkLeft"], eyeBlinkRCandidates=["eyeBlinkRight"];
+
+      const loader = new GLTFLoader(); loader.crossOrigin='anonymous';
+
+      let resizeObs=null;
+      function safeObserve(){
+        if (resizeObs) return;
+        resizeObs = new ResizeObserver(()=>{
+          const w=stage.clientWidth, h=stage.clientHeight;
+          renderer.setSize(w,h,false); camera.aspect=w/h; camera.updateProjectionMatrix();
+          if (avatarGroup) fitCameraToObject(camera, avatarGroup, renderer);
+        });
+        resizeObs.observe(stage);
+        window.addEventListener('orientationchange', ()=>setTimeout(()=>{
+          if (avatarGroup) fitCameraToObject(camera, avatarGroup, renderer);
+        }, 300), {passive:true});
+      }
+
+      loader.load(AVATAR_URL, (gltf)=>{
+        // Se já carregámos antes, não repete (proteção extra)
+        if (window.__ALMA_AVATAR_READY__) return;
+        window.__ALMA_AVATAR_READY__ = true;
+
+        avatarGroup = gltf.scene;
+        avatarGroup.traverse((o)=>{
+          const n=(o.name||"").toLowerCase();
+          if (n.includes('hand')||n.includes('wrist')||n.includes('wolf3d_hands')) o.visible=false;
+          if (o.isMesh && o.material?.isMeshStandardMaterial){
+            o.castShadow=false; o.receiveShadow=false;
+            o.material.roughness=0.75; o.material.metalness=0.05;
+          }
+        });
+
+        // Escala normalizada ~1.75m
+        const tmpBox=new THREE.Box3().setFromObject(avatarGroup);
+        const tmpSize=new THREE.Vector3(); tmpBox.getSize(tmpSize);
+        const heightM=tmpSize.y||1, desired=1.75;
+        avatarGroup.scale.setScalar(desired/heightM);
+
+        scene.add(avatarGroup);
+
+        // Morphs de expressões
+        exprMeshes=[]; idxSmileL=[]; idxSmileR=[]; idxBrowUp=[]; idxWideL=[]; idxWideR=[];
+        avatarGroup.traverse((obj)=>{
+          if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
+            const m=obj;
+            const sL=findMorphIndex(m,smileLCandidates);
+            const sR=findMorphIndex(m,smileRCandidates);
+            const bU=findMorphIndex(m,browUpCandidates);
+            const wL=findMorphIndex(m,eyeWideLCandidates);
+            const wR=findMorphIndex(m,eyeWideRCandidates);
+            const blL=findMorphIndex(m,eyeBlinkLCandidates);
+            const blR=findMorphIndex(m,eyeBlinkRCandidates);
+            if (sL>=0||sR>=0||bU>=0||wL>=0||wR>=0||blL>=0||blR>=0){
+              exprMeshes.push(m);
+              idxSmileL.push(sL); idxSmileR.push(sR); idxBrowUp.push(bU);
+              idxWideL.push(wL); idxWideR.push(wR);
+            }
+          }
+        });
+
+        fitCameraToObject(camera, avatarGroup, renderer);
+        safeObserve();
+        spinner.style.display='none';
+
+        // Intro: só corre uma vez por sessão
+        let introActive=false;
+        if (!window.__ALMA_INTRO_DONE__){
+          introActive=true;
+          avatarGroup.rotation.y = -Math.PI*0.55; // começa à esquerda
+        }
+
+        let smileT=0;
+        renderer.setAnimationLoop((t)=>{
+          if (!avatarGroup){ renderer.render(scene,camera); return; }
+
+          if (introActive){
+            const y=avatarGroup.rotation.y;
+            const ny=lerp(y, 0, 0.06);
+            avatarGroup.rotation.y = ny;
+
+            smileT=Math.min(1, smileT+0.02);
+            const smile=0.35*(0.5-0.5*Math.cos(Math.PI*smileT));
+            for (let i=0;i<exprMeshes.length;i++){
+              const infl=exprMeshes[i].morphTargetInfluences;
+              if (idxSmileL[i]>=0) infl[idxSmileL[i]]=lerp(infl[idxSmileL[i]]||0,smile,0.15);
+              if (idxSmileR[i]>=0) infl[idxSmileR[i]]=lerp(infl[idxSmileR[i]]||0,smile,0.15);
+              if (idxBrowUp[i]>=0) infl[idxBrowUp[i]]=lerp(infl[idxBrowUp[i]]||0,0.12,0.08);
+              if (idxWideL[i]>=0)  infl[idxWideL[i]] =lerp(infl[idxWideL[i]] ||0,0.06,0.06);
+              if (idxWideR[i]>=0)  infl[idxWideR[i]] =lerp(infl[idxWideR[i]] ||0,0.06,0.06);
+            }
+
+            if (Math.abs(ny) < 0.0025){
+              avatarGroup.rotation.y = 0;
+              introActive=false;
+              window.__ALMA_INTRO_DONE__ = true;  // <- nunca mais repete
+              setTimeout(startTypewriterOnce, 180);
+            }
+          } else {
+            // Se a intro já acabou noutra execução, garante que o text já apareceu
+            if (window.__ALMA_INTRO_DONE__) startTypewriterOnce();
+          }
+
+          renderer.render(scene,camera);
+        });
+
+      }, undefined, (err)=>{
+        spinner.style.display='none';
+        document.getElementById('prep').textContent='⚠️ Não consegui carregar o avatar.';
+        console.error('Falha GLB:', err);
+      });
+
+      // Pré-aquecimento (sem etiquetas)
+      (async ()=>{
+        const s=(u)=>fetch(u,{method:'GET',mode:'cors',cache:'no-store'}).catch(()=>{});
+        const p=document.getElementById('prep');
+        try{
+          await s('/health'); await s('/ping_grok'); s('/alma-chat'); s('/console');
+          p.textContent='pronto'; setTimeout(()=>p.style.display='none',800);
+        }catch{ p.style.display='none'; }
+      })();
+
+      // Cleanup ao sair (por completude)
+      window.addEventListener('pagehide', ()=>{
+        try{ renderer.setAnimationLoop(null); }catch{}
+        if (resizeObs) try{ resizeObs.disconnect(); }catch{}
+      }, {once:true});
+    }
   </script>
 </body>
 </html>
