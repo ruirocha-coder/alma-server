@@ -1,29 +1,28 @@
 <!doctype html>
 <html lang="pt">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Alma — entrada</title>
 <style>
   :root{
-    --bg:#0a0a0b; --panel:#0b0b0d;
-    --fg:#f3f3f3; --muted:#b9bbc2;
+    --bg:#0a0a0b; --fg:#f3f3f3; --muted:#b9bbc2;
     --accent:#d4a017; --border:#24242a;
-    --glow:0 14px 40px rgba(0,0,0,.40);
   }
   *{box-sizing:border-box} html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--fg);
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* ===== Avatar stage (sem moldura) ===== */
+  /* ===== Palco do avatar (sem moldura/caixa) ===== */
   .stage{
     width:clamp(320px,34vw,520px);
     height:clamp(260px,34vw,420px);
-    margin:8px auto 0;
-    position:relative; overflow:hidden; border-radius:18px;
-    background:radial-gradient(900px 450px at 80% -10%, rgba(212,160,23,.05), transparent 60%), var(--panel);
-    box-shadow:var(--glow);
+    margin:6px auto 0;
+    position:relative;
+    border-radius:18px;         /* só para o canvas respeitar os cantos */
+    overflow:hidden;
+    background:transparent;     /* funde com a página */
   }
   #avatarCanvas{position:absolute; inset:0}
   .spinner{position:absolute; inset:0; display:grid; place-items:center}
@@ -34,7 +33,7 @@
   }
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  /* ===== Typewriter ===== */
+  /* ===== Typewriter (começa depois da animação do avatar) ===== */
   .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
   .type{
     font-weight:900; letter-spacing:-0.5px; line-height:1.06;
@@ -55,7 +54,7 @@
     display:flex; flex-direction:column; gap:6px;
     padding:18px; border-radius:14px; text-decoration:none; color:var(--fg);
     background:linear-gradient(180deg,#0f0f11,#141418);
-    border:1px solid var(--border); box-shadow:var(--glow);
+    border:1px solid var(--border);
     transition:border-color .15s ease;
   }
   .tile:hover{ border-color: var(--accent); }
@@ -81,7 +80,7 @@
       <div class="spinner" id="spin"></div>
     </section>
 
-    <!-- TYPEWRITER (arranca só após animação do avatar) -->
+    <!-- TYPEWRITER -->
     <div class="typewrap">
       <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
     </div>
@@ -109,7 +108,7 @@
   import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
   import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-  // ---- config
+  // -------- config
   const qs = new URLSearchParams(location.search);
   const AVATAR_URL = qs.get('avatar') || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
 
@@ -117,7 +116,7 @@
   const container = document.getElementById('avatarCanvas');
   const spinner = document.getElementById('spin');
 
-  // ---- typewriter (arranca via callback)
+  // -------- typewriter (só arranca no fim da animação)
   const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   function startTypewriter(){
@@ -132,11 +131,9 @@
     })();
   }
 
-  // ---- three setup
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color('#0b0b0d');
-
-  const renderer = new THREE.WebGLRenderer({antialias:true});
+  // -------- three setup (alpha para “sumir” a caixa)
+  const scene = new THREE.Scene();   // sem background → renderer alpha
+  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   container.appendChild(renderer.domElement);
 
@@ -165,35 +162,43 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // util para “focar” o rosto e centrar na caixa
-  function fitCameraToObject(object, {padding=1.06, yBias=0.71, xBias=0.00, zoom=1.28}={}){
+  // util: recenter (x,z no 0), pés em y=0
+  function recenterXZAndGround(obj){
+    const box = new THREE.Box3().setFromObject(obj);
+    const center = new THREE.Vector3(); box.getCenter(center);
+    const min = new THREE.Vector3(); box.getMin(min);
+    obj.position.x -= center.x;
+    obj.position.z -= center.z;
+    obj.position.y -= min.y; // chão a 0
+  }
+
+  // focar objeto (olhar para a zona da cabeça)
+  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.30}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
 
-    // alvo ligeiramente acima do centro geométrico → foca rosto
-    const target=center.clone();
-    target.y += size.y*(yBias-0.5);
-    target.x += size.x*(xBias);
-
+    const target = new THREE.Vector3(0, size.y*yBias, 0); // como recentrámos, x=z=0
     const fov=(camera.fov*Math.PI)/180;
     const distH=(size.y*padding)/(2*Math.tan(fov/2));
     const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
     const dist=Math.max(distH,distW)*zoom;
 
-    const dirV=new THREE.Vector3(0,0.10,1).normalize(); // ligeiro “top-down”
+    const dirV=new THREE.Vector3(0,0.10,1).normalize();
     camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
     camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
     camera.lookAt(target);
   }
 
-  let avatar=null;
+  let rig = new THREE.Group();
+  scene.add(rig);
+
   loader.load(
     AVATAR_URL,
     (gltf)=>{
-      avatar=gltf.scene;
+      const avatar = gltf.scene;
 
-      // esconder mãos e afinar materiais
+      // materiais / esconder mãos
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
         if(nm.includes('hand')||nm.includes('wrist')||nm.includes('wolf3d_hands')) o.visible=false;
@@ -202,43 +207,45 @@
         }
       });
 
-      // normalizar altura e recentrar
-      const b=new THREE.Box3().setFromObject(avatar); const s=new THREE.Vector3(); b.getSize(s);
-      avatar.scale.setScalar(1.75/(s.y||1));
-      avatar.position.set(0,0,0);
-      scene.add(avatar);
+      // normalizar altura ~1.75m
+      let b = new THREE.Box3().setFromObject(avatar);
+      const sz = new THREE.Vector3(); b.getSize(sz);
+      avatar.scale.setScalar(1.75/(sz.y||1));
 
-      // focar
-      fitCameraToObject(avatar,{padding:1.06,yBias:0.72,zoom:1.30});
+      // recentrar pivô e assentar no “chão”
+      recenterXZAndGround(avatar);
 
-      // preparar sorriso morphs
-      const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
-      const mMeshes=[], mIdx=[];
+      // meter no rig (pivot limpo)
+      rig.add(avatar);
+
+      // focar e caber
+      fitCameraToObject(rig,{padding:1.06,yBias:0.70,zoom:1.32});
+
+      // índices para sorriso
+      const smiles=[];
       avatar.traverse(obj=>{
         if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-          for(const n of smileNames){
-            const id=obj.morphTargetDictionary[n];
-            if(typeof id==='number'){ mMeshes.push(obj); mIdx.push(id); break; }
+          const dict=obj.morphTargetDictionary;
+          for(const n of ["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"]){
+            if(typeof dict[n]==='number'){ smiles.push([obj,dict[n]]); }
           }
         }
       });
 
-      // anima: rodar da esquerda → frente e sorrir
-      avatar.rotation.y = -Math.PI/2; // começa virada à esquerda
+      // ANIMA: começa virada à esquerda → frente + sorriso
+      rig.rotation.y = -Math.PI*0.9;
       const t0=performance.now(), dur=1100;
-      function anim(){
+      (function anim(){
         const t=Math.min(1,(performance.now()-t0)/dur);
-        const e=1-Math.pow(1-t,3);
-        avatar.rotation.y = -Math.PI/2*(1-e);
-        for(let i=0;i<mMeshes.length;i++){
-          mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.35, e*0.4);
+        const e=1-Math.pow(1-t,3);                // ease out
+        rig.rotation.y = -Math.PI*0.9*(1-e);      // para 0
+        for(const [m,idx] of smiles){
+          m.morphTargetInfluences[idx] = Math.min(0.35, e*0.4);
         }
-        // durante a animação, manter o alvo centrado
-        camera.lookAt(0, 1.5, 0);
+        camera.lookAt(0, (new THREE.Box3().setFromObject(rig).getSize(new THREE.Vector3()).y)*0.70, 0);
         if(t<1){ requestAnimationFrame(anim); }
-        else{ spinner.style.display='none'; startTypewriter(); }
-      }
-      requestAnimationFrame(anim);
+        else { spinner.style.display='none'; startTypewriter(); }
+      })();
     },
     undefined,
     (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
@@ -247,14 +254,16 @@
   // render loop
   (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
+  // refit em resize (quando já houver rig com conteúdo)
+  addEventListener('resize', ()=>{
+    if (rig.children.length) fitCameraToObject(rig,{padding:1.06,yBias:0.70,zoom:1.32});
+  });
+
   // pré-aquecimento silencioso
   (async ()=>{
     try{
       await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]);
-      await Promise.race([
-        fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:'ping',user_id:'warmup'})}),
-        new Promise(r=>setTimeout(r,1500))
-      ]);
+      await Promise.race([fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:'ping',user_id:'warmup'})}), new Promise(r=>setTimeout(r,1500))]);
       fetch('/heygen/token',{method:'POST'}).catch(()=>{});
     }catch{}
   })();
