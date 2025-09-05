@@ -161,12 +161,26 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
+# --- NOVO: sessão HTTP global (keep-alive + pequeno pool) ---
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=8,
+    pool_maxsize=8,
+    max_retries=0
+)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
 def grok_chat(messages, timeout=120):
     if not XAI_API_KEY:
         raise RuntimeError("Falta XAI_API_KEY")
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+    }
     payload = {"model": MODEL, "messages": messages}
-    r = requests.post(XAI_API_URL, headers=headers, json=payload, timeout=timeout)
+    r = _session.post(XAI_API_URL, headers=headers, json=payload, timeout=timeout)
     log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
     r.raise_for_status()
     return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
@@ -392,6 +406,7 @@ def serve_alma_chat():
 # ---------------------------------------------------------------------------------------
 # 🔗 Pipeline Alma: Mem0 → RAG → Grok
 # ---------------------------------------------------------------------------------------
+
 def build_messages_with_memory_and_rag(
     user_id: str,
     question: str,
@@ -442,10 +457,39 @@ def build_messages_with_memory_and_rag(
 
     return messages, new_facts, facts, rag_used
 
+# --- NOVO: regra simples para fast-path (perguntas curtas) ---
+_FASTPATH_BAD_KEYS = {"pdf", "anexo", "anexa", "sitemap", "rag", "qdrant"}
+def _should_fastpath(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    if len(ql) <= 120 and len(ql.split()) <= 20 and not any(k in ql for k in _FASTPATH_BAD_KEYS):
+        return True
+    return False
+
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     if not q:
         return {"answer": "Falta query param ?q="}
+
+    # fast-path: sem Mem0/RAG — resposta mais rápida
+    if _should_fastpath(q):
+        messages = [{
+            "role": "system",
+            "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
+        }, {"role": "user", "content": q}]
+        try:
+            answer = grok_chat(messages)
+        except Exception as e:
+            return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+        local_append_dialog(user_id, q, answer)
+        _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        return {
+            "answer": answer,
+            "mem0": {"facts_used": False, "facts": {}},
+            "new_facts_detected": {},
+            "rag": {"used": False, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
+        }
+
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, q, namespace)
     # chamada ao LLM
     try:
@@ -473,6 +517,27 @@ async def ask(request: Request):
 
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
+
+    # fast-path: sem Mem0/RAG — resposta mais rápida
+    if _should_fastpath(question):
+        messages = [{
+            "role": "system",
+            "content": "És a Alma, especialista em design de interiores (método psicoestético). Responde claro, conciso e em pt-PT."
+        }, {"role": "user", "content": question}]
+        try:
+            answer = grok_chat(messages)
+        except Exception as e:
+            log.exception("Erro ao chamar a x.ai (fast-path)")
+            return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+        local_append_dialog(user_id, question, answer)
+        _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        return {
+            "answer": answer,
+            "mem0": {"facts_used": False, "facts": {}},
+            "new_facts_detected": {},
+            "rag": {"used": False, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
+        }
 
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, question, namespace)
 
