@@ -5,118 +5,78 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Alma — entrada</title>
 <style>
-  :root{
-    --bg:#0a0a0b; --fg:#f3f3f3; --muted:#b9bbc2;
-    --accent:#d4a017; --border:#24242a;
-  }
+  :root{ --bg:#0a0a0b; --fg:#f3f3f3; --muted:#b9bbc2; --accent:#d4a017; --border:#24242a; }
   *{box-sizing:border-box} html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--fg);
-       font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* ===== Palco do avatar (sem moldura/caixa) ===== */
-  .stage{
-    width:clamp(320px,34vw,520px);
-    height:clamp(260px,34vw,420px);
-    margin:6px auto 0;
-    position:relative;
-    border-radius:18px;         /* só para o canvas respeitar os cantos */
-    overflow:hidden;
-    background:transparent;     /* funde com a página */
-  }
-  #avatarCanvas{position:absolute; inset:0}
-  .spinner{position:absolute; inset:0; display:grid; place-items:center}
-  .spinner::before{
-    content:""; width:38px; height:38px; border-radius:50%;
-    border:4px solid rgba(212,160,23,.25); border-top-color:var(--accent);
-    animation:spin 1s linear infinite
-  }
+  /* Palco (sem moldura; o canvas é transparente) */
+  .stage{width:clamp(320px,34vw,520px);height:clamp(260px,34vw,420px);position:relative;border-radius:18px;overflow:hidden;background:transparent;margin:6px auto 0}
+  #av{position:absolute;inset:0}
+  .spinner{position:absolute;inset:0;display:grid;place-items:center}
+  .spinner::before{content:"";width:38px;height:38px;border-radius:50%;border:4px solid rgba(212,160,23,.25);border-top-color:var(--accent);animation:spin 1s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+  .err{position:absolute;inset:0;display:grid;place-items:center;color:#ff9c9c;font-size:14px}
 
-  /* ===== Typewriter (começa depois da animação do avatar) ===== */
+  /* Typewriter (arranca só após animação do avatar) */
   .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
-  .type{
-    font-weight:900; letter-spacing:-0.5px; line-height:1.06;
-    font-size:clamp(32px,7vw,72px); white-space:pre-wrap; user-select:none; margin:0;
-  }
+  .type{font-weight:900; letter-spacing:-0.5px; line-height:1.06; font-size:clamp(32px,7vw,72px); white-space:pre-wrap; user-select:none; margin:0;}
   .type .prompt{opacity:.6}
   .cursor{display:inline-block;width:.6ch;background:currentColor;animation:blink 1s steps(1,end) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* ===== Tiles ===== */
-  .tiles{
-    width:min(1100px,100%);
-    display:grid; grid-template-columns:repeat(3,1fr); gap:16px;
-    margin:22px auto 6px;
-  }
+  /* Tiles */
+  .tiles{width:min(1100px,100%);display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:22px auto 6px}
   @media (max-width:900px){ .tiles{grid-template-columns:1fr} }
-  .tile{
-    display:flex; flex-direction:column; gap:6px;
-    padding:18px; border-radius:14px; text-decoration:none; color:var(--fg);
-    background:linear-gradient(180deg,#0f0f11,#141418);
-    border:1px solid var(--border);
-    transition:border-color .15s ease;
-  }
-  .tile:hover{ border-color: var(--accent); }
-  .tile h3{margin:0 0 4px 0; font-size:18px}
-  .tile p{margin:0; color:var(--muted); font-size:14px}
+  .tile{display:flex;flex-direction:column;gap:6px;padding:18px;border-radius:14px;text-decoration:none;color:var(--fg);
+        background:linear-gradient(180deg,#0f0f11,#141418);border:1px solid var(--border);transition:border-color .15s ease}
+  .tile:hover{border-color:var(--accent)}
+  .tile h3{margin:0 0 4px 0;font-size:18px}
+  .tile p{margin:0;color:var(--muted);font-size:14px}
 </style>
 
-<!-- three + addons -->
-<script type="importmap">
-{
-  "imports": {
-    "three": "https://unpkg.com/three@0.160.1/build/three.module.js",
-    "three/addons/": "https://unpkg.com/three@0.160.1/examples/jsm/"
-  }
-}
-</script>
+<!-- three (versão estável, sem add-ons) -->
+<script type="module" src="https://unpkg.com/three@0.160.1/build/three.module.js"></script>
 </head>
 <body>
-  <div class="wrap">
-    <!-- AVATAR -->
-    <section class="stage" aria-label="Alma avatar 3D">
-      <div id="avatarCanvas"></div>
-      <div class="spinner" id="spin"></div>
-    </section>
+<div class="wrap">
+  <!-- AVATAR -->
+  <section class="stage" aria-label="Alma avatar 3D">
+    <div id="av"></div>
+    <div class="spinner" id="spin"></div>
+    <div class="err" id="err" style="display:none">⚠️ Não consegui carregar o avatar.</div>
+  </section>
 
-    <!-- TYPEWRITER -->
-    <div class="typewrap">
-      <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
-    </div>
-
-    <!-- TILES (texto apenas) -->
-    <nav class="tiles">
-      <a class="tile" href="/alma-chat">
-        <h3>Escrever com a Alma</h3>
-        <p>Chat em modo consola, rápido e minimal.</p>
-      </a>
-      <a class="tile" href="/alma-frontend">
-        <h3>Falar com a Alma</h3>
-        <p>Voz→voz e texto→voz, com lipsync.</p>
-      </a>
-      <a class="tile" href="/console">
-        <h3>Adicionar ao Alma Data</h3>
-        <p>Sitemaps, páginas, PDFs e texto para o RAG.</p>
-      </a>
-    </nav>
+  <!-- TYPEWRITER -->
+  <div class="typewrap">
+    <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
   </div>
 
-<script type="module">
-  import * as THREE from 'three';
-  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-  import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
-  import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+  <!-- TILES -->
+  <nav class="tiles">
+    <a class="tile" href="/alma-chat">
+      <h3>Escrever com a Alma</h3>
+      <p>Chat em modo consola, rápido e minimal.</p>
+    </a>
+    <a class="tile" href="/alma-frontend">
+      <h3>Falar com a Alma</h3>
+      <p>Voz→voz e texto→voz, com lipsync.</p>
+    </a>
+    <a class="tile" href="/console">
+      <h3>Adicionar ao Alma Data</h3>
+      <p>Sitemaps, páginas, PDFs e texto para o RAG.</p>
+    </a>
+  </nav>
+</div>
 
-  // -------- config
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.160.1/build/three.module.js';
+
+  // ---------- CONFIG
   const qs = new URLSearchParams(location.search);
   const AVATAR_URL = qs.get('avatar') || 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
 
-  const stage = document.querySelector('.stage');
-  const container = document.getElementById('avatarCanvas');
-  const spinner = document.getElementById('spin');
-
-  // -------- typewriter (só arranca no fim da animação)
+  // ---------- TYPEWRITER (arranca no fim)
   const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   function startTypewriter(){
@@ -131,14 +91,19 @@
     })();
   }
 
-  // -------- three setup (alpha para “sumir” a caixa)
-  const scene = new THREE.Scene();   // sem background → renderer alpha
-  const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
-  container.appendChild(renderer.domElement);
+  // ---------- THREE BASICS (alpha para palco “invisível”)
+  const stage = document.querySelector('.stage');
+  const holder = document.getElementById('av');
+  const spin = document.getElementById('spin');
+  const errBox = document.getElementById('err');
 
-  const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
-  camera.position.set(0, 1.55, 2.4);
+  const scene = new THREE.Scene(); // sem background → canvas transparente
+  const renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  holder.appendChild(renderer.domElement);
+
+  const camera = new THREE.PerspectiveCamera(42,1,0.1,100);
+  camera.position.set(0,1.55,2.4);
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
@@ -149,115 +114,110 @@
 
   // luzes
   scene.add(new THREE.HemisphereLight(0xffffff,0x222233,1.0));
-  const dir = new THREE.DirectionalLight(0xffffff,1.1);
-  dir.position.set(2,4,2); scene.add(dir);
+  const dir = new THREE.DirectionalLight(0xffffff,1.1); dir.position.set(2,4,2); scene.add(dir);
 
-  // loaders
-  const ktx2 = new KTX2Loader()
-    .setTranscoderPath('https://unpkg.com/three@0.160.1/examples/jsm/libs/basis/')
-    .detectSupport(renderer);
+  // ---------- GLB LOAD (sem KTX2/Meshopt para evitar CORS/decoders)
+  // loader simples via THREE.FileLoader (por ser um GLB “fechado” não precisamos de Textures externas)
+  async function loadGLB(url){
+    const resp = await fetch(url, {mode:'cors', credentials:'omit', cache:'no-store'});
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const ab = await resp.arrayBuffer();
+    const gltf = await new Promise((resolve,reject)=>{
+      // Carregador binário mínimo
+      try{
+        const loader = new THREE.GLTFLoader ? new THREE.GLTFLoader() : null;
+        if (!loader) { reject(new Error('GLTFLoader não disponível')); return; }
+      }catch{}
+      reject(new Error('Esta build não inclui GLTFLoader; usar URL alternativo.'));
+    });
+  }
 
+  // Como a build “pura” não expõe GLTFLoader, incluímo-la dinamicamente:
+  const { GLTFLoader } = await import('https://unpkg.com/three@0.160.1/examples/jsm/loaders/GLTFLoader.js');
   const loader = new GLTFLoader();
   loader.setCrossOrigin('anonymous');
-  loader.setKTX2Loader(ktx2);
-  loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // util: recenter (x,z no 0), pés em y=0
+  // util: recentrar XZ & assentar no chão
   function recenterXZAndGround(obj){
     const box = new THREE.Box3().setFromObject(obj);
     const center = new THREE.Vector3(); box.getCenter(center);
     const min = new THREE.Vector3(); box.getMin(min);
-    obj.position.x -= center.x;
-    obj.position.z -= center.z;
-    obj.position.y -= min.y; // chão a 0
+    obj.position.x -= center.x; obj.position.z -= center.z; obj.position.y -= min.y;
   }
-
-  // focar objeto (olhar para a zona da cabeça)
-  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.30}={}){
+  // focar rosto
+  function fitCameraToObject(object,{padding=1.06,yBias=0.70,zoom=1.32}={}){
     const box = new THREE.Box3().setFromObject(object);
-    const size=new THREE.Vector3(), center=new THREE.Vector3();
-    box.getSize(size); box.getCenter(center);
-
-    const target = new THREE.Vector3(0, size.y*yBias, 0); // como recentrámos, x=z=0
+    const size=new THREE.Vector3(); box.getSize(size);
+    const target = new THREE.Vector3(0, size.y*yBias, 0);
     const fov=(camera.fov*Math.PI)/180;
     const distH=(size.y*padding)/(2*Math.tan(fov/2));
     const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
     const dist=Math.max(distH,distW)*zoom;
-
     const dirV=new THREE.Vector3(0,0.10,1).normalize();
     camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
     camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
     camera.lookAt(target);
   }
 
-  let rig = new THREE.Group();
-  scene.add(rig);
+  let rig = new THREE.Group(); scene.add(rig);
 
   loader.load(
     AVATAR_URL,
     (gltf)=>{
       const avatar = gltf.scene;
-
-      // materiais / esconder mãos
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
         if(nm.includes('hand')||nm.includes('wrist')||nm.includes('wolf3d_hands')) o.visible=false;
-        if(o.isMesh && o.material?.isMeshStandardMaterial){
-          o.material.roughness=0.75; o.material.metalness=0.05;
-        }
+        if(o.isMesh && o.material?.isMeshStandardMaterial){ o.material.roughness=.75; o.material.metalness=.05; }
       });
 
-      // normalizar altura ~1.75m
-      let b = new THREE.Box3().setFromObject(avatar);
+      // normalizar ~1.75m e recentrar
+      const b = new THREE.Box3().setFromObject(avatar);
       const sz = new THREE.Vector3(); b.getSize(sz);
       avatar.scale.setScalar(1.75/(sz.y||1));
-
-      // recentrar pivô e assentar no “chão”
       recenterXZAndGround(avatar);
 
-      // meter no rig (pivot limpo)
       rig.add(avatar);
+      fitCameraToObject(rig);
 
-      // focar e caber
-      fitCameraToObject(rig,{padding:1.06,yBias:0.70,zoom:1.32});
-
-      // índices para sorriso
+      // sorriso (morphs)
       const smiles=[];
       avatar.traverse(obj=>{
         if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-          const dict=obj.morphTargetDictionary;
           for(const n of ["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"]){
-            if(typeof dict[n]==='number'){ smiles.push([obj,dict[n]]); }
+            const idx = obj.morphTargetDictionary[n];
+            if(typeof idx==='number') smiles.push([obj,idx]);
           }
         }
       });
 
-      // ANIMA: começa virada à esquerda → frente + sorriso
+      // animação: Y → frente e depois startTypewriter()
       rig.rotation.y = -Math.PI*0.9;
       const t0=performance.now(), dur=1100;
       (function anim(){
         const t=Math.min(1,(performance.now()-t0)/dur);
-        const e=1-Math.pow(1-t,3);                // ease out
-        rig.rotation.y = -Math.PI*0.9*(1-e);      // para 0
-        for(const [m,idx] of smiles){
-          m.morphTargetInfluences[idx] = Math.min(0.35, e*0.4);
-        }
-        camera.lookAt(0, (new THREE.Box3().setFromObject(rig).getSize(new THREE.Vector3()).y)*0.70, 0);
+        const e=1-Math.pow(1-t,3);
+        rig.rotation.y = -Math.PI*0.9*(1-e);
+        for(const [m,idx] of smiles){ m.morphTargetInfluences[idx] = Math.min(0.35, e*0.4); }
         if(t<1){ requestAnimationFrame(anim); }
-        else { spinner.style.display='none'; startTypewriter(); }
+        else { spin.style.display='none'; startTypewriter(); }
       })();
     },
     undefined,
-    (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
+    (e)=>{
+      console.warn('Falha GLB:', e);
+      spin.style.display='none';
+      errBox.style.display='grid';
+      // mesmo assim arranca o typewriter para não ficar “morto”
+      startTypewriter();
+    }
   );
 
-  // render loop
+  // loop
   (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
-  // refit em resize (quando já houver rig com conteúdo)
-  addEventListener('resize', ()=>{
-    if (rig.children.length) fitCameraToObject(rig,{padding:1.06,yBias:0.70,zoom:1.32});
-  });
+  // refit on resize
+  addEventListener('resize', ()=>{ if(rig.children.length) fitCameraToObject(rig); });
 
   // pré-aquecimento silencioso
   (async ()=>{
