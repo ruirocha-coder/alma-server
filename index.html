@@ -16,7 +16,7 @@
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* ===== Avatar stage ===== */
+  /* ===== Avatar stage (igual) ===== */
   .stage{
     width:clamp(320px,34vw,520px);
     height:clamp(260px,34vw,420px);
@@ -34,7 +34,7 @@
   }
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  /* ===== Typewriter ===== */
+  /* ===== Typewriter (igual) ===== */
   .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
   .type{
     font-weight:900; letter-spacing:-0.5px; line-height:1.06;
@@ -44,7 +44,7 @@
   .cursor{display:inline-block;width:.6ch;background:currentColor;animation:blink 1s steps(1,end) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* ===== Tiles ===== */
+  /* ===== Tiles (iguais) ===== */
   .tiles{
     width:min(1100px,100%);
     display:grid; grid-template-columns:repeat(3,1fr); gap:16px;
@@ -109,13 +109,14 @@
   import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
   import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
-  // config
+  // ---- config
   const AVATAR_URL = 'https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit';
+
   const stage = document.querySelector('.stage');
   const container = document.getElementById('avatarCanvas');
   const spinner = document.getElementById('spin');
 
-  // typewriter
+  // ---- typewriter (só arranca no fim da rotação)
   const TYPE_TEXT = "Olá, sou a Alma";
   const typeEl = document.getElementById('type');
   function startTypewriter(){
@@ -130,12 +131,14 @@
     })();
   }
 
-  // three setup
+  // ---- three setup (igual)
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#0b0b0d');
+
   const renderer = new THREE.WebGLRenderer({antialias:true});
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   container.appendChild(renderer.domElement);
+
   const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
   camera.position.set(0, 1.55, 2.4);
 
@@ -150,6 +153,7 @@
   const dir = new THREE.DirectionalLight(0xffffff,1.1);
   dir.position.set(2,4,2); scene.add(dir);
 
+  // loaders
   const ktx2 = new KTX2Loader()
     .setTranscoderPath('https://unpkg.com/three@0.160.1/examples/jsm/libs/basis/')
     .detectSupport(renderer);
@@ -159,18 +163,21 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  // focagem
-  function fitCameraToObject(object, {padding=1.06, yBias=0.71, xBias=0.00, zoom=1.28}={}){
+  // util para “focar” o rosto
+  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.28}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
+
+    // alvo ~olhos
     const target=center.clone();
     target.y += size.y*(yBias-0.5);
-    target.x += size.x*(xBias);
+
     const fov=(camera.fov*Math.PI)/180;
     const distH=(size.y*padding)/(2*Math.tan(fov/2));
     const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
     const dist=Math.max(distH,distW)*zoom;
+
     const dirV=new THREE.Vector3(0,0.10,1).normalize();
     camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
     camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
@@ -178,11 +185,16 @@
     return target;
   }
 
-  let avatar=null;
+  // ====== LOAD & CENTER (única alteração relevante) ======
+  let pivot = new THREE.Group();     // pivô no (0,0,0)
+  scene.add(pivot);
+
   loader.load(
     AVATAR_URL,
     (gltf)=>{
-      avatar=gltf.scene;
+      const avatar = gltf.scene;
+
+      // materiais + esconder mãos (igual)
       avatar.traverse(o=>{
         const nm=(o.name||'').toLowerCase();
         if(nm.includes('hand')||nm.includes('wrist')||nm.includes('wolf3d_hands')) o.visible=false;
@@ -190,13 +202,24 @@
           o.material.roughness=0.75; o.material.metalness=0.05;
         }
       });
-      const b=new THREE.Box3().setFromObject(avatar); const s=new THREE.Vector3(); b.getSize(s);
-      avatar.scale.setScalar(1.75/(s.y||1));
-      avatar.position.set(0,0,0);
-      scene.add(avatar);
 
-      const focusTarget = fitCameraToObject(avatar,{padding:1.06,yBias:0.72,zoom:1.30});
+      // normalizar altura
+      const b1=new THREE.Box3().setFromObject(avatar);
+      const s1=new THREE.Vector3(); b1.getSize(s1);
+      avatar.scale.setScalar(1.75/(s1.y||1));
 
+      // **recentrar pelo centro da bounding box** → fica mesmo no centro do pivot
+      const b2 = new THREE.Box3().setFromObject(avatar);
+      const c2 = b2.getCenter(new THREE.Vector3());
+      avatar.position.sub(c2);
+
+      // meter dentro do pivot e à cena
+      pivot.add(avatar);
+
+      // focar no rosto do objeto já centrado
+      const focusTarget = fitCameraToObject(pivot,{padding:1.06,yBias:0.72,zoom:1.30});
+
+      // sorriso morphs
       const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
       const mMeshes=[], mIdx=[];
       avatar.traverse(obj=>{
@@ -208,12 +231,13 @@
         }
       });
 
-      avatar.rotation.y = -Math.PI/2;
+      // rotação Y no pivot (esquerda → frente) + sorriso
+      pivot.rotation.y = -Math.PI/2;
       const t0=performance.now(), dur=1100;
       function anim(){
         const t=Math.min(1,(performance.now()-t0)/dur);
         const e=1-Math.pow(1-t,3);
-        avatar.rotation.y = -Math.PI/2*(1-e);
+        pivot.rotation.y = -Math.PI/2*(1-e);
         for(let i=0;i<mMeshes.length;i++){
           mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.35, e*0.4);
         }
@@ -227,9 +251,10 @@
     (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
   );
 
+  // render loop
   (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
-  // pré-aquecimento
+  // pré-aquecimento silencioso (sem HeyGen)
   (async ()=>{
     try{
       await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]);
