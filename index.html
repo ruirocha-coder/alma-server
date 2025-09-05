@@ -1,4 +1,4 @@
-<<!doctype html>
+<!doctype html>
 <html lang="pt">
 <head>
 <meta charset="utf-8">
@@ -16,7 +16,6 @@
        font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
   .wrap{max-width:1200px;margin:0 auto;padding:32px 18px;display:flex;flex-direction:column;align-items:center}
 
-  /* ===== Avatar stage (igual) ===== */
   .stage{
     width:clamp(320px,34vw,520px);
     height:clamp(260px,34vw,420px);
@@ -26,7 +25,6 @@
     box-shadow:var(--glow);
   }
   #avatarCanvas{position:absolute; inset:0}
-  /* ⬇ garante que o canvas ocupa 100% da caixa e não distorce */
   #avatarCanvas canvas{position:absolute; inset:0; width:100%; height:100%; display:block}
   .spinner{position:absolute; inset:0; display:grid; place-items:center}
   .spinner::before{
@@ -36,7 +34,6 @@
   }
   @keyframes spin{to{transform:rotate(360deg)}}
 
-  /* ===== Typewriter (igual) ===== */
   .typewrap{width:min(1000px,100%); margin:18px auto 0; text-align:center}
   .type{
     font-weight:900; letter-spacing:-0.5px; line-height:1.06;
@@ -46,7 +43,6 @@
   .cursor{display:inline-block;width:.6ch;background:currentColor;animation:blink 1s steps(1,end) infinite}
   @keyframes blink{50%{opacity:0}}
 
-  /* ===== Tiles (iguais) ===== */
   .tiles{
     width:min(1100px,100%);
     display:grid; grid-template-columns:repeat(3,1fr); gap:16px;
@@ -65,7 +61,6 @@
   .tile p{margin:0; color:var(--muted); font-size:14px}
 </style>
 
-<!-- three + addons -->
 <script type="importmap">
 {
   "imports": {
@@ -77,18 +72,15 @@
 </head>
 <body>
   <div class="wrap">
-    <!-- AVATAR -->
     <section class="stage" aria-label="Alma avatar 3D">
       <div id="avatarCanvas"></div>
       <div class="spinner" id="spin"></div>
     </section>
 
-    <!-- TYPEWRITER -->
     <div class="typewrap">
       <h1 class="type" id="type"><span class="prompt">&gt; </span></h1>
     </div>
 
-    <!-- TILES -->
     <nav class="tiles">
       <a class="tile" href="/alma-chat">
         <h3>Escrever com a Alma</h3>
@@ -130,7 +122,6 @@
     })();
   }
 
-  // three
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#0b0b0d');
 
@@ -143,7 +134,7 @@
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
-    renderer.setSize(w, h, true);               // ⬅ atualiza também o tamanho CSS
+    renderer.setSize(w, h, true);
     camera.aspect = w/h; camera.updateProjectionMatrix();
   }
   resize(); addEventListener('resize', resize, {passive:true});
@@ -161,7 +152,7 @@
   loader.setKTX2Loader(ktx2);
   loader.setMeshoptDecoder(MeshoptDecoder);
 
-  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.28}={}){
+  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.30}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
@@ -181,7 +172,6 @@
     return target;
   }
 
-  // pivot no 0,0,0 para rodar e manter centro
   const pivot = new THREE.Group();
   scene.add(pivot);
 
@@ -201,19 +191,18 @@
       // normalizar altura
       const b1=new THREE.Box3().setFromObject(avatar);
       const s1=new THREE.Vector3(); b1.getSize(s1);
-      avatar.scale.setScalar(1.75/(s1.y||1));
+      let scale = 1.75/(s1.y||1);
+      avatar.scale.setScalar(scale * 3);   // ⬅️ triplica o tamanho final
 
-      // **recentrar**: move o modelo para que o centro geométrico fique no (0,0,0)
+      // recentrar no pivot
       const b2 = new THREE.Box3().setFromObject(avatar);
       const c2 = b2.getCenter(new THREE.Vector3());
       avatar.position.sub(c2);
 
       pivot.add(avatar);
 
-      // foca o rosto (target devolvido) — garante centralização na CAIXA
       const focusTarget = fitCameraToObject(pivot,{padding:1.06,yBias:0.72,zoom:1.30});
 
-      // sorriso
       const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
       const mMeshes=[], mIdx=[];
       avatar.traverse(obj=>{
@@ -225,7 +214,6 @@
         }
       });
 
-      // rotação Y no pivot (esquerda -> frente) + sorriso
       pivot.rotation.y = -Math.PI/2;
       const t0=performance.now(), dur=1100;
       function anim(){
@@ -245,10 +233,8 @@
     (err)=>{ console.warn('GLB falhou:',err); spinner.style.display='none'; startTypewriter(); }
   );
 
-  // render loop
   (function tick(){ renderer.render(scene,camera); requestAnimationFrame(tick); })();
 
-  // pré-aquecimento silencioso (sem HeyGen)
   (async ()=>{
     try{
       await Promise.race([fetch('/health',{cache:'no-store'}), new Promise(r=>setTimeout(r,1200))]);
@@ -260,4 +246,4 @@
   })();
 </script>
 </body>
-</html
+</html>
