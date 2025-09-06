@@ -222,18 +222,21 @@
       // ---- enquadrar maior (~3x) ajustando o zoom
       const focusTarget = fitCameraToObject(pivot,{padding:1.06, yBias:0.72, zoom:0.30});
 
-// preparar sorriso morphs (ativa L e R em separado; se existir "both", também usa)
+// preparar sorriso morphs (corrigido — ativa todos os lados disponíveis)
+const smileNames = ["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
 const mMeshes = [], mIdx = [];
-avatar.traverse(obj => {
-  if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
-    const dict = obj.morphTargetDictionary;
-
-    // helper: se existir o morph, adiciona mais uma entrada
-    const add = (name) => {
-      const id = dict[name];
-      if (typeof id === "number") { mMeshes.push(obj); mIdx.push(id); return true; }
-      return false;
-    };
+avatar.traverse(obj=>{
+  if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
+    for(const n of smileNames){
+      const id = obj.morphTargetDictionary[n];
+      if(typeof id==='number'){ 
+        mMeshes.push(obj); 
+        mIdx.push(id); 
+        // <-- sem break, acumula todos
+      }
+    }
+  }
+});
 
     // tenta cada lado de forma independente
     add("mouthSmileLeft") || add("smileLeft");
