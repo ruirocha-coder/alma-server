@@ -209,7 +209,7 @@
       // normalizar altura (~1.75m) e recentrar no pivot
       const b1=new THREE.Box3().setFromObject(avatar);
       const s1=new THREE.Vector3(); b1.getSize(s1);
-      const scale = (1.75*1.2)/(s1.y||1);       // <- escala base (não mudamos)
+      const scale = (1.75*2)/(s1.y||1);       // <- escala base (não mudamos)
       avatar.scale.setScalar(scale);
 
       // recentrar o avatar no pivot para ficar mesmo no meio da caixa
