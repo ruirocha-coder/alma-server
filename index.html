@@ -222,16 +222,26 @@
       // ---- enquadrar maior (~3x) ajustando o zoom
       const focusTarget = fitCameraToObject(pivot,{padding:1.06, yBias:0.72, zoom:0.30});
 
-    // preparar sorriso morphs
-const smileNames=["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
-const mMeshes=[], mIdx=[];
-avatar.traverse(obj=>{
-  if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-    for(const n of smileNames){
-      const id=obj.morphTargetDictionary[n];
-      if(typeof id==='number'){ mMeshes.push(obj); mIdx.push(id); break; }
+// preparar sorriso morphs (L + R + ambos)
+const SMILE_L = ["mouthSmileLeft","smileLeft","MouthSmileLeft","mouth_smileLeft"];
+const SMILE_R = ["mouthSmileRight","smileRight","MouthSmileRight","mouth_smileRight"];
+const SMILE_B = ["mouthSmile","smile","MouthSmile","Mouth_Smile"]; // fallback "ambos"
+
+const smileTargets = []; // [{mesh, l, r, b}]
+avatar.traverse(obj => {
+  if (!(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences)) return;
+  const dict = obj.morphTargetDictionary;
+
+  const find = (names) => {
+    for (const n of names) {
+      const id = dict[n];
+      if (typeof id === "number") return id;
     }
-  }
+    return -1;
+  };
+
+  const rec = { mesh: obj, l: find(SMILE_L), r: find(SMILE_R), b: find(SMILE_B) };
+  if (rec.l >= 0 || rec.r >= 0 || rec.b >= 0) smileTargets.push(rec);
 });
 
       // anima: rodar da esquerda → frente e sorrir
