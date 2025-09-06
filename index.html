@@ -166,7 +166,7 @@
   loader.setMeshoptDecoder(MeshoptDecoder);
 
   // util para “focar” o rosto e centrar na caixa
-  function fitCameraToObject(object, {padding=1.06, yBias=0.72, zoom=1.30}={}){
+  function fitCameraToObject(object, {padding=1.06, yBias=0.72,Xbias=-1, zoom=1.30}={}){
     const box = new THREE.Box3().setFromObject(object);
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
