@@ -88,7 +88,6 @@
     </div>
 
     <!-- TILES (texto apenas) -->
-    
     <nav class="tiles">
       <a class="tile" href="/alma-chat">
         <h3>Escrever com a Alma</h3>
@@ -146,7 +145,7 @@
 
   function resize(){
     const w = stage.clientWidth, h = stage.clientHeight;
-    renderer.setSize(w,h,true);
+    renderer.setSize(w,h,false);
     camera.aspect = w/h; camera.updateProjectionMatrix();
   }
   resize(); addEventListener('resize', resize, {passive:true});
@@ -172,7 +171,6 @@
     const size=new THREE.Vector3(), center=new THREE.Vector3();
     box.getSize(size); box.getCenter(center);
 
-    // alvo ligeiramente acima do centro geométrico → foca rosto
     const target=center.clone();
     target.y += size.y*(yBias-0.5);
 
@@ -181,14 +179,14 @@
     const distW=(size.x*padding)/(2*Math.tan((fov*camera.aspect)/2));
     const dist=Math.max(distH,distW)*zoom;
 
-    const dirV=new THREE.Vector3(0,0.10,1).normalize(); // ligeiro “top-down”
+    const dirV=new THREE.Vector3(0,0.10,1).normalize();
     camera.position.copy(target.clone().add(dirV.multiplyScalar(dist)));
     camera.near=Math.max(0.01,dist/100); camera.far=dist*100; camera.updateProjectionMatrix();
     camera.lookAt(target);
-    return target; // devolvemos o ponto para voltar a olhar durante animação
+    return target;
   }
 
-  // pivot centrado: move o avatar relativamente ao centro da caixa
+  // pivot centrado
   const pivot = new THREE.Group();
   scene.add(pivot);
 
@@ -209,59 +207,46 @@
       // normalizar altura (~1.75m) e recentrar no pivot
       const b1=new THREE.Box3().setFromObject(avatar);
       const s1=new THREE.Vector3(); b1.getSize(s1);
-      const scale = (1.75*3)/(s1.y||1);       // <- escala base (não mudamos)
+      const scale = (1.75*3)/(s1.y||1);
       avatar.scale.setScalar(scale);
 
-      // recentrar o avatar no pivot para ficar mesmo no meio da caixa
       const b2 = new THREE.Box3().setFromObject(avatar);
       const c2 = b2.getCenter(new THREE.Vector3());
       avatar.position.sub(c2);
 
       pivot.add(avatar);
 
-      // ---- enquadrar maior (~3x) ajustando o zoom
+      // ---- enquadrar
       const focusTarget = fitCameraToObject(pivot,{padding:1.06, yBias:0.72, zoom:0.30});
 
-// preparar sorriso morphs
-const smileNames = ["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
-const mMeshes = [], mIdx = [];
-avatar.traverse(obj=>{
-  if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
-    for(const n of smileNames){
-      const id = obj.morphTargetDictionary[n];
-      if(typeof id==='number'){ mMeshes.push(obj); mIdx.push(id); break; }
-    }
-  }
-});
+      // ====== preparar sorriso morphs (ACUMULAR ambos os lados) ======
+      const smileNames = ["mouthSmileLeft","mouthSmileRight","smileLeft","smileRight"];
+      const mMeshes = [], mIdx = [];
+      avatar.traverse(obj=>{
+        if(obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences){
+          for(const n of smileNames){
+            const id = obj.morphTargetDictionary[n];
+            if(typeof id==='number'){
+              mMeshes.push(obj);
+              mIdx.push(id);
+              // sem break -> apanha left e right se existirem
+            }
+          }
+        }
+      });
 
-    // tenta cada lado de forma independente
-    add("mouthSmileLeft") || add("smileLeft");
-    add("mouthSmileRight") || add("smileRight");
-
-    // alguns modelos têm um único morph “both”
-    if (!("mouthSmileLeft" in dict || "smileLeft" in dict || "mouthSmileRight" in dict || "smileRight" in dict)) {
-      add("mouthSmile") || add("smile");
-    }
-  }
-});
-
-  const rec = { mesh: obj, l: find(SMILE_L), r: find(SMILE_R), b: find(SMILE_B) };
-  if (rec.l >= 0 || rec.r >= 0 || rec.b >= 0) smileTargets.push(rec);
-});
-
-      // anima: rodar da esquerda → frente e sorrir
-      pivot.rotation.y = -Math.PI/2; // começa virada à esquerda
+      // ====== anima: rodar da esquerda → frente e sorrir ======
+      pivot.rotation.y = -Math.PI/2;
       const t0=performance.now(), dur=1100;
       function anim(){
         const t=Math.min(1,(performance.now()-t0)/dur);
         const e=1-Math.pow(1-t,3);
         pivot.rotation.y = -Math.PI/2*(1-e);
-      for(let i=0;i<mMeshes.length;i++){
-      mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.60, e*0.6);
-      }
-        
-        
-        
+
+        for(let i=0;i<mMeshes.length;i++){
+          mMeshes[i].morphTargetInfluences[mIdx[i]] = Math.min(0.60, e*0.60);
+        }
+
         camera.lookAt(focusTarget);
         if(t<1){ requestAnimationFrame(anim); }
         else{ spinner.style.display='none'; startTypewriter(); }
