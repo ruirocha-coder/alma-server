@@ -5,152 +5,97 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Alma Data — Console RAG</title>
 <style>
-  /* ======= PALETA alinhada ao alma-chat (apenas estilo) ======= */
   :root{
-    --bg:#0a0a0b;
-    --panel:#0f0f11;
-    --panel-2:#141418;
-    --text:#f3f3f3;
-    --muted:#cfcfd3;
-    --ok:#39d98a;
-    --err:#ff6b6b;
-    --chip:#101217;
-    --chip-br:#26262b;
-    --tile-gap:16px;
-    --accent:#d4a017;          /* amarelo torrado */
-    --accent-700:#be8f13;
-    --accent-800:#a47c12;
+    --bg:#0a0a0b; --panel:#0f0f11; --panel-2:#141418;
+    --text:#f3f3f3; --muted:#cfcfd3;
+    --ok:#39d98a; --err:#ff6b6b;
+    --chip:#101217; --chip-br:#26262b;
+    --tile-gap:16px; --accent:#d4a017; --accent-700:#be8f13; --accent-800:#a47c12;
     --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 10px 28px rgba(0,0,0,.35);
   }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{
-    margin:0;background:var(--bg);color:var(--text);
-    font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans","Apple Color Emoji","Segoe UI Emoji";
-  }
+  *{box-sizing:border-box} html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans"}
   .container{max-width:1200px;margin:0 auto;padding:20px}
 
-  /* ======= HEADER ======= */
-  header{
-    display:flex;align-items:center;justify-content:space-between;margin-bottom:14px
-  }
-  header .brand{
-    font-weight:800;font-size:20px;letter-spacing:.2px
-  }
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  header .brand{font-weight:800;font-size:20px;letter-spacing:.2px}
   header .status{font-size:12px;color:var(--muted);opacity:.9}
 
-  /* ======= RESULT PANEL (sempre no topo) ======= */
-  .result{
-    background:linear-gradient(180deg,var(--panel),var(--panel-2));
-    border:1px solid var(--chip-br);border-radius:14px;
-    padding:16px; margin-bottom:16px; position:relative;
-    box-shadow:var(--shadow);
-  }
+  .result{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--chip-br);border-radius:14px;padding:16px;margin-bottom:16px;position:relative;box-shadow:var(--shadow)}
   .result h2{margin:0 0 10px 0;font-size:16px;letter-spacing:.2px}
-  .result pre{
-    margin:0;background:var(--panel-2);border:1px solid var(--chip-br);
+  .result pre{margin:0;background:var(--panel-2);border:1px solid var(--chip-br);
     color:var(--text);border-radius:10px;padding:12px;overflow:auto;max-height:38vh;
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-  }
-  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0 0}
-  .badge{
-    background:var(--chip);
-    border:1px solid var(--chip-br);
-    border-radius:999px;
-    padding:6px 12px;
-    font-size:12px;color:var(--muted);
-  }
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
 
-  /* ======= PARAM BAR ======= */
-  .param-bar{
-    display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px
-  }
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0 0}
+  .badge{background:var(--chip);border:1px solid var(--chip-br);border-radius:999px;padding:6px 12px;font-size:12px;color:var(--muted)}
+
+  .param-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px}
   .field{display:flex;flex-direction:column;gap:6px;min-width:160px}
   label{font-size:12px;color:var(--muted)}
   input[type=text], input[type=number], textarea{
     background:#101014;border:1px solid var(--chip-br);color:var(--text);
-    border-radius:10px;padding:12px 12px;outline:none;width:100%;
-    transition:border-color .12s, box-shadow .12s;
+    border-radius:10px;padding:12px;outline:none;width:100%;
+    transition:border-color .12s, box-shadow .12s
   }
   input[type=text]:focus, input[type=number]:focus, textarea:focus{
-    border-color:#32323a; box-shadow:0 0 0 3px rgba(212,160,23,.12);
+    border-color:#32323a; box-shadow:0 0 0 3px rgba(212,160,23,.12)
   }
   textarea{min-height:110px;resize:vertical}
 
-  /* ======= BUTTONS ======= */
-  .btn{
-    background:var(--accent);color:#121212;border:none;border-radius:12px;
+  .btn{background:var(--accent);color:#121212;border:none;border-radius:12px;
     padding:11px 16px;font-weight:800;cursor:pointer;transition:.12s;
-    box-shadow:0 1px 0 rgba(0,0,0,.35) inset, 0 0 0 1px rgba(0,0,0,.25);
-    letter-spacing:.2px;
-  }
-  .btn:hover{background:var(--accent-700)}
-  .btn:active{background:var(--accent-800);transform:translateY(1px)}
+    box-shadow:0 1px 0 rgba(0,0,0,.35) inset, 0 0 0 1px rgba(0,0,0,.25);letter-spacing:.2px}
+  .btn:hover{background:var(--accent-700)} .btn:active{background:var(--accent-800);transform:translateY(1px)}
   .btn:disabled{opacity:.45;cursor:not-allowed}
 
-  /* ======= LAYOUT COMUM ======= */
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .right{margin-left:auto}
   .tiny{font-size:12px;color:var(--muted)}
   .timer{font-size:12px;color:var(--muted)}
 
-  /* ======= TILES ======= */
-  .grid{
-    display:grid;
-    grid-template-columns:repeat(3,1fr);
-    gap:var(--tile-gap);
-  }
-  @media (max-width: 980px){
-    .grid{grid-template-columns:1fr}
-  }
-  .tile{
-    background:linear-gradient(180deg,var(--panel),var(--panel-2));
-    border:1px solid var(--chip-br);border-radius:14px;
-    padding:16px;display:flex;flex-direction:column;gap:12px;
-    box-shadow:var(--shadow);
-  }
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--tile-gap)}
+  @media (max-width:980px){ .grid{grid-template-columns:1fr} }
+  .tile{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--chip-br);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px;box-shadow:var(--shadow)}
   .tile h3{margin:0 0 4px 0;font-size:15px;letter-spacing:.2px}
-  .tile .res{
-    background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;
-    padding:12px;min-height:46px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-    white-space:pre-wrap;word-break:break-word
-  }
-  .inline{display:flex;gap:10px}
-  .inline > *{flex:1}
+  .tile .res{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;
+    padding:12px;min-height:46px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;white-space:pre-wrap;word-break:break-word}
+  .inline{display:flex;gap:10px} .inline > *{flex:1}
 
-  .chip-ok{color:var(--ok)}
-  .chip-err{color:var(--err)}
+  .progress{height:10px;border-radius:999px;background:#1b1b1f;border:1px solid #2a2a31;overflow:hidden}
+  .progress > div{height:100%;width:0;background:var(--accent);transition:width .15s ease}
 
-  /* ======= Scrollbars discretos (WebKit) ======= */
+  .list{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+  .ok{color:var(--ok)} .err{color:var(--err)}
+
   .result pre::-webkit-scrollbar,
   .tile .res::-webkit-scrollbar,
-  .tile textarea::-webkit-scrollbar{
-    width:10px;height:10px;
-  }
+  .tile textarea::-webkit-scrollbar,
+  .list::-webkit-scrollbar{width:10px;height:10px}
   .result pre::-webkit-scrollbar-thumb,
   .tile .res::-webkit-scrollbar-thumb,
-  .tile textarea::-webkit-scrollbar-thumb{
-    background:#2a2a31;border-radius:10px;
-  }
+  .tile textarea::-webkit-scrollbar-thumb,
+  .list::-webkit-scrollbar-thumb{background:#2a2a31;border-radius:10px}
   .result pre::-webkit-scrollbar-track,
   .tile .res::-webkit-scrollbar-track,
-  .tile textarea::-webkit-scrollbar-track{
-    background:transparent;
-  }
+  .tile textarea::-webkit-scrollbar-track,
+  .list::-webkit-scrollbar-track{background:transparent}
 </style>
 </head>
 <body>
   <div class="container">
     <header>
       <div class="brand">Alma Data</div>
-      <div class="status tiny">Versão do servidor: <span id="sv-version">—</span> &nbsp;•&nbsp; RAG: <span id="sv-rag">—</span> &nbsp;•&nbsp; Mem0: <span id="sv-mem">—</span></div>
+      <div class="status tiny">Versão do servidor: <span id="sv-version">—</span> • RAG: <span id="sv-rag">—</span> • Mem0: <span id="sv-mem">—</span></div>
     </header>
 
     <!-- RESULTADO NO TOPO -->
     <section class="result">
       <div class="row" style="justify-content:space-between;align-items:center">
-        <h2>Resultado</h2>
-        <div class="timer" id="globalTimer">⏱︎ 00:00</div>
+        <h2>Resultado</h2><div class="timer" id="globalTimer">⏱︎ 00:00</div>
       </div>
       <div class="badges" id="summaryBadges"></div>
       <pre id="resultBox">{}</pre>
@@ -175,7 +120,7 @@
         <input type="number" id="max_depth" min="0" value="4">
       </div>
       <div class="right tiny">Tarefa atual: <span id="taskLabel">—</span></div>
-      <button class="btn right" id="clearLogsBtn" title="Limpa o painel de resultado">Limpar resultado</button>
+      <button class="btn right" id="clearLogsBtn">Limpar resultado</button>
     </section>
 
     <!-- TILES -->
@@ -238,7 +183,7 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
-      <!-- NOVO: Extrair URLs do Sitemap (cliente) -->
+      <!-- Extrair URLs do Sitemap (cliente) -->
       <div class="tile">
         <h3>Extrair URLs do Sitemap</h3>
         <div class="inline">
@@ -250,7 +195,25 @@
         <div class="row" style="justify-content:flex-end;gap:8px">
           <button id="btnCopyExtract" class="btn" disabled>Copiar tudo</button>
         </div>
-        <div class="tiny">Se o site bloquear CORS, usa o tile “Ingestão via Sitemap” (server-side) e/ou um proxy.</div>
+        <div class="tiny">Se o site bloquear CORS, usa o tile “Ingestão via Sitemap”.</div>
+      </div>
+
+      <!-- NOVO: Ingerir em lote (lista de URLs) -->
+      <div class="tile">
+        <h3>Ingerir em lote (lista de URLs)</h3>
+        <textarea id="batchUrls" placeholder="Cola aqui uma URL por linha…"></textarea>
+        <div class="inline">
+          <input id="batchNamespace" type="text" placeholder="namespace (opcional, senão usa o da barra)">
+          <input id="batchDeadline" type="number" value="900" min="10" placeholder="deadline_s">
+          <input id="batchConcurrency" type="number" value="3" min="1" max="10" placeholder="concorrência">
+        </div>
+        <div class="progress"><div id="batchBar"></div></div>
+        <div class="tiny" id="batchStats">0/0 • OK: 0 • Falhas: 0</div>
+        <div class="list" id="batchList"></div>
+        <div class="row" style="justify-content:flex-end">
+          <button id="btnBatchStart" class="btn">Iniciar ingestão</button>
+          <button id="btnBatchStop" class="btn" disabled>Parar</button>
+        </div>
       </div>
 
     </section>
@@ -258,7 +221,6 @@
 
 <script>
 (function(){
-  // -------- util ----------
   const $ = sel => document.querySelector(sel);
   const resultBox = $('#resultBox');
   const badgesBox = $('#summaryBadges');
@@ -268,288 +230,209 @@
   const svMem = $('#sv-mem');
 
   let timerInterval = null;
-  function startTimer(){
-    const t0 = Date.now();
-    const el = $('#globalTimer');
+  function startTimer(){ const t0 = Date.now(); const el = $('#globalTimer');
     clearInterval(timerInterval);
-    timerInterval = setInterval(()=>{
-      const s = Math.floor((Date.now()-t0)/1000);
-      const mm = String(Math.floor(s/60)).padStart(2,'0');
-      const ss = String(s%60).padStart(2,'0');
-      el.textContent = `⏱︎ ${mm}:${ss}`;
-    }, 200);
+    timerInterval = setInterval(()=>{ const s = Math.floor((Date.now()-t0)/1000);
+      el.textContent = `⏱︎ ${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`; }, 200);
   }
   function stopTimer(){ clearInterval(timerInterval); }
-
   function setTask(t){ taskLabel.textContent = t || '—'; }
-  function setBadges(list){
-    badgesBox.innerHTML = '';
-    (list||[]).forEach(txt=>{
-      const b = document.createElement('div');
-      b.className = 'badge';
-      b.textContent = txt;
-      badgesBox.appendChild(b);
-    });
-  }
-  function printResult(obj){
-    resultBox.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
-  }
-  function smallRes(el, obj){
-    el.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
-  }
+  function setBadges(list){ badgesBox.innerHTML=''; (list||[]).forEach(txt=>{ const b=document.createElement('div'); b.className='badge'; b.textContent=txt; badgesBox.appendChild(b);}); }
+  function printResult(obj){ resultBox.textContent = (typeof obj==='string')?obj:JSON.stringify(obj,null,2); }
+  function smallRes(el,obj){ el.textContent = (typeof obj==='string')?obj:JSON.stringify(obj,null,2); }
 
-  // -------- status /health ----------
   async function loadHealth(){
-    try{
-      const r = await fetch('/health');
-      const j = await r.json();
-      svVersion.textContent = (j.model || '—');
-      svRag.textContent = j.rag_available ? 'disponível' : 'off';
-      svMem.textContent = j.mem0_enabled ? 'on' : 'off';
-    }catch(e){
-      svVersion.textContent = '—';
-      svRag.textContent = '—';
-      svMem.textContent = '—';
-    }
+    try{ const r = await fetch('/health'); const j = await r.json();
+      svVersion.textContent = (j.model || '—'); svRag.textContent = j.rag_available ? 'disponível' : 'off'; svMem.textContent = j.mem0_enabled ? 'on' : 'off';
+    }catch{ svVersion.textContent='—'; svRag.textContent='—'; svMem.textContent='—'; }
   }
   loadHealth();
 
-  // -------- Google Drive normalização ----------
   function normalizeGoogleDriveLink(url){
-    try{
-      const u = new URL(url);
-      if (u.hostname !== 'drive.google.com') return url;
-
-      if (u.pathname === '/uc' && (u.searchParams.get('id') || u.searchParams.get('export'))){
-        return url;
-      }
-
-      const m = u.pathname.match(/\/file\/d\/([^/]+)/);
-      if (m && m[1]) {
-        const id = m[1];
-        return `https://drive.google.com/uc?export=download&id=${id}`;
-      }
-
-      if (u.pathname === '/open' && u.searchParams.get('id')){
-        const id = u.searchParams.get('id');
-        return `https://drive.google.com/uc?export=download&id=${id}`;
-      }
-
+    try{ const u=new URL(url);
+      if (u.hostname!=='drive.google.com') return url;
+      if (u.pathname==='/uc' && (u.searchParams.get('id')||u.searchParams.get('export'))) return url;
+      const m=u.pathname.match(/\/file\/d\/([^/]+)/); if (m&&m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+      if (u.pathname==='/open' && u.searchParams.get('id')) return `https://drive.google.com/uc?export=download&id=${u.searchParams.get('id')}`;
       return url;
-    }catch(e){
-      return url;
-    }
+    }catch(e){ return url; }
   }
 
-  // -------- params ----------
-  function readCommon(){
-    return {
-      namespace: $('#ns').value.trim() || undefined,
-      max_pages: parseInt($('#max_pages').value || '0', 10) || undefined,
-      deadline_s: parseInt($('#deadline_s').value || '0', 10) || undefined,
-      max_depth: parseInt($('#max_depth').value || '0', 10) || undefined,
-    };
-  }
+  function readCommon(){ return {
+    namespace: $('#ns').value.trim() || undefined,
+    max_pages: parseInt($('#max_pages').value || '0',10) || undefined,
+    deadline_s: parseInt($('#deadline_s').value || '0',10) || undefined,
+    max_depth: parseInt($('#max_depth').value || '0',10) || undefined,
+  };}
 
-  // -------- chamadas ----------
   async function postJSON(path, payload){
-    const r = await fetch(path, {
-      method:'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(payload || {})
-    });
-    return r.json();
+    const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});
+    let j; try{ j = await r.json(); }catch{ j = {ok:false, http_status:r.status}; }
+    return j;
   }
 
-  // Ingest Sitemap
+  // ------- Tiles existentes -------
   $('#btnIngestSitemap').addEventListener('click', async ()=>{
-    const sitemap_url = $('#sitemap_url').value.trim();
-    if (!sitemap_url) return;
+    const sitemap_url = $('#sitemap_url').value.trim(); if (!sitemap_url) return;
     const p = readCommon();
     setTask(`ação: ingest-sitemap   item: ${sitemap_url}`);
     setBadges([`Sitemap: ${sitemap_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`]);
-    startTimer();
-    $('#btnIngestSitemap').disabled = true;
-    const res = await postJSON('/rag/ingest-sitemap', { sitemap_url, namespace:p.namespace, max_pages:p.max_pages, deadline_s:p.deadline_s });
-    stopTimer();
-    $('#btnIngestSitemap').disabled = false;
-    printResult(res);
-    smallRes($('#resSitemap'), res);
+    startTimer(); $('#btnIngestSitemap').disabled = true;
+    const res = await postJSON('/rag/ingest-sitemap',{ sitemap_url, namespace:p.namespace, max_pages:p.max_pages, deadline_s:p.deadline_s });
+    stopTimer(); $('#btnIngestSitemap').disabled = false; printResult(res); smallRes($('#resSitemap'),res);
   });
 
-  // Crawl
   $('#btnCrawl').addEventListener('click', async ()=>{
-    const seed_url = $('#seed_url').value.trim();
-    if (!seed_url) return;
+    const seed_url = $('#seed_url').value.trim(); if (!seed_url) return;
     const p = readCommon();
     setTask(`ação: crawl   seed: ${seed_url}`);
     setBadges([`Seed: ${seed_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`, `max_depth: ${p.max_depth||'—'}`]);
-    startTimer();
-    $('#btnCrawl').disabled = true;
-    const res = await postJSON('/rag/crawl', { seed_url, namespace:p.namespace, max_pages:p.max_pages, max_depth:p.max_depth, deadline_s:p.deadline_s });
-    stopTimer();
-    $('#btnCrawl').disabled = false;
-    printResult(res);
-    smallRes($('#resCrawl'), res);
+    startTimer(); $('#btnCrawl').disabled = true;
+    const res = await postJSON('/rag/crawl',{ seed_url, namespace:p.namespace, max_pages:p.max_pages, max_depth:p.max_depth, deadline_s:p.deadline_s });
+    stopTimer(); $('#btnCrawl').disabled = false; printResult(res); smallRes($('#resCrawl'),res);
   });
 
-  // URL individual (com normalização de Drive)
   $('#btnIngestURL').addEventListener('click', async ()=>{
-    let page_url = $('#single_url').value.trim();
-    if (!page_url) return;
-    page_url = normalizeGoogleDriveLink(page_url);
-    $('#single_url').value = page_url;
+    let page_url = $('#single_url').value.trim(); if (!page_url) return;
+    page_url = normalizeGoogleDriveLink(page_url); $('#single_url').value = page_url;
     const p = readCommon();
     setTask(`ação: ingest-url   item: ${page_url}`);
     setBadges([`URL: ${page_url}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer();
-    $('#btnIngestURL').disabled = true;
-    const res = await postJSON('/rag/ingest-url', { page_url, namespace:p.namespace, deadline_s:p.deadline_s });
-    stopTimer();
-    $('#btnIngestURL').disabled = false;
-    printResult(res);
-    smallRes($('#resURL'), res);
+    startTimer(); $('#btnIngestURL').disabled = true;
+    const res = await postJSON('/rag/ingest-url',{ page_url, namespace:p.namespace, deadline_s:p.deadline_s });
+    stopTimer(); $('#btnIngestURL').disabled = false; printResult(res); smallRes($('#resURL'),res);
   });
 
-  // Texto
   $('#btnIngestText').addEventListener('click', async ()=>{
-    const title = $('#text_title').value.trim();
-    const text  = $('#text_body').value.trim();
-    if (!title || !text) return;
-    const p = readCommon();
-    setTask(`ação: ingest-text   título: ${title}`);
-    setBadges([`Título: ${title}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer();
-    $('#btnIngestText').disabled = true;
-    const res = await postJSON('/rag/ingest-text', { title, text, namespace:p.namespace });
-    stopTimer();
-    $('#btnIngestText').disabled = false;
-    printResult(res);
-    smallRes($('#resText'), res);
+    const title = $('#text_title').value.trim(); const text = $('#text_body').value.trim();
+    if (!title || !text) return; const p = readCommon();
+    setTask(`ação: ingest-text   título: ${title}`); setBadges([`Título: ${title}`, `namespace: ${p.namespace||'default'}`]);
+    startTimer(); $('#btnIngestText').disabled = true;
+    const res = await postJSON('/rag/ingest-text',{ title, text, namespace:p.namespace });
+    stopTimer(); $('#btnIngestText').disabled = false; printResult(res); smallRes($('#resText'),res);
   });
 
-  // PDF (URL) — também normaliza Drive
   $('#btnIngestPDF').addEventListener('click', async ()=>{
-    let pdf_url = $('#pdf_url').value.trim();
-    const title = $('#pdf_title').value.trim() || null;
-    if (!pdf_url) return;
-    pdf_url = normalizeGoogleDriveLink(pdf_url);
-    $('#pdf_url').value = pdf_url;
-    const p = readCommon();
-    setTask(`ação: ingest-pdf-url   item: ${pdf_url}`);
+    let pdf_url = $('#pdf_url').value.trim(); const title = $('#pdf_title').value.trim() || null;
+    if (!pdf_url) return; pdf_url = normalizeGoogleDriveLink(pdf_url); $('#pdf_url').value = pdf_url;
+    const p = readCommon(); setTask(`ação: ingest-pdf-url   item: ${pdf_url}`);
     setBadges([`PDF: ${pdf_url}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer();
-    $('#btnIngestPDF').disabled = true;
-    const res = await postJSON('/rag/ingest-pdf-url', { pdf_url, title, namespace:p.namespace });
-    stopTimer();
-    $('#btnIngestPDF').disabled = false;
-    printResult(res);
-    smallRes($('#resPDF'), res);
+    startTimer(); $('#btnIngestPDF').disabled = true;
+    const res = await postJSON('/rag/ingest-pdf-url',{ pdf_url, title, namespace:p.namespace });
+    stopTimer(); $('#btnIngestPDF').disabled = false; printResult(res); smallRes($('#resPDF'),res);
   });
 
-  // Search
   $('#btnSearch').addEventListener('click', async ()=>{
-    const query = $('#search_q').value.trim();
-    const top_k = parseInt($('#search_topk').value || '6', 10);
-    const p = readCommon();
-    if (!query) return;
-    setTask(`ação: search   q: ${query}`);
-    setBadges([`q: ${query}`, `namespace: ${p.namespace||'default'}`, `top_k: ${top_k}`]);
-    startTimer();
-    $('#btnSearch').disabled = true;
-    const res = await postJSON('/rag/search', { query, namespace:p.namespace, top_k });
-    stopTimer();
-    $('#btnSearch').disabled = false;
-    printResult(res);
-    smallRes($('#resSearch'), res);
+    const query = $('#search_q').value.trim(); const top_k = parseInt($('#search_topk').value || '6',10);
+    const p = readCommon(); if (!query) return;
+    setTask(`ação: search   q: ${query}`); setBadges([`q: ${query}`, `namespace: ${p.namespace||'default'}`, `top_k: ${top_k}`]);
+    startTimer(); $('#btnSearch').disabled = true;
+    const res = await postJSON('/rag/search',{ query, namespace:p.namespace, top_k });
+    stopTimer(); $('#btnSearch').disabled = false; printResult(res); smallRes($('#resSearch'),res);
   });
 
-  // Limpar
-  $('#clearLogsBtn').addEventListener('click', ()=>{
-    printResult('{}'); setBadges([]); setTask('—');
-  });
+  $('#clearLogsBtn').addEventListener('click', ()=>{ printResult('{}'); setBadges([]); setTask('—'); });
 
-  // ===== NOVO: Extrair URLs do Sitemap (recursivo) =====
+  // ------- Extrair URLs (cliente) -------
   $('#btnExtractSitemap').addEventListener('click', async ()=>{
     const sitemap_url = $('#sitemap_extract_url').value.trim();
-    const outTA = $('#extractOutput');
-    const resBox = $('#resExtract');
+    const outTA = $('#extractOutput'); const resBox = $('#resExtract');
     if (!sitemap_url) return;
-
     setTask(`ação: extrair-urls   sitemap: ${sitemap_url}`);
-    setBadges([`Sitemap: ${sitemap_url}`]);
-    startTimer();
-    $('#btnExtractSitemap').disabled = true;
-    $('#btnCopyExtract').disabled = true;
-    outTA.value = '';
-    resBox.textContent = 'A extrair…';
-
-    try {
-      async function fetchXml(u){
-        const resp = await fetch(u, { cache: 'no-store' });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const txt = await resp.text();
-        return new window.DOMParser().parseFromString(txt, "application/xml");
+    setBadges([`Sitemap: ${sitemap_url}`]); startTimer();
+    $('#btnExtractSitemap').disabled = true; $('#btnCopyExtract').disabled = true;
+    outTA.value = ''; resBox.textContent = 'A extrair…';
+    try{
+      async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
+      const seen=new Set(), urls=[];
+      async function walk(u){ if(seen.has(u)) return; seen.add(u);
+        const doc=await fetchXml(u);
+        urls.push(...[...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean));
+        for (const s of [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean)) await walk(s);
       }
-      const seen = new Set();
-      const urls = [];
-      async function walk(u){
-        if (seen.has(u)) return;
-        seen.add(u);
-        const doc = await fetchXml(u);
-
-        // URLs
-        const locs = [...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean);
-        if (locs.length) urls.push(...locs);
-
-        // sub-sitemaps
-        const subs = [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean);
-        for (const s of subs) await walk(s);
-      }
-
-      await walk(sitemap_url);
-
-      stopTimer();
-
-      // Mostrar sumário + exemplos
-      const examples = urls.slice(0,3);
-      smallRes(resBox, { count: urls.length, examples });
-
-      // Preencher textarea e habilitar copiar
-      outTA.value = urls.join("\n");
-      $('#btnCopyExtract').disabled = urls.length === 0;
-
-      // Copiar automaticamente
-      if (urls.length) {
-        try {
-          await navigator.clipboard.writeText(outTA.value);
-          printResult({ ok:true, copied: urls.length, note: "URLs copiadas para o clipboard e listadas no textarea." });
-        } catch {
-          printResult({ ok:true, copied:false, note: "Não foi possível copiar automaticamente (permite o clipboard), mas as URLs estão no textarea." });
-        }
-      } else {
-        printResult({ ok:true, copied:false, note: "Nenhuma URL encontrada no sitemap." });
-      }
-
-    } catch(e){
-      stopTimer();
-      smallRes(resBox, { error: String(e && e.message || e) });
-      printResult({ ok:false, error: String(e && e.message || e), hint: "Se for CORS, usa o tile 'Ingestão via Sitemap' (server-side)." });
-    }
-
+      await walk(sitemap_url); stopTimer();
+      smallRes(resBox,{count:urls.length,examples:urls.slice(0,3)});
+      outTA.value = urls.join('\n'); $('#btnCopyExtract').disabled = urls.length===0;
+      if (urls.length){ try{ await navigator.clipboard.writeText(outTA.value); printResult({ok:true,copied:urls.length}); }catch{ printResult({ok:true,copied:false}); } }
+    }catch(e){ stopTimer(); smallRes(resBox,{error:String(e&&e.message||e)}); printResult({ok:false,error:String(e&&e.message||e)}); }
     $('#btnExtractSitemap').disabled = false;
   });
-
-  // Copiar manualmente o textarea
   $('#btnCopyExtract').addEventListener('click', async ()=>{
-    const txt = $('#extractOutput').value;
-    if (!txt.trim()) return;
-    try {
-      await navigator.clipboard.writeText(txt);
-      printResult({ ok:true, copied:true, lines: txt.split('\n').filter(Boolean).length });
-    } catch (e){
-      printResult({ ok:false, error:"Clipboard bloqueado pelo browser" });
+    const txt = $('#extractOutput').value; if (!txt.trim()) return;
+    try{ await navigator.clipboard.writeText(txt); printResult({ok:true,copied:true,lines:txt.split('\n').filter(Boolean).length}); }catch{ printResult({ok:false,error:'Clipboard bloqueado'}); }
+  });
+
+  // ------- NOVO: Ingestão em lote (com relatório em tempo real) -------
+  const state = { stop:false };
+  $('#btnBatchStart').addEventListener('click', async ()=>{
+    const raw = $('#batchUrls').value.trim();
+    const urls = raw.split('\n').map(s=>s.trim()).filter(Boolean);
+    if (!urls.length) return;
+
+    const commonNs = $('#ns').value.trim() || undefined;
+    const ns = ($('#batchNamespace').value.trim() || commonNs);
+    const deadline_s = parseInt($('#batchDeadline').value || '0',10) || undefined;
+    const concurrency = Math.max(1, Math.min(10, parseInt($('#batchConcurrency').value || '3',10)));
+
+    // UI init
+    state.stop = false;
+    $('#btnBatchStart').disabled = true;
+    $('#btnBatchStop').disabled = false;
+    setTask(`ação: ingest-batch   urls: ${urls.length}`);
+    setBadges([`namespace: ${ns||'default'}`, `concorrência: ${concurrency}`, `deadline_s: ${deadline_s||'—'}`]);
+    startTimer();
+
+    const list = $('#batchList'); list.innerHTML = '';
+    const bar = $('#batchBar'); bar.style.width = '0%';
+    const statsEl = $('#batchStats'); let done=0, ok=0, fail=0;
+
+    function update(){
+      const pct = Math.round((done/urls.length)*100);
+      bar.style.width = pct + '%';
+      statsEl.textContent = `${done}/${urls.length} • OK: ${ok} • Falhas: ${fail}`;
     }
+
+    function addLine(text, cls){
+      const div = document.createElement('div');
+      if (cls) div.className = cls;
+      div.textContent = text;
+      list.appendChild(div);
+      list.scrollTop = list.scrollHeight;
+    }
+
+    // worker
+    async function ingestOne(u){
+      const page_url = normalizeGoogleDriveLink(u);
+      addLine(`→ ${page_url}`);
+      const res = await postJSON('/rag/ingest-url', { page_url, namespace: ns, deadline_s });
+      if (res && (res.ok === true || res.status === 'ok')) { ok++; addLine(`✔ OK ${page_url}`, 'ok'); }
+      else { fail++; addLine(`✖ Falha ${page_url} :: ${JSON.stringify(res).slice(0,200)}`, 'err'); }
+      done++; update();
+    }
+
+    // scheduler com concorrência limitada
+    let idx = 0, active = 0;
+    await new Promise(resolve=>{
+      const tick = ()=>{
+        if (state.stop) { if (active===0) resolve(); return; }
+        while (active < concurrency && idx < urls.length){
+          const u = urls[idx++]; active++;
+          ingestOne(u).finally(()=>{ active--; tick(); });
+        }
+        if (done >= urls.length && active === 0) resolve();
+      };
+      tick();
+    });
+
+    stopTimer();
+    $('#btnBatchStart').disabled = false;
+    $('#btnBatchStop').disabled = true;
+    printResult({ ok:true, total: urls.length, ok, fail });
+  });
+
+  $('#btnBatchStop').addEventListener('click', ()=>{
+    state.stop = true;
+    $('#btnBatchStop').disabled = true;
   });
 
 })();
