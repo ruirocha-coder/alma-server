@@ -121,19 +121,17 @@
   .chip-ok{color:var(--ok)}
   .chip-err{color:var(--err)}
 
-  /* ======= Scrollbars discretos (WebKit) ======= */
+  /* Progress bar */
+  .progress{height:10px;background:#101014;border:1px solid var(--chip-br);border-radius:8px;overflow:hidden}
+  .progress > div{height:100%;background:var(--accent);width:0%}
+
+  /* ======= Scrollbars (WebKit) ======= */
   .result pre::-webkit-scrollbar,
-  .tile .res::-webkit-scrollbar{
-    width:10px;height:10px;
-  }
+  .tile .res::-webkit-scrollbar{ width:10px;height:10px; }
   .result pre::-webkit-scrollbar-thumb,
-  .tile .res::-webkit-scrollbar-thumb{
-    background:#2a2a31;border-radius:10px;
-  }
+  .tile .res::-webkit-scrollbar-thumb{ background:#2a2a31;border-radius:10px; }
   .result pre::-webkit-scrollbar-track,
-  .tile .res::-webkit-scrollbar-track{
-    background:transparent;
-  }
+  .tile .res::-webkit-scrollbar-track{ background:transparent; }
 </style>
 </head>
 <body>
@@ -175,7 +173,7 @@
       <button class="btn right" id="clearLogsBtn" title="Limpa o painel de resultado">Limpar resultado</button>
     </section>
 
-    <!-- 6 TILES -->
+    <!-- 6 TILES + 1 novo -->
     <section class="grid">
 
       <!-- Ingestão via Sitemap -->
@@ -186,6 +184,7 @@
           <button id="btnIngestSitemap" class="btn">Ingerir Sitemap</button>
         </div>
         <div class="res" id="resSitemap">{}</div>
+        <div class="tiny">Sitemap muito grande? Prefere “Lista de URLs (lotes)” abaixo para ter progresso e tolerância a falhas.</div>
       </div>
 
       <!-- Crawler (mesmo domínio) -->
@@ -233,6 +232,33 @@
         <input id="search_topk" type="number" value="6" min="1" max="50" />
         <button id="btnSearch" class="btn">Pesquisar</button>
         <div class="res" id="resSearch">{}</div>
+      </div>
+
+      <!-- NOVO: Ingestão de lista de URLs (lotes) -->
+      <div class="tile">
+        <h3>Ingestão de lista de URLs (lotes)</h3>
+        <textarea id="bulk_urls" placeholder="Cola aqui 1 URL por linha (podes colar 1700+)"></textarea>
+        <div class="row">
+          <div class="field">
+            <label>Concorrência</label>
+            <input id="bulk_conc" type="number" min="1" max="6" value="2">
+          </div>
+          <div class="field">
+            <label>Lote (URLs/min)</label>
+            <input id="bulk_rate" type="number" min="10" max="3000" value="240">
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button id="bulk_start" class="btn">Iniciar</button>
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button id="bulk_stop" class="btn" disabled>Parar</button>
+          </div>
+        </div>
+        <div class="progress"><div id="bulk_bar"></div></div>
+        <div class="tiny" id="bulk_stats">—</div>
+        <div class="res" id="resBulk">{}</div>
       </div>
 
     </section>
@@ -305,18 +331,15 @@
       if (u.pathname === '/uc' && (u.searchParams.get('id') || u.searchParams.get('export'))){
         return url;
       }
-
       const m = u.pathname.match(/\/file\/d\/([^/]+)/);
       if (m && m[1]) {
         const id = m[1];
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
-
       if (u.pathname === '/open' && u.searchParams.get('id')){
         const id = u.searchParams.get('id');
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
-
       return url;
     }catch(e){
       return url;
@@ -449,6 +472,110 @@
   // Limpar
   $('#clearLogsBtn').addEventListener('click', ()=>{
     printResult('{}'); setBadges([]); setTask('—');
+  });
+
+  // ============ NOVO: Bulk ingest (em lotes) ============
+  const bulk = {
+    running: false,
+    aborter: null,
+    total: 0,
+    done: 0,
+    ok: 0,
+    fail: 0
+  };
+
+  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+  function updateBulkUI(){
+    const bar = $('#bulk_bar');
+    const stats = $('#bulk_stats');
+    const pct = bulk.total ? Math.round((bulk.done / bulk.total) * 100) : 0;
+    bar.style.width = pct + '%';
+    stats.textContent = `Progresso: ${bulk.done}/${bulk.total}  •  OK: ${bulk.ok}  •  Erros: ${bulk.fail}  •  Restantes: ${Math.max(0, bulk.total - bulk.done)}`;
+  }
+
+  async function ingestOneURL(page_url, namespace, deadline_s){
+    try{
+      const payload = { page_url, namespace, deadline_s };
+      const r = await fetch('/rag/ingest-url', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload),
+        signal: bulk.aborter.signal
+      });
+      const j = await r.json().catch(()=>({ok:false, error:'json parse'}));
+      return j;
+    }catch(e){
+      return { ok:false, error: String(e) };
+    }
+  }
+
+  $('#bulk_start').addEventListener('click', async ()=>{
+    const raw = $('#bulk_urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
+    if (raw.length === 0) return;
+
+    // prepara URLs (normaliza Drive quando aplicável)
+    const urls = raw.map(u => {
+      try { return normalizeGoogleDriveLink(u); } catch { return u; }
+    });
+
+    const conc = Math.max(1, Math.min(6, parseInt($('#bulk_conc').value || '2',10)));
+    const rate = Math.max(10, parseInt($('#bulk_rate').value || '240',10)); // URLs/min
+    const delayPerReq = Math.floor(60000 / rate); // ms entre lançamentos
+    const p = readCommon();
+    setTask(`ação: bulk-ingest   ${urls.length} URLs`);
+    setBadges([`Total: ${urls.length}`, `conc: ${conc}`, `rate: ${rate}/min`, `namespace: ${p.namespace||'default'}`]);
+
+    // estado
+    bulk.running = true;
+    bulk.aborter = new AbortController();
+    bulk.total = urls.length;
+    bulk.done = 0; bulk.ok = 0; bulk.fail = 0;
+    updateBulkUI();
+    $('#bulk_start').disabled = true;
+    $('#bulk_stop').disabled = false;
+    startTimer();
+
+    // executa com “n” workers em paralelo, espaçando arranques
+    const queue = urls.slice();
+    const results = [];
+    async function worker(id){
+      while(bulk.running && queue.length){
+        const u = queue.shift();
+        if (!u) break;
+        const res = await ingestOneURL(u, p.namespace, p.deadline_s);
+        results.push({ url:u, res });
+        bulk.done += 1;
+        if (res && res.ok !== false) bulk.ok += 1; else bulk.fail += 1;
+        updateBulkUI();
+        await sleep(delayPerReq); // controlo de taxa
+      }
+    }
+
+    const workers = Array.from({length: conc}, (_,i)=>worker(i));
+    await Promise.race([
+      Promise.all(workers),
+      new Promise((_,rej)=> bulk.aborter.signal.addEventListener('abort', ()=>rej(new Error('aborted')), {once:true}))
+    ]).catch(()=>{}); // swallow abort
+
+    stopTimer();
+    $('#bulk_start').disabled = false;
+    $('#bulk_stop').disabled = true;
+    bulk.running = false;
+
+    // resumo e últimos 10 resultados
+    const last = results.slice(-10).map(x=>({url:x.url, ok:x.res?.ok!==false, err:x.res?.error||null}));
+    smallRes($('#resBulk'), { summary:{total:bulk.total, ok:bulk.ok, fail:bulk.fail}, last10:last });
+    printResult({ summary:{total:bulk.total, ok:bulk.ok, fail:bulk.fail}, sample:last });
+  });
+
+  $('#bulk_stop').addEventListener('click', ()=>{
+    if (!bulk.running) return;
+    bulk.running = false;
+    try{ bulk.aborter?.abort(); }catch{}
+    $('#bulk_start').disabled = false;
+    $('#bulk_stop').disabled = true;
+    setTask('—');
   });
 
 })();
