@@ -121,17 +121,22 @@
   .chip-ok{color:var(--ok)}
   .chip-err{color:var(--err)}
 
-  /* Progress bar */
-  .progress{height:10px;background:#101014;border:1px solid var(--chip-br);border-radius:8px;overflow:hidden}
-  .progress > div{height:100%;background:var(--accent);width:0%}
-
-  /* ======= Scrollbars (WebKit) ======= */
+  /* ======= Scrollbars discretos (WebKit) ======= */
   .result pre::-webkit-scrollbar,
-  .tile .res::-webkit-scrollbar{ width:10px;height:10px; }
+  .tile .res::-webkit-scrollbar,
+  .tile textarea::-webkit-scrollbar{
+    width:10px;height:10px;
+  }
   .result pre::-webkit-scrollbar-thumb,
-  .tile .res::-webkit-scrollbar-thumb{ background:#2a2a31;border-radius:10px; }
+  .tile .res::-webkit-scrollbar-thumb,
+  .tile textarea::-webkit-scrollbar-thumb{
+    background:#2a2a31;border-radius:10px;
+  }
   .result pre::-webkit-scrollbar-track,
-  .tile .res::-webkit-scrollbar-track{ background:transparent; }
+  .tile .res::-webkit-scrollbar-track,
+  .tile textarea::-webkit-scrollbar-track{
+    background:transparent;
+  }
 </style>
 </head>
 <body>
@@ -173,7 +178,7 @@
       <button class="btn right" id="clearLogsBtn" title="Limpa o painel de resultado">Limpar resultado</button>
     </section>
 
-    <!-- 6 TILES + 1 novo -->
+    <!-- TILES -->
     <section class="grid">
 
       <!-- Ingestão via Sitemap -->
@@ -184,7 +189,6 @@
           <button id="btnIngestSitemap" class="btn">Ingerir Sitemap</button>
         </div>
         <div class="res" id="resSitemap">{}</div>
-        <div class="tiny">Sitemap muito grande? Prefere “Lista de URLs (lotes)” abaixo para ter progresso e tolerância a falhas.</div>
       </div>
 
       <!-- Crawler (mesmo domínio) -->
@@ -234,31 +238,19 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
-      <!-- NOVO: Ingestão de lista de URLs (lotes) -->
+      <!-- NOVO: Extrair URLs do Sitemap (cliente) -->
       <div class="tile">
-        <h3>Ingestão de lista de URLs (lotes)</h3>
-        <textarea id="bulk_urls" placeholder="Cola aqui 1 URL por linha (podes colar 1700+)"></textarea>
-        <div class="row">
-          <div class="field">
-            <label>Concorrência</label>
-            <input id="bulk_conc" type="number" min="1" max="6" value="2">
-          </div>
-          <div class="field">
-            <label>Lote (URLs/min)</label>
-            <input id="bulk_rate" type="number" min="10" max="3000" value="240">
-          </div>
-          <div class="field">
-            <label>&nbsp;</label>
-            <button id="bulk_start" class="btn">Iniciar</button>
-          </div>
-          <div class="field">
-            <label>&nbsp;</label>
-            <button id="bulk_stop" class="btn" disabled>Parar</button>
-          </div>
+        <h3>Extrair URLs do Sitemap</h3>
+        <div class="inline">
+          <input id="sitemap_extract_url" type="text" placeholder="https://exemplo.com/sitemap.xml">
+          <button id="btnExtractSitemap" class="btn">Extrair URLs</button>
         </div>
-        <div class="progress"><div id="bulk_bar"></div></div>
-        <div class="tiny" id="bulk_stats">—</div>
-        <div class="res" id="resBulk">{}</div>
+        <div class="res" id="resExtract">—</div>
+        <textarea id="extractOutput" placeholder="URLs extraídas aparecerão aqui (uma por linha)…" style="min-height:160px"></textarea>
+        <div class="row" style="justify-content:flex-end;gap:8px">
+          <button id="btnCopyExtract" class="btn" disabled>Copiar tudo</button>
+        </div>
+        <div class="tiny">Se o site bloquear CORS, usa o tile “Ingestão via Sitemap” (server-side) e/ou um proxy.</div>
       </div>
 
     </section>
@@ -331,15 +323,18 @@
       if (u.pathname === '/uc' && (u.searchParams.get('id') || u.searchParams.get('export'))){
         return url;
       }
+
       const m = u.pathname.match(/\/file\/d\/([^/]+)/);
       if (m && m[1]) {
         const id = m[1];
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
+
       if (u.pathname === '/open' && u.searchParams.get('id')){
         const id = u.searchParams.get('id');
         return `https://drive.google.com/uc?export=download&id=${id}`;
       }
+
       return url;
     }catch(e){
       return url;
@@ -474,108 +469,87 @@
     printResult('{}'); setBadges([]); setTask('—');
   });
 
-  // ============ NOVO: Bulk ingest (em lotes) ============
-  const bulk = {
-    running: false,
-    aborter: null,
-    total: 0,
-    done: 0,
-    ok: 0,
-    fail: 0
-  };
+  // ===== NOVO: Extrair URLs do Sitemap (recursivo) =====
+  $('#btnExtractSitemap').addEventListener('click', async ()=>{
+    const sitemap_url = $('#sitemap_extract_url').value.trim();
+    const outTA = $('#extractOutput');
+    const resBox = $('#resExtract');
+    if (!sitemap_url) return;
 
-  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-  function updateBulkUI(){
-    const bar = $('#bulk_bar');
-    const stats = $('#bulk_stats');
-    const pct = bulk.total ? Math.round((bulk.done / bulk.total) * 100) : 0;
-    bar.style.width = pct + '%';
-    stats.textContent = `Progresso: ${bulk.done}/${bulk.total}  •  OK: ${bulk.ok}  •  Erros: ${bulk.fail}  •  Restantes: ${Math.max(0, bulk.total - bulk.done)}`;
-  }
-
-  async function ingestOneURL(page_url, namespace, deadline_s){
-    try{
-      const payload = { page_url, namespace, deadline_s };
-      const r = await fetch('/rag/ingest-url', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify(payload),
-        signal: bulk.aborter.signal
-      });
-      const j = await r.json().catch(()=>({ok:false, error:'json parse'}));
-      return j;
-    }catch(e){
-      return { ok:false, error: String(e) };
-    }
-  }
-
-  $('#bulk_start').addEventListener('click', async ()=>{
-    const raw = $('#bulk_urls').value.split('\n').map(s=>s.trim()).filter(Boolean);
-    if (raw.length === 0) return;
-
-    // prepara URLs (normaliza Drive quando aplicável)
-    const urls = raw.map(u => {
-      try { return normalizeGoogleDriveLink(u); } catch { return u; }
-    });
-
-    const conc = Math.max(1, Math.min(6, parseInt($('#bulk_conc').value || '2',10)));
-    const rate = Math.max(10, parseInt($('#bulk_rate').value || '240',10)); // URLs/min
-    const delayPerReq = Math.floor(60000 / rate); // ms entre lançamentos
-    const p = readCommon();
-    setTask(`ação: bulk-ingest   ${urls.length} URLs`);
-    setBadges([`Total: ${urls.length}`, `conc: ${conc}`, `rate: ${rate}/min`, `namespace: ${p.namespace||'default'}`]);
-
-    // estado
-    bulk.running = true;
-    bulk.aborter = new AbortController();
-    bulk.total = urls.length;
-    bulk.done = 0; bulk.ok = 0; bulk.fail = 0;
-    updateBulkUI();
-    $('#bulk_start').disabled = true;
-    $('#bulk_stop').disabled = false;
+    setTask(`ação: extrair-urls   sitemap: ${sitemap_url}`);
+    setBadges([`Sitemap: ${sitemap_url}`]);
     startTimer();
+    $('#btnExtractSitemap').disabled = true;
+    $('#btnCopyExtract').disabled = true;
+    outTA.value = '';
+    resBox.textContent = 'A extrair…';
 
-    // executa com “n” workers em paralelo, espaçando arranques
-    const queue = urls.slice();
-    const results = [];
-    async function worker(id){
-      while(bulk.running && queue.length){
-        const u = queue.shift();
-        if (!u) break;
-        const res = await ingestOneURL(u, p.namespace, p.deadline_s);
-        results.push({ url:u, res });
-        bulk.done += 1;
-        if (res && res.ok !== false) bulk.ok += 1; else bulk.fail += 1;
-        updateBulkUI();
-        await sleep(delayPerReq); // controlo de taxa
+    try {
+      async function fetchXml(u){
+        const resp = await fetch(u, { cache: 'no-store' });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const txt = await resp.text();
+        return new window.DOMParser().parseFromString(txt, "application/xml");
       }
+      const seen = new Set();
+      const urls = [];
+      async function walk(u){
+        if (seen.has(u)) return;
+        seen.add(u);
+        const doc = await fetchXml(u);
+
+        // URLs
+        const locs = [...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean);
+        if (locs.length) urls.push(...locs);
+
+        // sub-sitemaps
+        const subs = [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean);
+        for (const s of subs) await walk(s);
+      }
+
+      await walk(sitemap_url);
+
+      stopTimer();
+
+      // Mostrar sumário + exemplos
+      const examples = urls.slice(0,3);
+      smallRes(resBox, { count: urls.length, examples });
+
+      // Preencher textarea e habilitar copiar
+      outTA.value = urls.join("\n");
+      $('#btnCopyExtract').disabled = urls.length === 0;
+
+      // Copiar automaticamente
+      if (urls.length) {
+        try {
+          await navigator.clipboard.writeText(outTA.value);
+          printResult({ ok:true, copied: urls.length, note: "URLs copiadas para o clipboard e listadas no textarea." });
+        } catch {
+          printResult({ ok:true, copied:false, note: "Não foi possível copiar automaticamente (permite o clipboard), mas as URLs estão no textarea." });
+        }
+      } else {
+        printResult({ ok:true, copied:false, note: "Nenhuma URL encontrada no sitemap." });
+      }
+
+    } catch(e){
+      stopTimer();
+      smallRes(resBox, { error: String(e && e.message || e) });
+      printResult({ ok:false, error: String(e && e.message || e), hint: "Se for CORS, usa o tile 'Ingestão via Sitemap' (server-side)." });
     }
 
-    const workers = Array.from({length: conc}, (_,i)=>worker(i));
-    await Promise.race([
-      Promise.all(workers),
-      new Promise((_,rej)=> bulk.aborter.signal.addEventListener('abort', ()=>rej(new Error('aborted')), {once:true}))
-    ]).catch(()=>{}); // swallow abort
-
-    stopTimer();
-    $('#bulk_start').disabled = false;
-    $('#bulk_stop').disabled = true;
-    bulk.running = false;
-
-    // resumo e últimos 10 resultados
-    const last = results.slice(-10).map(x=>({url:x.url, ok:x.res?.ok!==false, err:x.res?.error||null}));
-    smallRes($('#resBulk'), { summary:{total:bulk.total, ok:bulk.ok, fail:bulk.fail}, last10:last });
-    printResult({ summary:{total:bulk.total, ok:bulk.ok, fail:bulk.fail}, sample:last });
+    $('#btnExtractSitemap').disabled = false;
   });
 
-  $('#bulk_stop').addEventListener('click', ()=>{
-    if (!bulk.running) return;
-    bulk.running = false;
-    try{ bulk.aborter?.abort(); }catch{}
-    $('#bulk_start').disabled = false;
-    $('#bulk_stop').disabled = true;
-    setTask('—');
+  // Copiar manualmente o textarea
+  $('#btnCopyExtract').addEventListener('click', async ()=>{
+    const txt = $('#extractOutput').value;
+    if (!txt.trim()) return;
+    try {
+      await navigator.clipboard.writeText(txt);
+      printResult({ ok:true, copied:true, lines: txt.split('\n').filter(Boolean).length });
+    } catch (e){
+      printResult({ ok:false, error:"Clipboard bloqueado pelo browser" });
+    }
   });
 
 })();
