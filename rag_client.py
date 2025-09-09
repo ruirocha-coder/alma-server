@@ -1,7 +1,7 @@
-# rag_client.py — OpenAI embeddings (1536D) + Qdrant + crawler/sitemap
-# -------------------------------------------------------------------
+# rag_client.py — OpenAI embeddings (1536D) + Qdrant + crawler/sitemap (com chunking por tokens)
+# ----------------------------------------------------------------------------------------------
 import os, time, uuid, requests
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Iterable
 from urllib.parse import urlsplit, urlunsplit, urljoin
 from bs4 import BeautifulSoup
 from qdrant_client import QdrantClient
@@ -18,6 +18,10 @@ UPSERT_BATCH      = int(os.getenv("UPSERT_BATCH", "64"))
 FETCH_TIMEOUT_S   = int(os.getenv("FETCH_TIMEOUT_S", "20"))
 QDRANT_AUTO_MIGRATE = os.getenv("QDRANT_AUTO_MIGRATE", "1") == "1"
 
+# Chunking seguro para embeddings
+RAG_CHUNK_TOKENS  = int(os.getenv("RAG_CHUNK_TOKENS", "7500"))  # < 8192
+RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+
 # =========================== Crawling defaults =====================
 CRAWL_MAX_PAGES   = int(os.getenv("CRAWL_MAX_PAGES", "500"))
 CRAWL_DEADLINE_S  = int(os.getenv("CRAWL_DEADLINE_S", "500"))
@@ -32,7 +36,7 @@ SITEMAP_SLEEP_MS  = int(os.getenv("SITEMAP_SLEEP_MS", "0"))         # pausa entr
 # Dimensão do embedding
 MODEL_DIMS = {
     "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 1536,
+    "text-embedding-3-large": 3072,  # oficial
 }
 VECTOR_SIZE = MODEL_DIMS.get(OPENAI_MODEL, 1536)
 
@@ -40,7 +44,8 @@ print(
     "[rag_client] defaults → "
     f"max_pages={CRAWL_MAX_PAGES}, deadline_s={CRAWL_DEADLINE_S}, max_depth={CRAWL_MAX_DEPTH}, "
     f"embed_model={OPENAI_MODEL}, vector_size={VECTOR_SIZE}, collection={QDRANT_COLLECTION}, "
-    f"site_concurrency={SITE_CONCURRENCY}, limit_per_call={LIMIT_PER_CALL}"
+    f"site_concurrency={SITE_CONCURRENCY}, limit_per_call={LIMIT_PER_CALL}, "
+    f"chunk_tokens={RAG_CHUNK_TOKENS}, overlap={RAG_CHUNK_OVERLAP}"
 )
 
 # ========================= Clients ================================
@@ -87,7 +92,7 @@ def ensure_collection(dim: int = VECTOR_SIZE):
             vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
         )
 
-# ---- NOVO: garantir índice de payload para 'namespace' (necessário ao filtro) ----
+# ---- payload index p/ namespace (filtro rápido) ----
 def ensure_payload_indexes():
     try:
         qdrant.create_payload_index(
@@ -97,7 +102,6 @@ def ensure_payload_indexes():
         )
         print("[rag_client] payload index 'namespace' criado (KEYWORD)")
     except Exception as e:
-        # Já existe ou a API devolveu 409 — ignoramos
         print(f"[rag_client] payload index 'namespace' pode já existir: {e}")
 
 ensure_collection(VECTOR_SIZE)
@@ -140,38 +144,68 @@ def _uuid_for_chunk(namespace: str, url: str, idx: int) -> str:
     base = f"{namespace}|{url}|{idx}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
 
-# =================== Texto / embeddings ===========================
-def _chunk_text(text: str, max_tokens: int = 450) -> List[str]:
-    parts, buf, count = [], [], 0
-    for sent in text.split(". "):
-        t = sent.strip()
-        if not t:
-            continue
-        toks = len(t.split())
-        if count + toks > max_tokens and buf:
-            parts.append(". ".join(buf))
-            buf, count = [], 0
-        buf.append(t)
-        count += toks
-    if buf:
-        parts.append(". ".join(buf))
-    return parts
-
-def _embed_texts(texts: List[str]) -> List[List[float]]:
-    if not texts:
+# =================== Chunking / embeddings ========================
+def _chunks_for_embedding(text: str, max_tokens: int = RAG_CHUNK_TOKENS, overlap: int = RAG_CHUNK_OVERLAP) -> Iterable[str]:
+    """
+    Divide 'text' em segmentos <= max_tokens com sobreposição 'overlap'.
+    Usa tiktoken se disponível; caso contrário, fallback aproximado por caracteres (~4 chars/token).
+    """
+    text = (text or "").strip()
+    if not text:
         return []
-    resp = openai_client.embeddings.create(model=OPENAI_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
+
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        toks = enc.encode(text)
+        step = max(1, max_tokens - overlap)
+        for i in range(0, len(toks), step):
+            yield enc.decode(toks[i:i + max_tokens])
+    except Exception:
+        # Fallback grosseiro: ~4 chars ≈ 1 token
+        max_chars = max_tokens * 4
+        step = max(1, (max_tokens - overlap) * 4)
+        for i in range(0, len(text), step):
+            yield text[i:i + max_chars]
+
+def _embed_texts(texts: List[str], batch_size: int = 128) -> List[List[float]]:
+    """
+    Cria embeddings em batches. Protege contra inputs vazios.
+    """
+    out: List[List[float]] = []
+    buf = [t if isinstance(t, str) else "" for t in (texts or [])]
+    buf = [t for t in buf if t.strip()]
+    if not buf:
+        return out
+
+    for i in range(0, len(buf), batch_size):
+        batch = buf[i:i + batch_size]
+        # Retry leve
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = openai_client.embeddings.create(model=OPENAI_MODEL, input=batch)
+                out.extend([d.embedding for d in resp.data])
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.6)
+        if last_err:
+            raise last_err
+    return out
 
 # ====================== Núcleo de ingest ==========================
 def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
-    chunks = _chunk_text(full_text)
+    # 1) chunking por tokens (seguro para modelos 8k)
+    chunks = list(_chunks_for_embedding(full_text, RAG_CHUNK_TOKENS, RAG_CHUNK_OVERLAP))
     if not chunks:
         return 0
 
+    # 2) embeddings em batch
     vecs = _embed_texts(chunks)
 
-    # sanity-check dimensão
+    # 3) sanity-check dimensão da coleção
     if vecs:
         embed_dim = len(vecs[0])
         if embed_dim != VECTOR_SIZE:
@@ -186,12 +220,13 @@ def _ingest(namespace: str, url: str, title: str, full_text: str) -> int:
                     f"Ativa QDRANT_AUTO_MIGRATE=1 ou recria coleção manualmente."
                 )
 
+    # 4) upsert em batches
     points: List[qm.PointStruct] = []
     for idx, (c, v) in enumerate(zip(chunks, vecs)):
         points.append(qm.PointStruct(
             id=_uuid_for_chunk(namespace, url, idx),
             vector=v,
-            payload={"url": url, "title": title, "text": c, "namespace": namespace}
+            payload={"url": url, "title": title, "text": c, "namespace": namespace, "chunk_idx": idx}
         ))
 
     total = 0
@@ -248,7 +283,6 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
                 u = f"https://drive.google.com/uc?export=download&id={file_id}"
 
     try:
-        # NÃO usar _clean_url; manter os query params
         r = requests.get(u, timeout=FETCH_TIMEOUT_S + 30, headers=DEFAULT_HEADERS, allow_redirects=True)
         r.raise_for_status()
     except Exception as e:
@@ -260,8 +294,8 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     except Exception as e:
         return {"ok": False, "error": f"pdf_open_failed: {e}", "url": u}
 
-    # Extrair texto (se o PDF for “scan” sem texto, devolve aviso)
-    pages_text = []
+    # Extrair texto por página e concatenar (depois será chunkado por tokens em _ingest)
+    pages_text: List[str] = []
     for page in doc:
         try:
             pages_text.append(page.get_text() or "")
