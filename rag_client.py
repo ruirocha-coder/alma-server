@@ -259,22 +259,26 @@ def ingest_url(page_url: str, namespace: str = "default", deadline_s: int = 55) 
             time.sleep(max(SITEMAP_SLEEP_MS, 0) / 1000.0)
     return {"ok": False, "error": f"fetch_failed: {err}", "url": u}
 
+
+# --- tuning opcional por env ---
+PDF_PAGES_PER_BATCH = int(os.getenv("PDF_PAGES_PER_BATCH", "200"))  # nº de páginas por lote (200)
+PDF_MAX_PAGES       = int(os.getenv("PDF_MAX_PAGES", "3000"))       # corta PDFs absurdos
+PDF_SKIP_EMPTY      = os.getenv("PDF_SKIP_EMPTY", "1") in ("1","true","yes")
+
 def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "default") -> Dict:
     """
-    Ingest de um PDF remoto. Suporta Google Drive:
-    - https://drive.google.com/file/d/<ID>/view  ->  https://drive.google.com/uc?export=download&id=<ID>
-    - https://drive.google.com/uc?export=download&id=<ID> (mantém)
-    IMPORTANTE: NÃO usar _clean_url aqui, para não perder query params (id=...).
+    Ingest de PDF remoto em LOTES de páginas (streaming), para evitar limites de tokens/memória.
+    Mantém a mesma API externa. IDs não colidem porque o URL leva sufixo com o intervalo de páginas.
     """
     import re
-    import fitz
+    import fitz  # PyMuPDF
 
     if not pdf_url:
         return {"ok": False, "error": "missing_pdf_url"}
 
     u = pdf_url.strip()
 
-    # Reescrever Google Drive /file/d/.../view => /uc?export=download&id=...
+    # Normalizar Google Drive (view/open -> uc?export=download&id=...)
     if "drive.google.com" in u:
         if "/uc?" not in u or "id=" not in u:
             m = re.search(r"/d/([A-Za-z0-9_-]{20,})", u) or re.search(r"[?&]id=([A-Za-z0-9_-]{20,})", u)
@@ -282,8 +286,9 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
                 file_id = m.group(1)
                 u = f"https://drive.google.com/uc?export=download&id={file_id}"
 
+    # Download
     try:
-        r = requests.get(u, timeout=FETCH_TIMEOUT_S + 30, headers=DEFAULT_HEADERS, allow_redirects=True)
+        r = requests.get(u, timeout=FETCH_TIMEOUT_S + 60, headers=DEFAULT_HEADERS, allow_redirects=True)
         r.raise_for_status()
     except Exception as e:
         return {"ok": False, "error": f"fetch_failed: {e}", "url": u}
@@ -294,20 +299,54 @@ def ingest_pdf_url(pdf_url: str, title: Optional[str] = None, namespace: str = "
     except Exception as e:
         return {"ok": False, "error": f"pdf_open_failed: {e}", "url": u}
 
-    # Extrair texto por página e concatenar (depois será chunkado por tokens em _ingest)
-    pages_text: List[str] = []
-    for page in doc:
+    total_pages = min(getattr(doc, "page_count", len(doc) if hasattr(doc, "__len__") else 0), PDF_MAX_PAGES)
+    if total_pages == 0:
+        return {"ok": True, "url": u, "count": 0, "warning": "pdf_has_no_pages"}
+
+    # Processar por lotes de 200
+    per = max(1, PDF_PAGES_PER_BATCH)
+    grand_total_chunks = 0
+    batches_info: List[Dict] = []
+
+    for start in range(0, total_pages, per):
+        end = min(start + per, total_pages)
+        texts: List[str] = []
+
+        for p in range(start, end):
+            try:
+                t = doc[p].get_text() or ""
+            except Exception:
+                t = ""
+            if PDF_SKIP_EMPTY and not t.strip():
+                continue
+            if t.strip():
+                texts.append(f"[Página {p+1}] {t.strip()}")
+
+        if not texts:
+            batches_info.append({"range": [start+1, end], "chunks": 0, "skipped": True})
+            continue
+
+        url_with_range = f"{pdf_url}#p{start+1}-{end}"
+        chunk_title = (title or pdf_url)
+
         try:
-            pages_text.append(page.get_text() or "")
-        except Exception:
-            pages_text.append("")
-    full = " ".join(pages_text).strip()
+            count = _ingest(namespace, url_with_range, chunk_title, "\n\n".join(texts))
+            grand_total_chunks += count
+            batches_info.append({"range": [start+1, end], "chunks": count})
+        except Exception as e:
+            batches_info.append({"range": [start+1, end], "error": str(e)})
+            # continua nos lotes seguintes
 
-    if not full:
-        return {"ok": True, "url": u, "count": 0, "warning": "pdf_has_no_extractable_text"}
+    return {
+        "ok": True,
+        "url": u,
+        "title": title or None,
+        "pages": total_pages,
+        "pages_per_batch": per,
+        "count": grand_total_chunks,
+        "batches": batches_info,
+    }
 
-    count = _ingest(namespace, pdf_url, title or pdf_url, full)
-    return {"ok": True, "url": u, "count": count}
 
 # ====================== Sitemap (com cursor/limite) ================
 def ingest_sitemap(
