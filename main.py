@@ -347,7 +347,7 @@ async def echo(request: Request):
 def ping_grok():
     try:
         msg = [{"role": "user", "content": "Diz apenas: pong"}]
-        content = grok_chat(msg, timeout=20)
+        content = grok_chat(msg, timeout=120)
         return {"ok": True, "reply": content}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -746,6 +746,82 @@ async def rag_search_post(request: Request):
         return {"ok": True, "matches": matches, "context_block": ctx}
     except Exception as e:
         return {"ok": False, "error": "search_failed", "detail": str(e)}
+
+# --- Proxy: extrair URLs (sitemap.xml, HTML ou texto colado) -----------------
+import xml.etree.ElementTree as ET
+
+@app.post("/rag/extract-urls")
+async def rag_extract_urls(request: Request):
+    """
+    Body:
+      { "url": "https://...",  # opcional
+        "text": "...",         # opcional (HTML/XML copiado)
+        "max_urls": 5000 }
+    """
+    try:
+        data = await request.json()
+        url = (data.get("url") or "").strip()
+        raw_text = data.get("text")
+        max_urls = int(data.get("max_urls") or 5000)
+
+        if not url and not raw_text:
+            return {"ok": False, "error": "fornece 'url' ou 'text'"}
+
+        # 1) obter texto
+        if url:
+            r = requests.get(url, headers={"User-Agent": "AlmaBot/1.0 (+rag)"},
+                             timeout=30)
+            r.raise_for_status()
+            raw_text = r.text
+
+        if not raw_text:
+            return {"ok": False, "error": "sem conteúdo"}
+
+        # 2) extrair URLs
+        urls = []
+
+        def dedup_keep(seq):
+            seen = set()
+            out = []
+            for u in seq:
+                u = (u or "").strip()
+                if not u or len(u) > 2048: 
+                    continue
+                if u in seen: 
+                    continue
+                seen.add(u)
+                out.append(u)
+                if len(out) >= max_urls: 
+                    break
+            return out
+
+        txt = raw_text
+
+        # sitemap XML?
+        if ("<urlset" in txt) or ("<sitemapindex" in txt):
+            try:
+                root = ET.fromstring(txt)
+                locs = [ (el.text or "").strip() 
+                         for el in root.findall(".//{*}loc") ]
+                urls = dedup_keep(locs)
+                return {"ok": True, "type": "sitemap", "count": len(urls), "urls": urls[:max_urls]}
+            except Exception:
+                # fallback regex
+                import re
+                locs = re.findall(r"<loc>(.*?)</loc>", txt, flags=re.I|re.S)
+                urls = dedup_keep(locs)
+                return {"ok": True, "type": "sitemap-regex", "count": len(urls), "urls": urls[:max_urls]}
+
+        # HTML normal → hrefs
+        import re
+        hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', txt, flags=re.I)
+        urls = dedup_keep(hrefs)
+        return {"ok": True, "type": "html", "count": len(urls), "urls": urls[:max_urls]}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
