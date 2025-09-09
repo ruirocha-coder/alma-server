@@ -183,7 +183,7 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
-      <!-- Extrair URLs do Sitemap (cliente) -->
+      <!-- Extrair URLs do Sitemap (com fallback) -->
       <div class="tile">
         <h3>Extrair URLs do Sitemap</h3>
         <div class="inline">
@@ -195,10 +195,10 @@
         <div class="row" style="justify-content:flex-end;gap:8px">
           <button id="btnCopyExtract" class="btn" disabled>Copiar tudo</button>
         </div>
-        <div class="tiny">Se o site bloquear CORS, usa o tile “Ingestão via Sitemap”.</div>
+        <div class="tiny">Tenta primeiro no servidor. Se falhar, cai para extração no cliente (pode falhar por CORS).</div>
       </div>
 
-      <!-- NOVO: Ingerir em lote (lista de URLs) -->
+      <!-- Ingerir em lote (lista de URLs) -->
       <div class="tile">
         <h3>Ingerir em lote (lista de URLs)</h3>
         <textarea id="batchUrls" placeholder="Cola aqui uma URL por linha…"></textarea>
@@ -333,36 +333,66 @@
 
   $('#clearLogsBtn').addEventListener('click', ()=>{ printResult('{}'); setBadges([]); setTask('—'); });
 
-  // ------- Extrair URLs (cliente) -------
+  // ------- Extrair URLs (servidor com fallback cliente) -------
   $('#btnExtractSitemap').addEventListener('click', async ()=>{
     const sitemap_url = $('#sitemap_extract_url').value.trim();
     const outTA = $('#extractOutput'); const resBox = $('#resExtract');
     if (!sitemap_url) return;
+
     setTask(`ação: extrair-urls   sitemap: ${sitemap_url}`);
     setBadges([`Sitemap: ${sitemap_url}`]); startTimer();
     $('#btnExtractSitemap').disabled = true; $('#btnCopyExtract').disabled = true;
     outTA.value = ''; resBox.textContent = 'A extrair…';
+
+    // 1) tenta no servidor
+    let usedServer = false;
     try{
-      async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
-      const seen=new Set(), urls=[];
-      async function walk(u){ if(seen.has(u)) return; seen.add(u);
-        const doc=await fetchXml(u);
-        urls.push(...[...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean));
-        for (const s of [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean)) await walk(s);
+      const srv = await postJSON('/rag/extract-urls', { url: sitemap_url, max_urls: 20000 });
+      if (srv && srv.ok && Array.isArray(srv.urls) && srv.urls.length){
+        usedServer = true;
+        stopTimer();
+        smallRes(resBox,{ via:'server', type:srv.type, count:srv.count, examples:srv.urls.slice(0,3) });
+        outTA.value = srv.urls.join('\n');
+        $('#btnCopyExtract').disabled = srv.urls.length===0;
+        try{ await navigator.clipboard.writeText(outTA.value); }catch{}
+        printResult({ ok:true, via:'server', count:srv.urls.length });
       }
-      await walk(sitemap_url); stopTimer();
-      smallRes(resBox,{count:urls.length,examples:urls.slice(0,3)});
-      outTA.value = urls.join('\n'); $('#btnCopyExtract').disabled = urls.length===0;
-      if (urls.length){ try{ await navigator.clipboard.writeText(outTA.value); printResult({ok:true,copied:urls.length}); }catch{ printResult({ok:true,copied:false}); } }
-    }catch(e){ stopTimer(); smallRes(resBox,{error:String(e&&e.message||e)}); printResult({ok:false,error:String(e&&e.message||e)}); }
+    }catch(e){
+      // ignora e tenta cliente
+    }
+
+    // 2) fallback cliente (CORS pode falhar)
+    if (!usedServer){
+      try{
+        async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
+        const seen=new Set(), urls=[];
+        async function walk(u){ if(seen.has(u)) return; seen.add(u);
+          const doc=await fetchXml(u);
+          urls.push(...[...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean));
+          for (const s of [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean)) await walk(s);
+        }
+        await walk(sitemap_url);
+        stopTimer();
+        smallRes(resBox,{ via:'client', count:urls.length, examples:urls.slice(0,3) });
+        outTA.value = urls.join('\n'); $('#btnCopyExtract').disabled = urls.length===0;
+        try{ await navigator.clipboard.writeText(outTA.value); }catch{}
+        printResult({ ok:true, via:'client', count:urls.length });
+      }catch(e){
+        stopTimer();
+        smallRes(resBox,{ error:String(e && e.message || e) });
+        printResult({ ok:false, error:String(e && e.message || e) });
+      }
+    }
+
     $('#btnExtractSitemap').disabled = false;
   });
+
   $('#btnCopyExtract').addEventListener('click', async ()=>{
     const txt = $('#extractOutput').value; if (!txt.trim()) return;
     try{ await navigator.clipboard.writeText(txt); printResult({ok:true,copied:true,lines:txt.split('\n').filter(Boolean).length}); }catch{ printResult({ok:false,error:'Clipboard bloqueado'}); }
   });
 
-  // ------- NOVO: Ingestão em lote (com relatório em tempo real) -------
+  // ------- Ingestão em lote -------
   const state = { stop:false };
   $('#btnBatchStart').addEventListener('click', async ()=>{
     const raw = $('#batchUrls').value.trim();
@@ -400,7 +430,12 @@
       list.scrollTop = list.scrollHeight;
     }
 
-    // worker
+    async function postJSON(path, payload){
+      const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});
+      let j; try{ j = await r.json(); }catch{ j = {ok:false, http_status:r.status}; }
+      return j;
+    }
+
     async function ingestOne(u){
       const page_url = normalizeGoogleDriveLink(u);
       addLine(`→ ${page_url}`);
