@@ -3,7 +3,7 @@
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -38,8 +38,7 @@ log = logging.getLogger("alma")
 APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-3")
 
 # ---------------------------------------------------------------------------------------
-# Prompt nuclear da Alma (missão/valores/funções)
-# (⚠️ Mantém como está; podes editar o conteúdo à vontade no teu repo)
+# Prompt nuclear da Alma (mantido como está)
 # ---------------------------------------------------------------------------------------
 ALMA_MISSION = """
 És a Alma, inteligência da Boa Safra Lda (Boa Safra + Interior Guider).
@@ -87,48 +86,35 @@ Formato de resposta
 """
 
 # ---------------------------------------------------------------------------------------
-# 🔸 Prompt adicional: MODO ORÇAMENTOS (ativado apenas quando o pedido é orçamento)
+# 🔸 Prompt adicional: MODO ORÇAMENTOS
 # ---------------------------------------------------------------------------------------
 ALMA_ORCAMENTO_PROMPT = """
 Quando fores pedido para preparar um orçamento, segue estas regras:
 
-0) Restrições
-- Não envies emails nem digas que os vais enviar. Entrega o CSV diretamente no chat (ou indica o endpoint /budget/csv).
-- Apenas inclui no orçamento produtos que foram explicitamente solicitados. Não acrescentes itens por iniciativa própria.
+1) Template
+- "profissional/revenda/arquitetos/pro/com IVA" → formato PROFISSIONAL (TOTAL C/IVA).
+- Caso contrário → PÚBLICO (TOTAL S/IVA).
 
-1) Escolha do template
-- Se o pedido mencionar "profissional", "revenda", "arquitetos", "pro" ou "com IVA" → usa o formato PROFISSIONAL (coluna TOTAL C/IVA).
-- Caso contrário → usa o formato PÚBLICO (coluna TOTAL S/IVA).
+2) Campos por linha
+- REF., DESIGNAÇÃO (inclui materiais/acabamentos), QUANT., PREÇO UNI., DESC.%
+- Público: TOTAL S/IVA = QUANT × PREÇO UNI × (1 - DESC%/100)
+- Profissional: TOTAL C/IVA = TOTAL S/IVA × (1 + IVA%/100)
 
-2) Campos essenciais por linha
-- REF. (ex.: BS.01)
-- DESIGNAÇÃO (nome do produto; inclui materiais/acabamentos relevantes)
-- QUANT.
-- PREÇO UNI.
-- DESC. (% se existir)
-- Para PÚBLICO: TOTAL S/IVA = QUANT × PREÇO UNI × (1 - DESC%/100)
-- Para PROFISSIONAL: TOTAL C/IVA = TOTAL S/IVA × (1 + IVA%/100)
+3) Só perguntar o ESTRITAMENTE necessário (ex.: quantidade, cor/variante, desconto) para identificar o artigo ou calcular.
 
-3) Campos opcionais (só se fizerem falta ou se vierem no pedido)
-- Dimensões
-- Material/Acabamento/Cor
-- Marca
-- Link do produto (preferir sempre interiorguider.com; formata como [ver produto](URL))
+4) Links de produto
+- Preferir sempre interiorguider.com; não inventar caminhos; evitar "/product/...".
 
-4) Regras de pergunta
-- Não perguntes por tudo; questiona apenas o que está em falta e é necessário para identificar o artigo
-  ou calcular o total (ex.: quantidade, cor, variante, desconto).
-
-5) Saída
-- Gera a tabela no chat (pré-visualização). Oferece exportação CSV (não e-mail).
+5) Saída no chat
+- Mostra apenas uma pré-visualização resumida (sem blocos ``` e sem markdown nas células).
+- Se o utilizador pedir CSV, diz para usar o endpoint POST /budget/csv com o JSON atual — não digas “enviei por email”.
 
 6) Estilo
-- Objetivo e conciso. No fim, propõe uma única próxima ação útil
-  (ex.: “Exporto já em CSV?”).
+- Conciso, objetivo; termina com uma única próxima ação útil.
 """
 
 # ---------------------------------------------------------------------------------------
-# RAG (qdrant + openai embeddings) — usa rag_client.py
+# RAG (qdrant + openai embeddings)
 # ---------------------------------------------------------------------------------------
 try:
     from rag_client import (
@@ -147,7 +133,7 @@ RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
 DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None
 
 # ---------------------------------------------------------------------------------------
-# Mem0 (curto prazo) — opcional; se falhar cai em fallback local
+# Mem0 (curto prazo)
 # ---------------------------------------------------------------------------------------
 MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
 MEM0_API_KEY = (os.getenv("MEM0_API_KEY") or "").strip()
@@ -183,7 +169,7 @@ if MEM0_ENABLE:
                 mem0_client = None
 
 # ---------------------------------------------------------------------------------------
-# Fallback local (se Mem0 off) — curto prazo + FACTs
+# Fallback local (se Mem0 off)
 # ---------------------------------------------------------------------------------------
 LOCAL_FACTS: Dict[str, Dict[str, str]] = {}
 LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}
@@ -368,7 +354,7 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
-# DETETOR: pedido de orçamento
+# DETETORES
 # ---------------------------------------------------------------------------------------
 def _is_budget_request(text: str) -> bool:
     if not text:
@@ -381,50 +367,38 @@ def _is_budget_request(text: str) -> bool:
     return any(k in t for k in keys)
 
 # ---------------------------------------------------------------------------------------
-# 🔧 PATCH DE LINKS — normaliza URLs de produtos do interiorguider.com
+# 🔒 SANITIZADOR DE SAÍDA (chat) PARA ORÇAMENTOS
 # ---------------------------------------------------------------------------------------
-_IG_DOM_RE = re.compile(r"^(https?://)(?:www\.)?interiorguider\.com(?P<path>/.*)?$", re.IGNORECASE)
+CSV_FENCE_RE = re.compile(r"```.*?```", re.S)
+MD_LINK_RE = re.compile(r"$begin:math:display$([^$end:math:display$]+)\]$begin:math:text$(https?://[^)]+)$end:math:text$")
 
-def _fix_ig_links(text: str) -> str:
+def enforce_budget_output_policies(text: str) -> str:
     """
-    Corrige URLs inventados com /product/ ou /products/ e preserva
-    o resto do caminho. Funciona em texto simples e dentro de links Markdown.
+    - Remove blocos ```...```
+    - Converte links markdown para 'Texto — URL'
+    - Troca promessas de email por instrução do endpoint
+    - Substitui frases tipo “Aqui está o orçamento exportado em formato CSV…” por nota curta
     """
     if not text:
         return text
+    t = text
 
-    # 1) Corrigir links Markdown: [label](url)
-    def _md_sub(m):
-        label = m.group(1)
-        url = m.group(2)
-        url = _fix_single_url(url)
-        return f"[{label}]({url})"
+    # 1) remover blocos fenced (``` ... ```)
+    if "```" in t:
+        t = CSV_FENCE_RE.sub("[Pré-visualização: usa o endpoint /budget/csv para obter o ficheiro.]\n", t)
 
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _md_sub, text)
+    # 2) links markdown → texto — URL (evita link “invisível” em markdown)
+    t = MD_LINK_RE.sub(r"\1 — \2", t)
 
-    # 2) Corrigir URLs “soltos” no texto
-    def _url_sub(m):
-        url = m.group(0)
-        return _fix_single_url(url)
+    # 3) proibir promessas/envios por email
+    t = re.sub(r"(?i)(vou|posso|irei|acabei de|já) (enviar|mandar).{0,20}e-?mail", 
+               "posso gerar o ficheiro CSV via POST /budget/csv", t)
 
-    text = re.sub(r"https?://[^\s)]+", _url_sub, text)
+    # 4) frases de “aqui está o csv”
+    t = re.sub(r"(?i)aqui está o orçamento.*?csv.*?:?", 
+               "Pré-visualização pronta. Para o ficheiro, usa POST /budget/csv.", t)
 
-    return text
-
-def _fix_single_url(url: str) -> str:
-    try:
-        m = _IG_DOM_RE.match(url)
-        if not m:
-            return url  # não é interiorguider.com
-        path = m.group("path") or "/"
-        # remove /product/ ou /products/ apenas se for exatamente esse segmento inicial
-        path = re.sub(r"^/(?:product|products)/", "/", path, flags=re.IGNORECASE)
-        # normaliza barras duplas
-        path = re.sub(r"//+", "/", path)
-        fixed = f"https://interiorguider.com{path}"
-        return fixed
-    except Exception:
-        return url
+    return t
 
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS
@@ -461,6 +435,7 @@ def status_json():
             "rag_ingest_text": "POST /rag/ingest-text",
             "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
             "rag_search_post": "POST /rag/search {query, namespace?, top_k?}",
+            "budget_preview": "POST /budget/preview",
             "budget_csv": "POST /budget/csv"
         }
     }
@@ -489,21 +464,6 @@ def ping_grok():
         return {"ok": True, "reply": content}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-# ---------------------------------------------------------------------------------------
-# Memória contextual (FACTs) e Mem0 debug
-# ---------------------------------------------------------------------------------------
-@app.get("/mem/facts")
-def mem_facts(user_id: str = "anon"):
-    facts = mem0_get_facts(user_id=user_id, limit=50)
-    return {"user_id": user_id, "facts": facts}
-
-@app.get("/mem/search")
-def mem_search_route(q: str = "", user_id: str = "anon"):
-    if not q:
-        return {"user_id": user_id, "found": 0, "snippets": []}
-    snippets = _mem0_search(q, user_id=user_id, limit=10) or local_search_snippets(user_id, limit=10)
-    return {"user_id": user_id, "found": len(snippets), "snippets": snippets}
 
 # ---------------------------------------------------------------------------------------
 # RAG: GET /rag/search (debug)
@@ -605,9 +565,13 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, q, namespace)
     try:
         answer = grok_chat(messages)
-        answer = _fix_ig_links(answer)  # 🔧 PATCH de links
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    # 🔒 Sanitização de saída para pedidos de orçamento
+    if _is_budget_request(q):
+        answer = enforce_budget_output_policies(answer)
+
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -633,10 +597,13 @@ async def ask(request: Request):
 
     try:
         answer = grok_chat(messages)
-        answer = _fix_ig_links(answer)  # 🔧 PATCH de links
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    # 🔒 Sanitização de saída para pedidos de orçamento
+    if _is_budget_request(question):
+        answer = enforce_budget_output_policies(answer)
 
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -832,7 +799,7 @@ async def rag_search_post(request: Request):
     except Exception as e:
         return {"ok": False, "error": "search_failed", "detail": str(e)}
 
-# --- Proxy: extrair URLs (sitemap.xml, HTML ou texto colado) -----------------
+# --- Proxy: extrair URLs (sitemap.xml, HTML ou texto colado)
 import xml.etree.ElementTree as ET
 
 @app.post("/rag/extract-urls")
@@ -888,6 +855,38 @@ async def rag_extract_urls(request: Request):
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
+# 🔸 Pré-visualização (chat) — sem ficheiro
+# ---------------------------------------------------------------------------------------
+@app.post("/budget/preview")
+async def budget_preview(request: Request):
+    data = await request.json()
+    mode = (data.get("mode") or "public").lower().strip()
+    iva_pct = float(data.get("iva_pct", 23))
+    rows = data.get("rows") or []
+    if mode not in ("public", "pro"):
+        return PlainTextResponse("mode deve ser 'public' ou 'pro'", status_code=400)
+    if not rows:
+        return PlainTextResponse("rows vazio", status_code=400)
+
+    out = []
+    for r in rows:
+        quant = int(r.get("quant") or 1)
+        preco = float(r.get("preco_uni") or 0)
+        desc  = float(r.get("desc_pct") or 0)
+        total_si = quant * preco * (1 - desc/100)
+        total = total_si if mode == "public" else total_si * (1 + iva_pct/100.0)
+        out.append({
+            "ref": r.get("ref") or "",
+            "descricao": r.get("descricao") or "",
+            "quant": quant,
+            "preco_uni": round(preco, 2),
+            "desc_pct": round(desc, 2) if desc else 0,
+            "total": round(total, 2),
+            "link": r.get("link") or ""
+        })
+    return JSONResponse({"mode": mode, "iva_pct": iva_pct, "items": out})
+
+# ---------------------------------------------------------------------------------------
 # 🔸 Exportação CSV de Orçamentos
 # ---------------------------------------------------------------------------------------
 def _safe_float(v, default=0.0):
@@ -903,28 +902,6 @@ def _format_money(x: float) -> str:
 
 @app.post("/budget/csv")
 async def budget_csv(request: Request):
-    """
-    Body esperado:
-    {
-      "mode": "public" | "pro",       # public => TOTAL S/IVA ; pro => TOTAL C/IVA
-      "iva_pct": 23,                  # obrigatório para 'pro' se quiser cálculo correto
-      "rows": [
-        {
-          "ref": "BS.01",
-          "descricao": "Produto — Nome / Material / Cor",
-          "quant": 1,
-          "preco_uni": 100,
-          "desc_pct": 5,              # opcional
-          "dim": "80x40xH45",
-          "material": "Carvalho / Óleo natural",
-          "marca": "Boa Safra",
-          "link": "https://interiorguider.com/..."
-        },
-        ...
-      ]
-    }
-    Devolve um ficheiro CSV pronto para importar no Google Sheets (Público ou Profissional).
-    """
     data = await request.json()
     mode = (data.get("mode") or "public").lower().strip()
     iva_pct = _safe_float(data.get("iva_pct", 23.0))
@@ -935,13 +912,11 @@ async def budget_csv(request: Request):
     if not isinstance(rows, list) or not rows:
         return PlainTextResponse("rows vazio", status_code=400)
 
-    # Cabeçalhos conforme template
     if mode == "public":
         headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA"]
     else:
         headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL C/IVA"]
 
-    # Escrever CSV em memória
     sio = StringIO()
     writer = csv.writer(sio)
     writer.writerow(headers)
@@ -952,14 +927,13 @@ async def budget_csv(request: Request):
         preco_uni = _safe_float(r.get("preco_uni"), 0.0)
         desc_pct = _safe_float(r.get("desc_pct"), 0.0)
 
-        # Montar designação detalhada
         desc_main = (r.get("descricao") or "").strip() or "Produto"
         extra_lines = []
         if r.get("dim"): extra_lines.append(f"Dimensões: {r['dim']}")
         if r.get("material"): extra_lines.append(f"Material/Acabamento: {r['material']}")
         if r.get("marca"): extra_lines.append(f"Marca: {r['marca']}")
         if r.get("link"):
-            link = _fix_single_url(str(r["link"]).strip())  # normaliza IG
+            link = str(r["link"]).strip()
             extra_lines.append(f"Link: {link}")
         full_desc = desc_main + (("\n" + "\n".join(extra_lines)) if extra_lines else "")
 
@@ -979,7 +953,7 @@ async def budget_csv(request: Request):
             total_col
         ])
 
-    csv_bytes = sio.getvalue().encode("utf-8-sig")  # BOM para Excel/Sheets
+    csv_bytes = sio.getvalue().encode("utf-8-sig")
     fname = f"orcamento_{mode}_{int(time.time())}.csv"
     fpath = os.path.join("/tmp", fname)
     with open(fpath, "wb") as f:
