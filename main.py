@@ -3,8 +3,8 @@
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles   # <--- novo para servir ficheiros estáticos
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 import os
 import requests
@@ -12,6 +12,8 @@ import logging
 import uvicorn
 import time
 import re
+import csv
+from io import StringIO
 from typing import Dict, List, Tuple, Optional
 
 # ---------------------------------------------------------------------------------------
@@ -35,11 +37,9 @@ log = logging.getLogger("alma")
 
 APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-3")
 
-
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma (missão/valores/funções)
 # ---------------------------------------------------------------------------------------
-
 ALMA_MISSION = """
 És a Alma, inteligência da Boa Safra Lda (Boa Safra + Interior Guider).
 A tua missão é apoiar a direção (Rui Rocha) e a equipa para que a empresa
@@ -76,12 +76,52 @@ Contexto
 - Boa Safra: editora de design natural português para a casa, com coleção própria.
 - Interior Guider (2025): design de interiores com perspetiva psicoestética e marcas parceiras.
 
+Links de produtos
+- Sempre que mencionares produtos, inclui um link para a página do produto no site interiorguider.com
+  quando existir. Se existirem vários links, escolhe o do interiorguider.com.
+
 Formato de resposta
 - 1 bloco curto; usa bullets apenas quando ajudam a agir.
 - Termina com 1 próxima ação concreta (p.ex.: “Queres que valide o prazo com o fornecedor?”).
 """
 
+# ---------------------------------------------------------------------------------------
+# 🔸 Prompt adicional: MODO ORÇAMENTOS (ativado apenas quando o pedido é orçamento)
+# ---------------------------------------------------------------------------------------
+ALMA_ORCAMENTO_PROMPT = """
+Quando fores pedido para preparar um orçamento, segue estas regras:
 
+1) Escolha do template
+- Se o pedido mencionar "profissional", "revenda", "arquitetos", "pro" ou "com IVA" → usa o formato PROFISSIONAL (coluna TOTAL C/IVA).
+- Caso contrário → usa o formato PÚBLICO (coluna TOTAL S/IVA).
+
+2) Campos essenciais por linha
+- REF. (ex.: BS.01)
+- DESIGNAÇÃO (nome do produto; inclui materiais/acabamentos relevantes)
+- QUANT.
+- PREÇO UNI.
+- DESC. (% se existir)
+- Para PÚBLICO: TOTAL S/IVA = QUANT × PREÇO UNI × (1 - DESC%/100)
+- Para PROFISSIONAL: TOTAL C/IVA = TOTAL S/IVA × (1 + IVA%/100)
+
+3) Campos opcionais (só se fizerem falta ou se vierem no pedido)
+- Dimensões
+- Material/Acabamento/Cor
+- Marca
+- Link do produto (preferir sempre interiorguider.com)
+
+4) Regras de pergunta
+- Não perguntes por tudo; questiona apenas o que está em falta e é necessário para identificar o artigo
+  ou calcular o total (ex.: quantidade, cor, variante, desconto).
+
+5) Saída
+- Gera a tabela no chat (para pré-visualização) e oferece exportação CSV.
+- Ao apresentar produtos, inclui o link do interiorguider.com sempre que exista.
+
+6) Estilo
+- Objetivo e conciso. No fim, propõe uma única próxima ação útil
+  (ex.: “Exporto já em CSV?”).
+"""
 
 # ---------------------------------------------------------------------------------------
 # RAG (qdrant + openai embeddings) — usa rag_client.py
@@ -100,7 +140,6 @@ except Exception as e:
 
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
 RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
-# Namespace por omissão para pesquisas/respostas
 DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None  # p.ex. "site_boasafra"
 
 # ---------------------------------------------------------------------------------------
@@ -118,12 +157,10 @@ if MEM0_ENABLE:
     else:
         try:
             try:
-                # PyPI antigo
                 import mem0ai as _mem0_pkg
                 from mem0ai import MemoryClient as _MC
                 pkg_name = "mem0ai"
             except Exception:
-                # PyPI recente
                 import mem0 as _mem0_pkg
                 from mem0 import MemoryClient as _MC
                 pkg_name = "mem0"
@@ -144,8 +181,8 @@ if MEM0_ENABLE:
 # ---------------------------------------------------------------------------------------
 # Fallback local (se Mem0 off) — curto prazo + FACTs
 # ---------------------------------------------------------------------------------------
-LOCAL_FACTS: Dict[str, Dict[str, str]] = {}            # user_id -> {key: value}
-LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}   # user_id -> [(question, answer), ...]
+LOCAL_FACTS: Dict[str, Dict[str, str]] = {}
+LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}
 
 def local_set_fact(user_id: str, key: str, value: str):
     LOCAL_FACTS.setdefault(user_id, {})
@@ -163,7 +200,7 @@ def local_append_dialog(user_id: str, question: str, answer: str, cap: int = 50)
 def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
     items = LOCAL_HISTORY.get(user_id, [])
     out = []
-    for q, a in reversed(items[-limit*2:]):  # heuristic
+    for q, a in reversed(items[-limit*2:]):
         if len(out) >= limit: break
         out.append(f"User: {q}")
         if len(out) >= limit: break
@@ -171,15 +208,15 @@ def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
     return out[:limit]
 
 # ---------------------------------------------------------------------------------------
-# Helpers Mem0 compat (algumas versões usam .memories, outras métodos diretos)
+# Helpers Mem0 compat
 # ---------------------------------------------------------------------------------------
 def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
     if not (MEM0_ENABLE and mem0_client):
         return
     try:
-        if hasattr(mem0_client, "memories"):  # API com namespace .memories
+        if hasattr(mem0_client, "memories"):
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
-        else:  # API com métodos diretos
+        else:
             mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
     except Exception as e:
         log.warning(f"[mem0] create falhou: {e}")
@@ -209,15 +246,9 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
 
-# --- sessão HTTP global (keep-alive + pequeno pool) ---
 _session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=8,
-    pool_maxsize=8,
-    max_retries=0
-)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+_session.mount("https://", _adapter); _session.mount("http://", _adapter)
 
 def grok_chat(messages, timeout=120):
     if not XAI_API_KEY:
@@ -234,7 +265,7 @@ def grok_chat(messages, timeout=120):
     return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
 
 # ---------------------------------------------------------------------------------------
-# Memória Contextual (FACTs) — extração simples
+# Memória Contextual (FACTs)
 # ---------------------------------------------------------------------------------------
 FACT_PREFIX = "FACT|"
 
@@ -259,7 +290,6 @@ ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", 
 def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
     facts: Dict[str, str] = {}
     t = " " + text.strip() + " "
-    # nome
     for pat in NAME_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
@@ -269,7 +299,6 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
             else:
                 facts["name"] = name
                 break
-    # cidade/local
     for pat in CITY_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
@@ -277,7 +306,6 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
             if 2 <= len(city) <= 60:
                 facts["location"] = city
                 break
-    # preferências
     for pat in PREF_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
@@ -285,7 +313,6 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
             if 3 <= len(pref) <= 80:
                 facts.setdefault("preferences", pref)
                 break
-    # divisão
     for kw in ROOM_KEYWORDS:
         if re.search(rf"\b{re.escape(kw)}\b", t, flags=re.IGNORECASE):
             facts["room"] = kw
@@ -337,9 +364,21 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
+# DETETORES
+# ---------------------------------------------------------------------------------------
+def _is_budget_request(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    keys = [
+        "orçamento", "orcamento", "budget", "cotação", "cotacao",
+        "proposta", "quote", "preço total", "quanto fica", "fazer orçamento"
+    ]
+    return any(k in t for k in keys)
+
+# ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS
 # ---------------------------------------------------------------------------------------
-# NOVO: "/" serve a landing page (index.html). O JSON antigo foi movido para /status.
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
     try:
@@ -371,7 +410,8 @@ def status_json():
             "rag_ingest_url": "POST /rag/ingest-url",
             "rag_ingest_text": "POST /rag/ingest-text",
             "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
-            "rag_search_post": "POST /rag/search {query, namespace?, top_k?}"
+            "rag_search_post": "POST /rag/search {query, namespace?, top_k?}",
+            "budget_csv": "POST /budget/csv"
         }
     }
 
@@ -412,7 +452,6 @@ def mem_facts(user_id: str = "anon"):
 def mem_search_route(q: str = "", user_id: str = "anon"):
     if not q:
         return {"user_id": user_id, "found": 0, "snippets": []}
-    # usa Mem0 se houver; senão, fallback local
     snippets = _mem0_search(q, user_id=user_id, limit=10) or local_search_snippets(user_id, limit=10)
     return {"user_id": user_id, "found": len(snippets), "snippets": snippets}
 
@@ -454,30 +493,25 @@ def serve_alma_chat():
 # ---------------------------------------------------------------------------------------
 # 🔗 Pipeline Alma: Mem0 → RAG → Grok
 # ---------------------------------------------------------------------------------------
-
 def build_messages_with_memory_and_rag(
     user_id: str,
     question: str,
     namespace: Optional[str]
 ):
-    # 0) Deteção e armazenamento de FACTs (a partir da pergunta atual)
+    # 0) FACTs
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 1) Carregar FACTs existentes (perfil contextual)
+    # 1) Perfil contextual
     facts = mem0_get_facts(user_id)
     facts_block = facts_to_context_block(facts)
 
-    # 2) Curto prazo (Mem0 → fallback local)
-    short_snippets = _mem0_search(question, user_id=user_id, limit=5)
-    if not short_snippets:
-        short_snippets = local_search_snippets(user_id, limit=5)
-    memory_block = ""
-    if short_snippets:
-        memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3])
+    # 2) Curto prazo
+    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
+    memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
-    # 3) RAG (sempre tentamos — se não houver resultados, segue sem)
+    # 3) RAG
     rag_block = ""
     rag_used = False
     if RAG_READY:
@@ -490,11 +524,16 @@ def build_messages_with_memory_and_rag(
             rag_block = ""
             rag_used = False
 
-    # 4) Montar mensagens p/ LLM — usa a missão da Alma
+    # 4) Mensagens
     messages = [{
         "role": "system",
         "content": ALMA_MISSION
     }]
+
+    # Modo Orçamentos (só se pedido)
+    if _is_budget_request(question):
+        messages.append({"role": "system", "content": ALMA_ORCAMENTO_PROMPT})
+
     if facts_block:
         messages.append({"role": "system", "content": facts_block})
     if rag_block:
@@ -514,12 +553,10 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
         return {"answer": "Falta query param ?q="}
 
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, q, namespace)
-    # chamada ao LLM
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
-    # guardar diálogo (Mem0 + local)
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -535,7 +572,7 @@ async def ask(request: Request):
     data = await request.json()
     question = (data.get("question") or "").strip()
     user_id = (data.get("user_id") or "").strip() or "anon"
-    namespace = (data.get("namespace") or "").strip() or None  # permite override por chamada
+    namespace = (data.get("namespace") or "").strip() or None
     log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} question={question!r}")
 
     if not question:
@@ -543,14 +580,12 @@ async def ask(request: Request):
 
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, question, namespace)
 
-    # chamada ao LLM
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-    # guardar diálogo (Mem0 + local)
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -633,11 +668,7 @@ def heygen_token():
         res = requests.post(
             "https://api.heygen.com/v1/realtime/session",
             headers={"Authorization": f"Bearer {HEYGEN_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "avatar_id": "ebc94c0e88534d078cf8788a01f3fba9",
-                "voice_id": "ff5719e3a6314ecea47badcbb1c0ffaa",
-                "language": "pt-PT"
-            },
+            json={"avatar_id": "ebc94c0e88534d078cf8788a01f3fba9","voice_id": "ff5719e3a6314ecea47badcbb1c0ffaa","language": "pt-PT"},
             timeout=15
         )
         res.raise_for_status()
@@ -754,12 +785,6 @@ import xml.etree.ElementTree as ET
 
 @app.post("/rag/extract-urls")
 async def rag_extract_urls(request: Request):
-    """
-    Body:
-      { "url": "https://...",  # opcional
-        "text": "...",         # opcional (HTML/XML copiado)
-        "max_urls": 5000 }
-    """
     try:
         data = await request.json()
         url = (data.get("url") or "").strip()
@@ -769,60 +794,154 @@ async def rag_extract_urls(request: Request):
         if not url and not raw_text:
             return {"ok": False, "error": "fornece 'url' ou 'text'"}
 
-        # 1) obter texto
         if url:
-            r = requests.get(url, headers={"User-Agent": "AlmaBot/1.0 (+rag)"},
-                             timeout=30)
+            r = requests.get(url, headers={"User-Agent": "AlmaBot/1.0 (+rag)"}, timeout=30)
             r.raise_for_status()
             raw_text = r.text
 
         if not raw_text:
             return {"ok": False, "error": "sem conteúdo"}
 
-        # 2) extrair URLs
         urls = []
 
         def dedup_keep(seq):
-            seen = set()
-            out = []
+            seen = set(); out = []
             for u in seq:
                 u = (u or "").strip()
-                if not u or len(u) > 2048:
-                    continue
-                if u in seen:
-                    continue
-                seen.add(u)
-                out.append(u)
-                if len(out) >= max_urls:
-                    break
+                if not u or len(u) > 2048: continue
+                if u in seen: continue
+                seen.add(u); out.append(u)
+                if len(out) >= max_urls: break
             return out
 
         txt = raw_text
 
-        # sitemap XML?
         if ("<urlset" in txt) or ("<sitemapindex" in txt):
             try:
                 root = ET.fromstring(txt)
-                locs = [ (el.text or "").strip()
-                         for el in root.findall(".//{*}loc") ]
+                locs = [(el.text or "").strip() for el in root.findall(".//{*}loc")]
                 urls = dedup_keep(locs)
                 return {"ok": True, "type": "sitemap", "count": len(urls), "urls": urls[:max_urls]}
             except Exception:
-                # fallback regex
                 import re
                 locs = re.findall(r"<loc>(.*?)</loc>", txt, flags=re.I|re.S)
                 urls = dedup_keep(locs)
                 return {"ok": True, "type": "sitemap-regex", "count": len(urls), "urls": urls[:max_urls]}
 
-        # HTML normal → hrefs
         import re
         hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', txt, flags=re.I)
         urls = dedup_keep(hrefs)
         return {"ok": True, "type": "html", "count": len(urls), "urls": urls[:max_urls]}
-
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------------------------------------------------------------------------------------
+# 🔸 Exportação CSV de Orçamentos
+# ---------------------------------------------------------------------------------------
+def _safe_float(v, default=0.0):
+    try:
+        if isinstance(v, str):
+            v = v.replace("€", "").replace(",", ".").strip()
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _format_money(x: float) -> str:
+    return f"{x:.2f}"
+
+@app.post("/budget/csv")
+async def budget_csv(request: Request):
+    """
+    Body esperado:
+    {
+      "mode": "public" | "pro",       # public => TOTAL S/IVA ; pro => TOTAL C/IVA
+      "iva_pct": 23,                  # obrigatório para 'pro' se quiser cálculo correto
+      "rows": [
+        {
+          "ref": "BS.01",
+          "descricao": "Produto — Nome / Material / Cor",
+          "quant": 1,
+          "preco_uni": 100,
+          "desc_pct": 5,              # opcional
+          "dim": "80x40xH45",
+          "material": "Carvalho / Óleo natural",
+          "marca": "Boa Safra",
+          "link": "https://interiorguider.com/..."
+        },
+        ...
+      ]
+    }
+    Devolve um ficheiro CSV pronto para importar no Google Sheets (Público ou Profissional).
+    """
+    data = await request.json()
+    mode = (data.get("mode") or "public").lower().strip()
+    iva_pct = _safe_float(data.get("iva_pct", 23.0))
+    rows = data.get("rows") or []
+
+    if mode not in ("public", "pro"):
+        return PlainTextResponse("mode deve ser 'public' ou 'pro'", status_code=400)
+    if not isinstance(rows, list) or not rows:
+        return PlainTextResponse("rows vazio", status_code=400)
+
+    # Cabeçalhos conforme template
+    if mode == "public":
+        headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA"]
+    else:
+        headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL C/IVA"]
+
+    # Escrever CSV em memória
+    sio = StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(headers)
+
+    for r in rows:
+        ref = (r.get("ref") or "").strip()
+        quant = int(r.get("quant") or 1)
+        preco_uni = _safe_float(r.get("preco_uni"), 0.0)
+        desc_pct = _safe_float(r.get("desc_pct"), 0.0)
+
+        # Montar designação detalhada
+        desc_main = (r.get("descricao") or "").strip() or "Produto"
+        extra_lines = []
+        if r.get("dim"): extra_lines.append(f"Dimensões: {r['dim']}")
+        if r.get("material"): extra_lines.append(f"Material/Acabamento: {r['material']}")
+        if r.get("marca"): extra_lines.append(f"Marca: {r['marca']}")
+        if r.get("link"):
+            link = str(r["link"]).strip()
+            # preferir interiorguider.com (se não for, mantém mas sinaliza)
+            if "interiorguider.com" not in link.lower():
+                extra_lines.append(f"Link: {link}")
+            else:
+                extra_lines.append(f"Link: {link}")
+        full_desc = desc_main + (("\n" + "\n".join(extra_lines)) if extra_lines else "")
+
+        total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
+        if mode == "public":
+            total_col = _format_money(total_si)
+        else:
+            total_ci = total_si * (1.0 + iva_pct/100.0)
+            total_col = _format_money(total_ci)
+
+        writer.writerow([
+            ref,
+            full_desc,
+            str(quant),
+            _format_money(preco_uni),
+            (f"{desc_pct:.0f}%" if desc_pct else ""),
+            total_col
+        ])
+
+    csv_bytes = sio.getvalue().encode("utf-8-sig")  # BOM para Excel/Sheets
+    fname = f"orcamento_{mode}_{int(time.time())}.csv"
+    fpath = os.path.join("/tmp", fname)
+    with open(fpath, "wb") as f:
+        f.write(csv_bytes)
+
+    return FileResponse(
+        fpath,
+        media_type="text/csv",
+        filename=fname
+    )
 
 # ---------------------------------------------------------------------------------------
 # Local run
