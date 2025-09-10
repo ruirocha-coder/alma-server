@@ -15,7 +15,7 @@ import re
 import csv
 from io import StringIO
 from typing import Dict, List, Tuple, Optional
-from urllib.parse import urlsplit, urlunsplit  # <-- ADICIONADO
+from urllib.parse import urlparse, urlunparse  # <-- (novo) usado na normalização de links
 
 # ---------------------------------------------------------------------------------------
 # FastAPI & CORS
@@ -365,7 +365,7 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
-# DETETORES / HELPERS
+# DETETORES
 # ---------------------------------------------------------------------------------------
 def _is_budget_request(text: str) -> bool:
     if not text:
@@ -377,24 +377,60 @@ def _is_budget_request(text: str) -> bool:
     ]
     return any(k in t for k in keys)
 
-def sanitize_product_link(link: str) -> str:
-    """
-    Conservador: só ajusta links de interiorguider.com quando o caminho começa por
-    /product/ ou /products/ -> remove esse segmento. Mantém query e fragment.
-    Caso contrário, devolve o link original.
-    """
-    if not link or not isinstance(link, str):
-        return link
+# ---------------------------------------------------------------------------------------
+# 🔧 NORMALIZAÇÃO E LINKIFICAÇÃO DE URLs DO INTERIOR GUIDER (PATCH)
+# ---------------------------------------------------------------------------------------
+IG_HOST = os.getenv("IG_HOST", "interiorguider.com").lower()
+
+def _canon_ig_url(u: str) -> str:
+    """Normaliza URLs do interiorguider.com e remove segmentos errados tipo /products/, /product/, /produto(s)/."""
     try:
-        p = urlsplit(link.strip())
-        if not p.netloc.lower().endswith("interiorguider.com"):
-            return link  # fora do domínio -> não mexe
-        new_path = re.sub(r"^/(?:product|products)/", "/", p.path or "")
-        if new_path != (p.path or ""):
-            return urlunsplit((p.scheme or "https", p.netloc, new_path, p.query, p.fragment))
-        return link
+        p = urlparse(u.strip())
     except Exception:
-        return link
+        return u
+    if not p.netloc:
+        return u
+    host = p.netloc.lower().replace("www.", "")
+    if IG_HOST not in host:
+        return u
+    # remove segmentos inventados
+    path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
+    path = re.sub(r"//+", "/", path)
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    p = p._replace(scheme="https", netloc=IG_HOST, path=path)
+    return urlunparse(p)
+
+def _fix_product_links_markdown(text: str) -> str:
+    """Corrige URLs em links Markdown e também URLs cruas do interiorguider.com, tornando-as clicáveis."""
+    if not text:
+        return text
+
+    # 1) Corrigir links Markdown existentes: [label](url)
+    def _md_repl(m):
+        label, url = m.group(1), m.group(2)
+        return f"[{label}]({_canon_ig_url(url)})"
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _md_repl, text)
+
+    # 2) Corrigir URLs cruas e convertê-las em Markdown clicável
+    #    Evita capturar urls que já estejam dentro de parêntesis de markdown.
+    def _raw_repl(m):
+        url = m.group(0)
+        fixed = _canon_ig_url(url)
+        return f"[ver produto]({fixed})"
+    text = re.sub(
+        rf"(?<!\]\()(https?://(?:www\.)?{re.escape(IG_HOST)}/[^\s)>\]]+)",
+        _raw_repl,
+        text
+    )
+
+    # 3) Corrigir quaisquer outras URLs (não-IG) apenas para limpar // e espaços
+    #    (não altera, só remove duplicações óbvias)
+    return text
+
+def _postprocess_answer(answer: str) -> str:
+    """Pipeline de pós-processamento da resposta do LLM."""
+    return _fix_product_links_markdown(answer or "")
 
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS
@@ -577,6 +613,10 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    # 🔧 pós-processamento para corrigir links e torná-los clicáveis
+    answer = _postprocess_answer(answer)
+
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -605,6 +645,9 @@ async def ask(request: Request):
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    # 🔧 pós-processamento para corrigir links e torná-los clicáveis
+    answer = _postprocess_answer(answer)
 
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -927,8 +970,9 @@ async def budget_csv(request: Request):
         if r.get("material"): extra_lines.append(f"Material/Acabamento: {r['material']}")
         if r.get("marca"): extra_lines.append(f"Marca: {r['marca']}")
         if r.get("link"):
-            link = sanitize_product_link(str(r["link"]).strip())  # <-- USA SANITIZADOR
+            link = _canon_ig_url(str(r["link"]).strip())  # <-- normaliza link no CSV também
             extra_lines.append(f"Link: {link}")
+
         full_desc = desc_main + (("\n" + "\n".join(extra_lines)) if extra_lines else "")
 
         total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
