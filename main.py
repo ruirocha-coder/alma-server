@@ -39,6 +39,7 @@ APP_VERSION = os.getenv("APP_VERSION", "alma-server/clean-1+context-1+rag-3")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma (missão/valores/funções)
+# (⚠️ Mantém como está; podes editar o conteúdo à vontade no teu repo)
 # ---------------------------------------------------------------------------------------
 ALMA_MISSION = """
 És a Alma, inteligência da Boa Safra Lda (Boa Safra + Interior Guider).
@@ -91,6 +92,10 @@ Formato de resposta
 ALMA_ORCAMENTO_PROMPT = """
 Quando fores pedido para preparar um orçamento, segue estas regras:
 
+0) Restrições
+- Não envies emails nem digas que os vais enviar. Entrega o CSV diretamente no chat (ou indica o endpoint /budget/csv).
+- Apenas inclui no orçamento produtos que foram explicitamente solicitados. Não acrescentes itens por iniciativa própria.
+
 1) Escolha do template
 - Se o pedido mencionar "profissional", "revenda", "arquitetos", "pro" ou "com IVA" → usa o formato PROFISSIONAL (coluna TOTAL C/IVA).
 - Caso contrário → usa o formato PÚBLICO (coluna TOTAL S/IVA).
@@ -108,15 +113,14 @@ Quando fores pedido para preparar um orçamento, segue estas regras:
 - Dimensões
 - Material/Acabamento/Cor
 - Marca
-- Link do produto (preferir sempre interiorguider.com)
+- Link do produto (preferir sempre interiorguider.com; formata como [ver produto](URL))
 
 4) Regras de pergunta
 - Não perguntes por tudo; questiona apenas o que está em falta e é necessário para identificar o artigo
   ou calcular o total (ex.: quantidade, cor, variante, desconto).
 
 5) Saída
-- Gera a tabela no chat (para pré-visualização) e oferece exportação CSV.
-- Ao apresentar produtos, inclui o link do interiorguider.com sempre que exista.
+- Gera a tabela no chat (pré-visualização). Oferece exportação CSV (não e-mail).
 
 6) Estilo
 - Objetivo e conciso. No fim, propõe uma única próxima ação útil
@@ -140,7 +144,7 @@ except Exception as e:
 
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
 RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
-DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None  # p.ex. "site_boasafra"
+DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None
 
 # ---------------------------------------------------------------------------------------
 # Mem0 (curto prazo) — opcional; se falhar cai em fallback local
@@ -364,7 +368,7 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
-# DETETORES
+# DETETOR: pedido de orçamento
 # ---------------------------------------------------------------------------------------
 def _is_budget_request(text: str) -> bool:
     if not text:
@@ -375,6 +379,52 @@ def _is_budget_request(text: str) -> bool:
         "proposta", "quote", "preço total", "quanto fica", "fazer orçamento"
     ]
     return any(k in t for k in keys)
+
+# ---------------------------------------------------------------------------------------
+# 🔧 PATCH DE LINKS — normaliza URLs de produtos do interiorguider.com
+# ---------------------------------------------------------------------------------------
+_IG_DOM_RE = re.compile(r"^(https?://)(?:www\.)?interiorguider\.com(?P<path>/.*)?$", re.IGNORECASE)
+
+def _fix_ig_links(text: str) -> str:
+    """
+    Corrige URLs inventados com /product/ ou /products/ e preserva
+    o resto do caminho. Funciona em texto simples e dentro de links Markdown.
+    """
+    if not text:
+        return text
+
+    # 1) Corrigir links Markdown: [label](url)
+    def _md_sub(m):
+        label = m.group(1)
+        url = m.group(2)
+        url = _fix_single_url(url)
+        return f"[{label}]({url})"
+
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _md_sub, text)
+
+    # 2) Corrigir URLs “soltos” no texto
+    def _url_sub(m):
+        url = m.group(0)
+        return _fix_single_url(url)
+
+    text = re.sub(r"https?://[^\s)]+", _url_sub, text)
+
+    return text
+
+def _fix_single_url(url: str) -> str:
+    try:
+        m = _IG_DOM_RE.match(url)
+        if not m:
+            return url  # não é interiorguider.com
+        path = m.group("path") or "/"
+        # remove /product/ ou /products/ apenas se for exatamente esse segmento inicial
+        path = re.sub(r"^/(?:product|products)/", "/", path, flags=re.IGNORECASE)
+        # normaliza barras duplas
+        path = re.sub(r"//+", "/", path)
+        fixed = f"https://interiorguider.com{path}"
+        return fixed
+    except Exception:
+        return url
 
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS
@@ -555,6 +605,7 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     messages, new_facts, facts, rag_used = build_messages_with_memory_and_rag(user_id, q, namespace)
     try:
         answer = grok_chat(messages)
+        answer = _fix_ig_links(answer)  # 🔧 PATCH de links
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
     local_append_dialog(user_id, q, answer)
@@ -582,6 +633,7 @@ async def ask(request: Request):
 
     try:
         answer = grok_chat(messages)
+        answer = _fix_ig_links(answer)  # 🔧 PATCH de links
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
@@ -907,12 +959,8 @@ async def budget_csv(request: Request):
         if r.get("material"): extra_lines.append(f"Material/Acabamento: {r['material']}")
         if r.get("marca"): extra_lines.append(f"Marca: {r['marca']}")
         if r.get("link"):
-            link = str(r["link"]).strip()
-            # preferir interiorguider.com (se não for, mantém mas sinaliza)
-            if "interiorguider.com" not in link.lower():
-                extra_lines.append(f"Link: {link}")
-            else:
-                extra_lines.append(f"Link: {link}")
+            link = _fix_single_url(str(r["link"]).strip())  # normaliza IG
+            extra_lines.append(f"Link: {link}")
         full_desc = desc_main + (("\n" + "\n".join(extra_lines)) if extra_lines else "")
 
         total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
