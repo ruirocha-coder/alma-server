@@ -816,141 +816,198 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# (PATCH) URL helpers + redefinição de rag_guess_products_by_name (versão melhorada)
+# € — parsing robusto + CSV “PT-friendly” (Excel)
+# ---------------------------------------------------------------------------------------
+def _parse_money_eu(s: str) -> Optional[float]:
+    """
+    Aceita: "1.234,56", "1,234.56", "1234,56", "1234.56", "€1 234,56", "1 234,56 €", "1,000€"
+    Remove espaços/€; deteta decimal pelo último separador.
+    """
+    try:
+        if s is None:
+            return None
+        s = str(s).strip().replace("€", "").replace("\u00A0", " ").strip()
+        s = re.sub(r"\s+", "", s)
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")   # EU -> .
+            else:
+                s = s.replace(",", "")                    # US -> remove milhar
+        else:
+            if "," in s:
+                s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
+
+def _safe_float(v, default=0.0):
+    if isinstance(v, (int, float)):
+        return float(v)
+    f = _parse_money_eu(v)
+    return f if f is not None else float(default)
+
+# ---------------------------------------------------------------------------------------
+# Exportação CSV de Orçamentos
+# ---------------------------------------------------------------------------------------
+def make_budget_csv(iva_pct: float, rows: List[dict], mode: str = "public",
+                    delimiter: str = ";", decimal: str = "comma") -> str:
+    """
+    Gera ficheiro CSV e devolve o caminho no /tmp.
+    """
+    def fmt_money(x: float) -> str:
+        s = f"{x:.2f}"
+        return s.replace(".", ",") if decimal == "comma" else s
+
+    if mode == "public":
+        headers = ["REF.", "DESIGNAÇÃO", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL C/IVA"]
+        show_total_ci = True
+    else:
+        headers = ["REF.", "DESIGNAÇÃO", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA"]
+        show_total_ci = False
+
+    sio = StringIO()
+    writer = csv.writer(sio, delimiter=delimiter)
+    writer.writerow(headers)
+
+    for r in rows:
+        ref = (r.get("ref") or "").strip()
+        quant = int(_safe_float(r.get("quant"), 1))
+        preco_uni = _safe_float(r.get("preco_uni"), 0.0)
+        desc_pct = _safe_float(r.get("desc_pct"), 0.0)
+
+        desc_main = (r.get("descricao") or "").strip() or "Produto"
+        full_desc = desc_main
+
+        total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
+        total = total_si * (1.0 + iva_pct/100.0) if show_total_ci else total_si
+
+        writer.writerow([
+            ref,
+            full_desc,
+            str(quant),
+            fmt_money(preco_uni),
+            (f"{desc_pct:.0f}%" if desc_pct else ""),
+            fmt_money(total)
+        ])
+
+    csv_bytes = sio.getvalue().encode("utf-8-sig")
+    fname = f"orcamento_{mode}_{int(time.time())}.csv"
+    fpath = os.path.join("/tmp", fname)
+    with open(fpath, "wb") as f:
+        f.write(csv_bytes)
+    return fpath
+
+# ---------------------------------------------------------------------------------------
+# 🔗 PATCH — RAG links + orçamento
 # ---------------------------------------------------------------------------------------
 import re as _re_local
+from urllib.parse import urlparse as _urlparse
+
+_MD_LINK_RE = _re_local.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _re_local.I)
 _URL_RE = _re_local.compile(r"https?://[^\s)>\]]+", _re_local.I)
 
+def _normalize_link_field(v: str) -> str:
+    if not v:
+        return ""
+    v = str(v).strip()
+    m = _MD_LINK_RE.search(v)
+    if m:
+        return m.group(2).strip()
+    return v
+
 def _urls_from_text(txt: str) -> List[str]:
-    """Extrai URLs do texto do chunk, preferindo interiorguider.com e canonizando IG."""
     if not txt:
         return []
     urls = _URL_RE.findall(txt)
     out, seen = [], set()
     for u in urls:
-        host = (urlparse(u).netloc or "").lower()
-        cu = _canon_ig_url(u) if IG_HOST in host else u.strip()
+        host = (_urlparse(u).netloc or "").lower()
+        cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
         if not cu or cu in seen:
             continue
         seen.add(cu)
         out.append(cu)
-    # preferir IG
-    return sorted(out, key=lambda x: 0 if IG_HOST in (urlparse(x).netloc or "").lower() else 1)
+    return sorted(out, key=lambda x: 0 if IG_HOST in (_urlparse(x).netloc or "").lower() else 1)
 
-def rag_guess_products_by_name(question: str, top_k: int = 3) -> List[dict]:
-    """
-    PATCH: além de metadata.url, apanha links dentro do corpo do chunk e prefere IG.
-    Mantém deteção básica de preço e nome pelo título.
-    """
-    if not RAG_READY:
+_NAME_HINTS = [
+    r"\bmesa[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
+    r"\bcadeira[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
+    r"\bbanco[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
+    r"\bcama[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
+    r"\bluminária[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
+    r"\bcod\b(?:\s+[a-z0-9]{1,10})?",
+]
+
+def _extract_name_terms(text: str) -> List[str]:
+    if not text:
         return []
-    terms = _extract_name_terms(question)
-    results = []
-    seen_urls = set()
-    for term in terms:
-        try:
-            hits = search_chunks(query=term, namespace=DEFAULT_NAMESPACE, top_k=top_k) or []
-        except Exception:
-            hits = []
-        for h in hits:
-            meta = h.get("metadata", {}) or {}
-            url_meta = meta.get("url") or ""
-            title = meta.get("title") or ""
-            text  = h.get("text") or ""
+    terms = []
+    for pat in _NAME_HINTS:
+        for m in _re_local.finditer(pat, text, flags=_re_local.I):
+            terms.append(m.group(0).strip())
+    t_norm = _re_local.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    if "cod" in t_norm and "cadeira" not in t_norm:
+        terms.append("cadeira cod")
+    if not terms:
+        parts = _re_local.split(r"[,\n;]| e ", text)
+        terms = [p.strip() for p in parts if len(p.strip()) >= 3][:8]
+    seen = set(); out = []
+    for t in terms:
+        tn = t.lower()
+        if tn not in seen:
+            seen.add(tn); out.append(t)
+    return out[:8]
 
-            candidates = []
-            if url_meta:
-                candidates = [_canon_ig_url(url_meta)]
-            else:
-                candidates = _urls_from_text(text)
-
-            cu = candidates[0] if candidates else ""
-            if cu and cu in seen_urls:
-                continue
-            if cu:
-                seen_urls.add(cu)
-
-            price = _price_from_text(text) or _price_from_text(title)
-            name  = title or term
-            entry = {
-                "ref": "",
-                "name": name.strip(),
-                "url": cu or "sem URL",
-                "price_gross": price,
-                "source": "SITE" if (cu and IG_HOST in (urlparse(cu).netloc or "").lower()) else "CATALOGO_EXTERNO"
-            }
-            results.append(entry)
-    return results
-
-# ---------------------------------------------------------------------------------------
-# (PATCH) Enriquecimento das linhas do orçamento com dados do RAG (links/preços)
-# ---------------------------------------------------------------------------------------
 def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
-    """Para cada linha sem link/preço, tenta preencher com o RAG por nome/ref."""
     if not rows or not RAG_READY:
         return rows
     out = []
     for r in rows:
         rr = dict(r)
         name_q = rr.get("descricao") or rr.get("ref") or ""
-        need_link = not rr.get("link") or str(rr.get("link")).strip().lower() in {"", "sem url", "-"}
+        raw_link = (rr.get("link") or "").strip()
+        link_norm = _normalize_link_field(raw_link)
+        rr["link"] = link_norm
+        need_link = (not link_norm) or (not link_norm.lower().startswith("http"))
         need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0"))
-
         if (need_link or need_price) and name_q:
             try:
-                hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=6) or []
+                hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=8) or []
             except Exception:
                 hits = []
-
+            if (not hits) and len(name_q) > 18:
+                key = " ".join([w for w in _re_local.findall(r"[A-Za-z0-9]+", name_q) if len(w) <= 6][:3]).lower()
+                if "cod" in key and "cadeira" not in key:
+                    key = ("cadeira " + key).strip()
+                try:
+                    more = search_chunks(query=key, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+                except Exception:
+                    more = []
+                hits = more or hits
             best_url = ""
             best_price = None
             for h in hits:
                 meta = h.get("metadata", {}) or {}
                 text = h.get("text") or ""
                 title = meta.get("title") or ""
-
-                # 1) url por metadata ou corpo
                 urls = []
                 if meta.get("url"):
                     urls.append(_canon_ig_url(meta["url"]))
                 urls.extend(_urls_from_text(text))
                 if urls and not best_url:
                     best_url = urls[0]
-
-                # 2) preço se conseguirmos detetar
                 price = _price_from_text(text) or _price_from_text(title)
                 if price and not best_price:
                     best_price = price
-
             if need_link:
                 rr["link"] = best_url if best_url else "sem URL"
             if need_price and best_price is not None:
                 rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
-
         out.append(rr)
     return out
 
 # ---------------------------------------------------------------------------------------
-# Console HTML
-# ---------------------------------------------------------------------------------------
-@app.get("/console", response_class=HTMLResponse)
-def serve_console():
-    try:
-        with open("console.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
-
-@app.get("/alma-chat", response_class=HTMLResponse)
-def serve_alma_chat():
-    try:
-        with open("alma-chat.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
-
-# ---------------------------------------------------------------------------------------
-# ASK endpoints (com CSV automático no modo orçamento + enriquecimento RAG)
+# ASK endpoints (com RAG budget patch)
 # ---------------------------------------------------------------------------------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
@@ -961,37 +1018,36 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
-
     answer = _postprocess_answer(answer)
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-
-    resp = {
-        "answer": answer,
-        "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
-    }
-
-    # CSV automático se for orçamento (com enriquecimento por RAG)
+    resp = {"answer": answer, "new_facts_detected": new_facts,
+            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
     if _is_budget_request(q):
         obj = parse_budget_rows_from_answer(answer)
         if obj.get("rows"):
             try:
                 enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
-                # (Opcional) mini pré-visualização corrigida no chat
-                preview_lines = ["\n**(Corrigido — links/preços verificados no RAG):**",
-                                 "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
-                                 "|-|-|-|-|-|"]
+                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public",
+                                           delimiter=";", decimal="comma")
+                preview_lines = [
+                    "\n**(Corrigido — links/preços verificados no RAG):**",
+                    "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
+                    "|---|---:|---:|---:|---|"
+                ]
                 for e in enriched[:20]:
-                    preview_lines.append(f"| {e.get('ref') or e.get('descricao','-')} | {e.get('quant',1)} | {e.get('preco_uni','-')} | {e.get('desc_pct','')} | {e.get('link','sem URL')} |")
+                    ref_or_name = e.get("ref") or e.get("descricao","-")
+                    qtd = e.get("quant", 1)
+                    preco = e.get("preco_uni", "-")
+                    desc = e.get("desc_pct", "")
+                    link = _normalize_link_field(e.get("link", "")) or "sem URL"
+                    preview_lines.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
                 resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview_lines))
                 resp["csv_download"] = csv_path
                 resp["rows_enriched"] = enriched
             except Exception as e:
                 resp["csv_error"] = str(e)
-
     return resp
 
 @app.post("/ask")
@@ -1001,230 +1057,45 @@ async def ask(request: Request):
     user_id = (data.get("user_id") or "").strip() or "anon"
     namespace = (data.get("namespace") or "").strip() or None
     log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} question={question!r}")
-
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
-
     messages, new_facts, rag_used = build_messages(user_id, question, namespace)
-
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
-
     answer = _postprocess_answer(answer)
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-
-    resp = {
-        "answer": answer,
-        "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
-    }
-
-    # CSV automático se for orçamento (com enriquecimento por RAG)
+    resp = {"answer": answer, "new_facts_detected": new_facts,
+            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
     if _is_budget_request(question):
         obj = parse_budget_rows_from_answer(answer)
         if obj.get("rows"):
             try:
                 enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
-                # (Opcional) mini pré-visualização corrigida no chat
-                preview_lines = ["\n**(Corrigido — links/preços verificados no RAG):**",
-                                 "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
-                                 "|-|-|-|-|-|"]
+                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public",
+                                           delimiter=";", decimal="comma")
+                preview_lines = [
+                    "\n**(Corrigido — links/preços verificados no RAG):**",
+                    "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
+                    "|---|---:|---:|---:|---|"
+                ]
                 for e in enriched[:20]:
-                    preview_lines.append(f"| {e.get('ref') or e.get('descricao','-')} | {e.get('quant',1)} | {e.get('preco_uni','-')} | {e.get('desc_pct','')} | {e.get('link','sem URL')} |")
+                    ref_or_name = e.get("ref") or e.get("descricao","-")
+                    qtd = e.get("quant", 1)
+                    preco = e.get("preco_uni", "-")
+                    desc = e.get("desc_pct", "")
+                    link = _normalize_link_field(e.get("link", "")) or "sem URL"
+                    preview_lines.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
                 resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview_lines))
                 resp["csv_download"] = csv_path
                 resp["rows_enriched"] = enriched
             except Exception as e:
                 resp["csv_error"] = str(e)
-
     return resp
-
-# ---------------------------------------------------------------------------------------
-# Endpoints de memória (debug/auxiliar)
-# ---------------------------------------------------------------------------------------
-@app.get("/mem/facts")
-def mem_facts(user_id: str):
-    return {"ok": True, "user_id": user_id, "facts": mem0_get_facts(user_id)}
-
-@app.get("/mem/search")
-def mem_search(user_id: str, q: str = "", limit: int = 5):
-    results = _mem0_search(q or "contexto", user_id=user_id, limit=limit) or local_search_snippets(user_id, limit=limit)
-    return {"ok": True, "user_id": user_id, "q": q, "results": results[:limit]}
-
-# ---------------------------------------------------------------------------------------
-# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST)
-# ---------------------------------------------------------------------------------------
-@app.post("/rag/crawl")
-async def rag_crawl(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        seed_url   = (data.get("seed_url") or "").strip()
-        namespace  = (data.get("namespace") or "default").strip()
-        max_pages  = int(data.get("max_pages")  or os.getenv("CRAWL_MAX_PAGES", "40"))
-        max_depth  = int(data.get("max_depth")  or os.getenv("CRAWL_MAX_DEPTH", "2"))
-        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
-        if not seed_url:
-            return {"ok": False, "error": "Falta seed_url"}
-        res = crawl_and_ingest(
-            seed_url=seed_url, namespace=namespace,
-            max_pages=max_pages, max_depth=max_depth, deadline_s=deadline_s
-        )
-        if "ok" not in res: res["ok"] = True
-        res.setdefault("summary", f"visited={res.get('visited')} ok_chunks={res.get('ok_chunks')} fail={res.get('fail')} namespace={namespace}")
-        return res
-    except Exception as e:
-        import traceback
-        log.exception("crawl_failed")
-        return {"ok": False, "error": "crawl_failed", "detail": str(e), "trace": traceback.format_exc(limit=3)}
-
-@app.post("/rag/ingest-sitemap")
-async def rag_ingest_sitemap_route(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        sitemap_url = (data.get("sitemap_url") or data.get("site_url") or "").strip()
-        namespace   = (data.get("namespace") or "default").strip()
-        max_pages   = int(data.get("max_pages") or os.getenv("CRAWL_MAX_PAGES", "40"))
-        deadline_s  = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
-        if not sitemap_url:
-            return {"ok": False, "error": "Falta sitemap_url/site_url"}
-        return ingest_sitemap(sitemap_url, namespace=namespace, max_pages=max_pages, deadline_s=deadline_s)
-    except Exception as e:
-        return {"ok": False, "error": "sitemap_failed", "detail": str(e)}
-
-@app.post("/rag/ingest-url")
-async def rag_ingest_url_route(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        page_url  = (data.get("page_url") or "").strip()
-        namespace = (data.get("namespace") or "default").strip()
-        deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
-        if not page_url:
-            return {"ok": False, "error": "Falta page_url"}
-        return ingest_url(page_url, namespace=namespace, deadline_s=deadline_s)
-    except Exception as e:
-        return {"ok": False, "error": "ingest_url_failed", "detail": str(e)}
-
-@app.post("/rag/ingest-text")
-async def rag_ingest_text_route(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        title     = (data.get("title") or "").strip()
-        text      = (data.get("text") or "").strip()
-        namespace = (data.get("namespace") or "default").strip()
-        if not title or not text:
-            return {"ok": False, "error": "Falta title ou text"}
-        return ingest_text(title=title, text=text, namespace=namespace)
-    except Exception as e:
-        return {"ok": False, "error": "ingest_text_failed", "detail": str(e)}
-
-@app.post("/rag/ingest-pdf-url")
-async def rag_ingest_pdf_url_route(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        pdf_url  = (data.get("pdf_url") or "").strip()
-        title    = (data.get("title") or None)
-        namespace = (data.get("namespace") or "default").strip()
-        if not pdf_url:
-            return {"ok": False, "error": "Falta pdf_url"}
-        return ingest_pdf_url(pdf_url=pdf_url, title=title, namespace=namespace)
-    except Exception as e:
-        return {"ok": False, "error": "ingest_pdf_failed", "detail": str(e)}
-
-@app.post("/rag/search")
-async def rag_search_post(request: Request):
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG não disponível"}
-    try:
-        data = await request.json()
-        query     = (data.get("query") or "").strip()
-        namespace = (data.get("namespace") or None)
-        top_k     = int(data.get("top_k") or os.getenv("RAG_TOP_K", "6"))
-        matches = search_chunks(query=query, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k)
-        ctx = build_context_block(matches, token_budget=RAG_CONTEXT_TOKEN_BUDGET)
-        return {"ok": True, "matches": matches, "context_block": ctx}
-    except Exception as e:
-        return {"ok": False, "error": "search_failed", "detail": str(e)}
-
-# --- Proxy: extrair URLs -----------------------------------------------------
-@app.post("/rag/extract-urls")
-async def rag_extract_urls(request: Request):
-    try:
-        data = await request.json()
-        url = (data.get("url") or "").strip()
-        raw_text = data.get("text")
-        max_urls = int(data.get("max_urls") or 5000)
-
-        if not url and not raw_text:
-            return {"ok": False, "error": "fornece 'url' ou 'text'"}
-
-        if url:
-            r = requests.get(url, headers={"User-Agent": "AlmaBot/1.0 (+rag)"}, timeout=30)
-            r.raise_for_status()
-            raw_text = r.text
-
-        if not raw_text:
-            return {"ok": False, "error": "sem conteúdo"}
-
-        def dedup_keep(seq):
-            seen = set(); out = []
-            for u in seq:
-                u = (u or "").strip()
-                if not u or len(u) > 2048: continue
-                if u in seen: continue
-                seen.add(u); out.append(u)
-                if len(out) >= max_urls: break
-            return out
-
-        txt = raw_text
-
-        if ("<urlset" in txt) or ("<sitemapindex" in txt):
-            try:
-                root = ET.fromstring(txt)
-                locs = [(el.text or "").strip() for el in root.findall(".//{*}loc")]
-                urls = dedup_keep(locs)
-                return {"ok": True, "type": "sitemap", "count": len(urls), "urls": urls[:max_urls]}
-            except Exception:
-                import re
-                locs = re.findall(r"<loc>(.*?)</loc>", txt, flags=re.I|re.S)
-                urls = dedup_keep(locs)
-                return {"ok": True, "type": "sitemap-regex", "count": len(urls), "urls": urls[:max_urls]}
-
-        import re
-        hrefs = re.findall(r'href=["\'](https?://[^"\']+)["\']', txt, flags=re.I)
-        urls = dedup_keep(hrefs)
-        return {"ok": True, "type": "html", "count": len(urls), "urls": urls[:max_urls]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ---------------------------------------------------------------------------------------
-# Endpoint de exportação CSV (caso queiras chamar diretamente)
-# ---------------------------------------------------------------------------------------
-@app.post("/budget/csv")
-async def budget_csv(request: Request):
-    data = await request.json()
-    iva_pct = float(data.get("iva_pct", 23))
-    rows = data.get("rows") or []
-    try:
-        fpath = make_budget_csv(iva_pct, rows, mode="public", delimiter=";", decimal="comma")
-        return FileResponse(fpath, media_type="text/csv", filename=os.path.basename(fpath))
-    except Exception as e:
-        return PlainTextResponse(str(e), status_code=400)
 
 # ---------------------------------------------------------------------------------------
 # Local run
