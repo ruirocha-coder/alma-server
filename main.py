@@ -1,8 +1,8 @@
-# main.py — Alma Server (RAG-only + Memória + CSV a pedido)
+# main.py — Alma Server (RAG-only + Memória + CSV a pedido, parser robusto)
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -36,7 +36,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-csv-on-demand-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-csv-on-demand-2")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma
@@ -87,7 +87,7 @@ Formato de resposta
 """
 
 # ---------------------------------------------------------------------------------------
-# Prompt adicional: MODO ORÇAMENTOS — (apenas para orientar a escrita da Alma; CSV é a pedido)
+# Prompt adicional: MODO ORÇAMENTOS — (apenas orienta; CSV é a pedido)
 # ---------------------------------------------------------------------------------------
 ALMA_ORCAMENTO_PROMPT = """
 REGRAS MODO ORÇAMENTO (ESTRITO):
@@ -95,7 +95,7 @@ REGRAS MODO ORÇAMENTO (ESTRITO):
 - NÃO inventes produtos nem URLs. Usa apenas itens encontrados no RAG. Se faltar URL, escreve "sem URL".
 - Se o item for de catálogo externo (sem link IG), acrescenta "disponibilidade a confirmar".
 - Se o pedido não indicar variante, assume a VARIANTE DEFAULT e lista explicitamente o que assumiste.
-- A pré-visualização no chat pode usar tabela compacta; no fim, se quiser CSV, será pedido à parte.
+- A pré-visualização no chat pode usar tabela compacta; o CSV só é gerado se pedirem.
 """
 
 # ---------------------------------------------------------------------------------------
@@ -112,10 +112,10 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
     host = p.netloc.lower().replace("www.", "")
     if IG_HOST not in host:
-        # mantemos como está para sites externos; só canonizamos IG
         return u or ""
-    path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
-    path = re.sub(r"//+", "/", path)
+    import re as _re
+    path = _re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=_re.I)
+    path = _re.sub(r"//+", "/", path)
     if path != "/" and path.endswith("/"):
         path = path[:-1]
     p = p._replace(scheme="https", netloc=IG_HOST, path=path)
@@ -179,7 +179,7 @@ _NAME_HINTS = [
     r"\bcama[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
     r"\bluminária[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
 ]
-_PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,6})")
+_PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,9})(?:\s*€)?")
 
 def _extract_name_terms(text:str) -> List[str]:
     t = " " + (text or "") + " "
@@ -199,19 +199,35 @@ def _extract_name_terms(text:str) -> List[str]:
     return out[:8]
 
 def _parse_money_eu(s: str) -> Optional[float]:
+    """
+    Suporta:
+      "1.802", "1.802,50", "1802", "1 802,50", "€1.802", "€ 1.802"
+    Heurística: se existir "." e NÃO existir "," e o sufixo após o último "." não tiver 2 dígitos,
+    interpretamos "." como separador de milhar (removemos).
+    """
     try:
         if s is None:
             return None
-        s = str(s).strip().replace("€", "").replace("\u00A0", " ").strip()
-        s = re.sub(r"\s+", "", s)
-        if "," in s and "." in s:
+        s = str(s).strip().replace("€", "").replace("\u00A0", " ")
+        s = re.sub(r"[ ]+", "", s)
+
+        has_comma = "," in s
+        has_dot = "." in s
+
+        if has_comma and has_dot:
+            # Caso típico PT: milhar com ponto e decimais com vírgula → remover pontos, trocar vírgula por ponto
             if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")   # EU -> .
+                s = s.replace(".", "").replace(",", ".")
             else:
-                s = s.replace(",", "")                    # US -> remove milhar
-        else:
-            if "," in s:
-                s = s.replace(",", ".")
+                s = s.replace(",", "")  # caso raro en-US com vírgula milhar
+        elif has_comma:
+            # só vírgula → decimal
+            s = s.replace(",", ".")
+        elif has_dot:
+            # só ponto → decidir se milhar ou decimal
+            right = s.split(".")[-1]
+            if len(right) != 2:  # não parece decimal → tratar como milhar
+                s = s.replace(".", "")
         return float(s)
     except Exception:
         return None
@@ -220,7 +236,7 @@ def _price_from_text(txt: str) -> Optional[float]:
     if not txt: return None
     m = _PRICE_RE.search(txt)
     if not m: return None
-    return None if m is None else _parse_money_eu(m.group(1))
+    return _parse_money_eu(m.group(1))
 
 def rag_guess_products_by_name(question: str, top_k: int = 3) -> List[dict]:
     if not RAG_READY:
@@ -248,7 +264,7 @@ def rag_guess_products_by_name(question: str, top_k: int = 3) -> List[dict]:
                 "ref": "",
                 "name": name.strip(),
                 "url": cu or "sem URL",
-                "price_gross": price,                 # COM IVA quando capturado do site
+                "price_gross": price,
                 "source": "SITE" if (cu and IG_HOST in (urlparse(cu).netloc or "").lower()) else "CATALOGO_EXTERNO"
             }
             results.append(entry)
@@ -292,8 +308,8 @@ if MEM0_ENABLE:
 
 LOCAL_FACTS: Dict[str, Dict[str, str]] = {}
 LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}
-LAST_PRODUCTS: Dict[str, List[str]] = {}  # refs/nomes
-LAST_SPECS: Dict[str, Dict[str, str]] = {}  # ex.: {"cadeira x": "vermelha, 6 un"}
+LAST_PRODUCTS: Dict[str, List[str]] = {}
+LAST_SPECS: Dict[str, Dict[str, str]] = {}
 
 FACT_PREFIX = "FACT|"
 
@@ -323,7 +339,6 @@ def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
 def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
     if not (MEM0_ENABLE and mem0_client):
         return
-    # tenta .memories.create; se não existir, tenta .create
     try:
         if hasattr(mem0_client, "memories") and hasattr(mem0_client.memories, "create"):
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
@@ -422,7 +437,7 @@ def recall_spec(user_id: str, product_name: str) -> Optional[str]:
     return facts.get(f"spec::{key}")
 
 # ---------------------------------------------------------------------------------------
-# Extração de factos simples do texto (nome, localização, preferências, divisão)
+# Extração de factos simples do texto
 # ---------------------------------------------------------------------------------------
 NAME_PATTERNS = [
     r"\bchamo-?me\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
@@ -486,7 +501,7 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
-# DETETOR de orçamento (apenas para orientar prompt; CSV é a pedido)
+# DETETOR de orçamento (só orienta; CSV é a pedido)
 # ---------------------------------------------------------------------------------------
 def _is_budget_request(text: str) -> bool:
     if not text:
@@ -502,25 +517,22 @@ def _is_budget_request(text: str) -> bool:
     return any(k in t for k in keys)
 
 # ---------------------------------------------------------------------------------------
-# RAG helpers para bloco de contexto (produtos sugeridos pelo RAG)
+# RAG helpers
 # ---------------------------------------------------------------------------------------
 def build_rag_products_block(question: str) -> str:
     if not RAG_READY:
         return ""
-    # tentar hits diretos
     hits = []
     try:
         hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K) or []
     except Exception:
         hits = []
-    # se pouco, tentar por nome
     if len(hits) < 3:
         guessed = rag_guess_products_by_name(question, top_k=3)
         lines = []
         for g in guessed[:6]:
             lines.append(f"- NOME={g.get('name') or '-'}; URL={g.get('url') or 'sem URL'}; PRECO_COM_IVA={g.get('price_gross') if g.get('price_gross') is not None else 'N/D'}; SOURCE={g.get('source') or '-'}")
         return "Produtos sugeridos pelo RAG:\n" + "\n".join(lines) if lines else ""
-    # se muitos hits, sumarizar por título+url para o LLM
     seen=set(); lines=[]
     for h in hits[:6]:
         meta = h.get("metadata", {}) or {}
@@ -534,7 +546,7 @@ def build_rag_products_block(question: str) -> str:
     return "Produtos sugeridos pelo RAG:\n" + "\n".join(lines) if lines else ""
 
 # ---------------------------------------------------------------------------------------
-# CSV helpers
+# CSV helpers + enriquecimento RAG
 # ---------------------------------------------------------------------------------------
 def _safe_float(v, default=0.0):
     if isinstance(v, (int, float)):
@@ -546,10 +558,12 @@ def _fmt_money(x: float, decimal="comma"):
     s = f"{x:.2f}"
     return s.replace(".", ",") if decimal == "comma" else s
 
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)", re.I)
+
 def _normalize_link_field(v: str) -> str:
     if not v: return ""
     v = str(v).strip()
-    m = re.search(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", v, flags=re.I)
+    m = _MD_LINK_RE.search(v)
     return m.group(2).strip() if m else v
 
 def _urls_from_text(txt: str) -> List[str]:
@@ -561,62 +575,95 @@ def _urls_from_text(txt: str) -> List[str]:
         cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
         if cu and cu not in seen:
             seen.add(cu); out.append(cu)
-    # preferir interiorguider.com
     return sorted(out, key=lambda x: 0 if IG_HOST in (urlparse(x).netloc or "").lower() else 1)
 
-def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
+def _best_ig_url_from_hits(hits: List[dict]) -> str:
+    best = ""
+    for h in hits or []:
+        meta = h.get("metadata", {}) or {}
+        text = h.get("text") or ""
+        if meta.get("url"):
+            u = _canon_ig_url(meta["url"])
+            if u and IG_HOST in (urlparse(u).netloc or "").lower():
+                return u
+            best = best or u
+        for u in _urls_from_text(text):
+            if IG_HOST in (urlparse(u).netloc or "").lower():
+                return u
+            best = best or u
+    return best
+
+def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0, namespace: Optional[str] = None) -> List[dict]:
     if not rows or not RAG_READY: return rows
     out = []
     for r in rows:
         rr = dict(r)
-        name_q = rr.get("descricao") or rr.get("ref") or ""
+        name_q = rr.get("descricao") or rr.get("ref") or rr.get("item") or ""
         raw_link = (rr.get("link") or "").strip()
         link_norm = _normalize_link_field(raw_link)
         rr["link"] = link_norm
         need_link = (not link_norm) or (not link_norm.lower().startswith("http")) or (link_norm.lower() in {"sem url","-","n/d"})
-        need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0"))
+        need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0", "€0", "€ 0"))
 
         if (need_link or need_price) and name_q:
             try:
-                hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+                hits = search_chunks(query=name_q, namespace=namespace or DEFAULT_NAMESPACE, top_k=8) or []
             except Exception:
                 hits = []
-            # tentativa curta (melhor matching quando a frase é comprida)
+            # 2º fôlego: chave curta
             if (not hits) and len(name_q) > 18:
                 key = " ".join([w for w in re.findall(r"[A-Za-z0-9]+", name_q) if len(w) <= 6][:3]).lower()
                 try:
-                    more = search_chunks(query=key, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+                    more = search_chunks(query=key, namespace=namespace or DEFAULT_NAMESPACE, top_k=8) or []
                 except Exception:
                     more = []
                 hits = more or hits
 
-            best_url = ""
+            best_url = _best_ig_url_from_hits(hits)
             best_price = None
-            for h in hits:
+            for h in hits or []:
                 meta = h.get("metadata", {}) or {}
                 text = h.get("text") or ""
                 title = meta.get("title") or ""
-                urls = []
-                if meta.get("url"): urls.append(_canon_ig_url(meta["url"]))
-                urls.extend(_urls_from_text(text))
-                if urls and not best_url: best_url = urls[0]
                 price = _price_from_text(text) or _price_from_text(title)
-                if (price is not None) and (best_price is None): best_price = price
+                if (price is not None) and (best_price is None):
+                    best_price = price
+
+            # 3º fôlego: guess por nome
+            if (not best_url) or (need_price and best_price is None):
+                guesses = rag_guess_products_by_name(name_q, top_k=3)
+                # preferir IG
+                for g in guesses:
+                    gu = g.get("url") or ""
+                    if gu and IG_HOST in (urlparse(gu).netloc or "").lower():
+                        best_url = best_url or gu
+                        if best_price is None and g.get("price_gross") is not None:
+                            best_price = g["price_gross"]
+                        break
+                if (not best_url) and guesses:
+                    g0 = guesses[0]
+                    best_url = best_url or (g0.get("url") or "")
+                    if best_price is None and g0.get("price_gross") is not None:
+                        best_price = g0["price_gross"]
 
             if need_link: rr["link"] = best_url if best_url else "sem URL"
-            if need_price and (best_price is not None): rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
+            if need_price and (best_price is not None):
+                rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
         out.append(rr)
     return out
 
 def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
     """
-    Procura bloco ```json {iva_pct, rows} ``` OU tabela Markdown.
-    Devolve {"iva_pct": int, "rows": [ ... ]}.
+    Extrai orçamento a partir de:
+      1) bloco ```json { "iva_pct": 23, "rows":[...] } ```
+      2) tabelas Markdown:
+         - estilo antigo: REF/Descrição/Quant/Preço/Desc/Link...
+         - estilo "Item | Quantidade | Preço Unitário | Subtotal [| Link]"
     """
     iva_pct = 23
     rows: List[Dict] = []
 
-    # 1) JSON entre fences
+    # 1) JSON
     m = re.search(r"```json\s*(\{.*?\})\s*```", llm_answer, flags=re.S|re.I)
     if m:
         try:
@@ -628,32 +675,63 @@ def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
         except Exception:
             pass
 
-    # 2) Tabela markdown muito simples (cabeçalhos conhecidos)
-    lines = [l.strip() for l in llm_answer.splitlines() if l.strip()]
+    # 2) Tabela Markdown
+    lines = [l.rstrip() for l in llm_answer.splitlines() if l.strip()]
+    # encontrar cabeçalho com palavras-chave
     header_idx = -1
+    header = ""
     for i, l in enumerate(lines):
-        if ("ref" in l.lower() and "preço" in l.lower()) or ("descricao" in _norm(l) and "quant" in _norm(l)):
-            header_idx = i; break
+        low = l.lower()
+        if ("ref" in low and ("preço" in low or "preco" in low)) or \
+           ("descricao" in _norm(l) and "quant" in _norm(l)) or \
+           ("item" in low and "quant" in low and ("preço" in low or "preco" in low)):
+            header_idx = i
+            header = low
+            break
+
     if header_idx >= 0:
+        # mapear colunas
+        headers = [c.strip().lower() for c in lines[header_idx].split("|")]
+        col_map = {h:i for i,h in enumerate(headers)}
+        # nomes conhecidos
+        def idx(*keys):
+            for k in keys:
+                if k in col_map: return col_map[k]
+            return None
+        i_item = idx("item","ref","ref/nome","designação","designacao","descrição","descricao","nome")
+        i_qtd  = idx("quantidade","quant.","quant","qtd","qtde")
+        i_pu   = idx("preço unitário (com iva)","preço unitário","preco unitario (com iva)","preco unitario","preço uni.","preco uni.","preço","preco")
+        i_link = idx("link")
+
         for l in lines[header_idx+1:]:
-            cells = [c.strip() for c in l.split("|")]
-            cells = [c for c in cells if c != ""]
-            if len(cells) < 4:
+            if set(l.strip()) in ({"-"}, {"|","-"}, {"|"}):  # separadores
                 continue
-            # heurística: [ref/nome, quant, preço, desconto?, link?]
-            ref = cells[0]
-            quant = cells[1] if len(cells) > 1 else "1"
-            preco = cells[2] if len(cells) > 2 else "0"
-            desc  = cells[3] if len(cells) > 3 else ""
-            link  = cells[4] if len(cells) > 4 else ""
+            cells = [c.strip() for c in l.split("|")]
+            if len([c for c in cells if c]) < 2:
+                continue
+            item_txt = cells[i_item].strip() if (i_item is not None and i_item < len(cells)) else ""
+            qtd_txt  = cells[i_qtd].strip() if (i_qtd is not None and i_qtd < len(cells)) else "1"
+            pu_txt   = cells[i_pu].strip() if (i_pu is not None and i_pu < len(cells)) else ""
+            link_txt = cells[i_link].strip() if (i_link is not None and i_link < len(cells)) else ""
+
+            # extrair link do item, se existir markdown
+            mlink = _MD_LINK_RE.search(item_txt)
+            if mlink and not link_txt:
+                link_txt = mlink.group(2).strip()
+
+            # normalizar zeros
+            if pu_txt.lower() in {"não disponível", "nao disponivel", "-", "n/d", ""}:
+                pu_txt = ""
+
             rows.append({
-                "ref": ref,
-                "descricao": ref,
-                "quant": quant,
-                "preco_uni": preco,
-                "desc_pct": desc,
-                "link": link
+                "ref": "",
+                "descricao": re.sub(r"\s*\(.*?\)\s*$", "", mlink.group(1) if mlink else item_txt).strip() or item_txt,
+                "quant": qtd_txt or "1",
+                "preco_uni": pu_txt.replace("€","").strip() if pu_txt else "",
+                "desc_pct": "",
+                "link": link_txt or (mlink.group(2).strip() if mlink else "")
             })
+
     return {"iva_pct": iva_pct, "rows": rows}
 
 def make_budget_csv(iva_pct: float, rows: List[dict], mode: str = "public",
@@ -743,16 +821,16 @@ def facts_block_for_user(user_id: str) -> str:
     return facts_to_context_block(facts)
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # 0) extrair e guardar factos rápidos
+    # 0) factos rápidos
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 1) mem de curto prazo
+    # 1) mem curto prazo
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
     memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
-    # 2) RAG — bloco de conhecimento & produtos
+    # 2) RAG
     rag_block = ""
     rag_used = False
     if RAG_READY:
@@ -767,7 +845,7 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     products_block = build_rag_products_block(question)
 
-    # 3) construir mensagens
+    # 3) mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
     if _is_budget_request(question):
         messages.append({"role": "system", "content": ALMA_ORCAMENTO_PROMPT})
@@ -814,7 +892,7 @@ def status_json():
             "health": "/health",
             "ask": "POST /ask {question, user_id?, namespace?}",
             "ask_get": "/ask_get?q=...&user_id=...&namespace=...",
-            "budget_csv": "POST /budget/csv {answer? or rows[], iva_pct?, mode?}",
+            "budget_csv": "POST /budget/csv {answer? or rows[], iva_pct?, mode?, namespace?}",
             "ping_grok": "/ping_grok",
             "rag_search_get": "/rag/search?q=...&namespace=...",
         }
@@ -878,7 +956,7 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
         "answer": answer,
         "new_facts_detected": new_facts,
         "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE},
-        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>}.",
+        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>, 'namespace': '...'}",
     }
 
 @app.post("/ask")
@@ -905,7 +983,7 @@ async def ask(request: Request):
         "answer": answer,
         "new_facts_detected": new_facts,
         "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE},
-        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>}.",
+        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>, 'namespace': '...'}",
     }
 
 # ---------------------------------------------------------------------------------------
@@ -915,9 +993,9 @@ async def ask(request: Request):
 async def budget_csv(request: Request):
     """
     Body pode ser:
-    - {"answer": "<texto da Alma>"}   # o servidor extrai linhas/tabela
-    - {"rows": [...], "iva_pct": 23}  # se já tiveres as linhas
-    Opções extra: {"mode":"public|pro", "delimiter":";", "decimal":"comma|dot"}
+    - {"answer": "<texto da Alma>", "namespace":"boasafra"}  # servidor extrai linhas/tabela desse texto
+    - {"rows": [...], "iva_pct": 23, "namespace":"boasafra"} # se já tiveres as linhas
+    Opções: {"mode":"public|pro", "delimiter":";", "decimal":"comma|dot"}
     """
     data = await request.json()
     answer_text = (data.get("answer") or "").strip()
@@ -926,6 +1004,7 @@ async def budget_csv(request: Request):
     mode = (data.get("mode") or "public").strip()
     delimiter = (data.get("delimiter") or ";")
     decimal = (data.get("decimal") or "comma")
+    namespace = (data.get("namespace") or "").strip() or DEFAULT_NAMESPACE
 
     if not rows_in:
         if not answer_text:
@@ -938,9 +1017,8 @@ async def budget_csv(request: Request):
         return JSONResponse({"ok": False, "error": "Não encontrei linhas de orçamento no 'answer' e 'rows' não foi fornecido."}, status_code=400)
 
     try:
-        enriched = enrich_rows_with_rag(rows_in, iva_pct_default=iva_pct)
+        enriched = enrich_rows_with_rag(rows_in, iva_pct_default=iva_pct, namespace=namespace)
         csv_path = make_budget_csv(iva_pct, enriched, mode=mode, delimiter=delimiter, decimal=decimal)
-        # mini preview (apenas 20 linhas)
         preview = [
             "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
             "|---|---:|---:|---:|---|"
