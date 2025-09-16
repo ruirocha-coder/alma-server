@@ -1,8 +1,8 @@
-# main.py — Alma Server (RAG + Memória; sem modo orçamento; CSV opcional simples)
+# main.py — Alma Server (RAG-only + Memória) — sem orçamento/CSV
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -11,9 +11,7 @@ import logging
 import uvicorn
 import time
 import re
-import csv
 import json
-from io import StringIO
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -36,10 +34,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+no-budget-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-2+mem-strong-1")
 
 # ---------------------------------------------------------------------------------------
-# Prompt nuclear da Alma (sem modo orçamento)
+# Prompt nuclear da Alma
 # ---------------------------------------------------------------------------------------
 ALMA_MISSION = """
 És a Alma, inteligência da Boa Safra Lda (Boa Safra + Interior Guider).
@@ -48,9 +46,30 @@ sobreviva e prospere, com respostas úteis, objetivas e calmas.
 
 Estilo (estrito)
 - Clareza e concisão: vai direto ao ponto. Máximo 1 frase de abertura.
-- Empatia sob medida: só comenta o estado emocional quando houver sinais de stress.
-- Evita frases feitas e entusiasmos excessivos.
-- No fim, no máximo 1 pergunta que desbloqueie o próximo passo concreto.
+- Empatia sob medida: só comenta o estado emocional quando houver sinais de stress
+  (“urgente”, “aflito”, “atraso”, “problema”, “ansioso”, “sob pressão”). Caso contrário,
+  não faças small talk.
+- Valores implícitos: mantém o alinhamento sem o declarar. Nunca escrevas
+  “estou alinhada com os valores” ou “em nome da missão”.
+- Vocabulário disciplinado:
+  * “psicoestética/psicoestético” apenas quando tecnicamente relevante (no máximo 1 vez).
+  * Evita frases feitas e entusiasmos excessivos.
+- Seguimento: no fim, no máximo 1 pergunta, apenas se desbloquear o próximo passo concreto.
+
+Proibido
+- Iniciar com “Como vai o teu dia?”, “Espero que estejas bem”, “Espero que seja útil”
+  ou “alinhado com os valores…”.
+- Alongar justificações sobre missão/valores.
+- Emojis, múltiplas exclamações, tom efusivo.
+
+Funções
+1) Estratégia — apoiar a direção na definição/monitorização de estratégias de sobrevivência e crescimento.
+2) Apoio Comercial — esclarecer produtos, preços, prazos e características técnicas.
+3) Método (quando relevante) — aconselhar a equipa no método psicoestético sem anunciar o rótulo;
+   foca no raciocínio (luz, materiais, uso, bem-estar).
+4) Suporte Humano (condicional) — se houver stress, reconhecer e reduzir carga (“Vamos por partes…”).
+5) Procedimentos — explicar regras internas e leis relevantes de forma clara.
+6) Respostas Gerais — combinar RAG e Grok; se faltar evidência, diz o que não sabes e o passo para obter.
 
 Contexto
 - Boa Safra: editora de design natural português para a casa, com coleção própria.
@@ -69,6 +88,8 @@ Formato de resposta
 # Utilidades de URL e normalização
 # ---------------------------------------------------------------------------------------
 IG_HOST = os.getenv("IG_HOST", "interiorguider.com").lower()
+_BAD_HOSTS = {"w3.org", "www.w3.org", "schema.org", "www.schema.org"}
+_BAD_PREFIXES = ("mailto:", "tel:", "data:")
 
 def _canon_ig_url(u: str) -> str:
     try:
@@ -79,7 +100,7 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
     host = p.netloc.lower().replace("www.", "")
     if IG_HOST not in host:
-        # apenas canonizamos links IG; externos mantêm-se
+        # mantemos como está para sites externos; só canonizamos IG
         return u or ""
     path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
     path = re.sub(r"//+", "/", path)
@@ -88,16 +109,18 @@ def _canon_ig_url(u: str) -> str:
     p = p._replace(scheme="https", netloc=IG_HOST, path=path)
     return urlunparse(p)
 
+# --- transformar URLs soltas do IG (com e sem esquema) em markdown clicável ------------
 def _fix_product_links_markdown(text: str) -> str:
     if not text:
         return text
-    # [label](url)
+
+    # 1) links já em markdown → apenas canonizar IG
     def _md_repl(m):
         label, url = m.group(1), m.group(2)
         return f"[{label}]({_canon_ig_url(url)})"
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _md_repl, text)
 
-    # URLs cruas IG → [ver produto](url-normalizado)
+    # 2) URLs IG cruas com esquema → embrulhar em markdown
     def _raw_repl(m):
         url = m.group(0)
         fixed = _canon_ig_url(url)
@@ -107,6 +130,20 @@ def _fix_product_links_markdown(text: str) -> str:
         _raw_repl,
         text
     )
+
+    # 3) URLs IG cruas sem esquema (ex.: interiorguider.com/mesa-family) → https + markdown
+    def _noscheme_repl(m):
+        path = m.group(1)
+        fixed = f"https://{IG_HOST}{path}"
+        fixed = _canon_ig_url(fixed)
+        return f"[ver produto]({fixed})"
+    text = re.sub(
+        rf"(?<!\]\()(?<!https?://)(?:www\.)?{re.escape(IG_HOST)}(/[\w\-/\.%#\?=&]+)",
+        _noscheme_repl,
+        text,
+        flags=re.I
+    )
+
     return text
 
 def _postprocess_answer(answer: str) -> str:
@@ -140,9 +177,7 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
 RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
 DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None
 
-# ---------------------------------------------------------------------------------------
-# “Guess” por nome (suporte a pesquisa livre, opcional para contexto)
-# ---------------------------------------------------------------------------------------
+# --- Heurística de nomes -------------------------------------------------
 _NAME_HINTS = [
     r"\bmesa\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
     r"\bcadeira[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
@@ -150,6 +185,86 @@ _NAME_HINTS = [
     r"\bcama[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
     r"\bluminária[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
 ]
+
+# --- Aliases genéricos (singular/plural e sinónimos frequentes) ---------
+ALIAS_TERMS = {
+    r"\bcadeira(?:s)?\s+cod\b": ["cadeira cod", "cod chair"],
+    r"\bbanco(?:s)?\s+(?:tr[eê]s|3)\s+patas\b": ["3 leg stool", "banco três patas", "banco 3 patas"],
+    r"\bmesa\s+family\b": ["mesa family", "family table"],
+}
+
+def _expand_alias_queries(text: str) -> List[str]:
+    out = []
+    for pat, qlist in ALIAS_TERMS.items():
+        if re.search(pat, text, flags=re.I):
+            out.extend(qlist)
+    # dedupe mantendo ordem
+    seen=set(); res=[]
+    for q in out:
+        k=_norm(q)
+        if k not in seen:
+            seen.add(k); res.append(q)
+    return res
+
+def _extract_name_terms(text:str) -> List[str]:
+    t = " " + (text or "") + " "
+    terms = []
+
+    # aliases primeiro
+    terms.extend(_expand_alias_queries(text or ""))
+
+    for pat in _NAME_HINTS:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            terms.append(m.group(0).strip())
+    pieces = re.split(r"[,;\n]| e | com | para | de ", text or "", flags=re.I)
+    for c in pieces:
+        c = c.strip()
+        if 3 <= len(c) <= 60 and any(w in c.lower() for w in ["mesa","cadeira","banco","cama","luminária","luminaria"]):
+            terms.append(c)
+    seen=set(); out=[]
+    for s in map(_norm, terms):
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out[:8]
+
+# --- util para URLs dentro do texto do ponto do RAG ---------------------
+_URL_RE = re.compile(r"https?://[^\s)>\]\"']+", re.I)
+
+def _is_bad_url(u: str) -> bool:
+    if not u: return True
+    if any(u.lower().startswith(p) for p in _BAD_PREFIXES): return True
+    host = (urlparse(u).netloc or "").lower()
+    h = host.replace("www.", "")
+    return h in _BAD_HOSTS
+
+def _urls_from_text(txt: str, only_ig: bool = True) -> List[str]:
+    if not txt: return []
+    urls = _URL_RE.findall(txt)
+    out, seen = [], set()
+    for u in urls:
+        if _is_bad_url(u):  # filtra w3/schema/mailto/etc.
+            continue
+        if only_ig and IG_HOST not in (urlparse(u).netloc or "").lower():
+            continue
+        cu = _canon_ig_url(u) if IG_HOST in (urlparse(u).netloc or "").lower() else u.strip()
+        if cu and cu not in seen:
+            seen.add(cu); out.append(cu)
+    # preferir interiorguider.com
+    out.sort(key=lambda x: 0 if IG_HOST in (urlparse(x).netloc or "").lower() else 1)
+    return out
+
+def _best_product_url(meta: dict, text: str) -> str:
+    # 1º: metadata.url (de confiança)
+    u = (meta or {}).get("url") or ""
+    if u:
+        cu = _canon_ig_url(u)
+        if cu: return cu
+    # 2º: procurar no texto apenas URLs do IG
+    urls = _urls_from_text(text or "", only_ig=True)
+    return urls[0] if urls else ""
+
+# ---------------------------------------------------------------------------------------
+# Extração de preços (aproximada) -------------------------------------------------------
 _PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,6})")
 
 def _parse_money_eu(s: str) -> Optional[float]:
@@ -160,9 +275,9 @@ def _parse_money_eu(s: str) -> Optional[float]:
         s = re.sub(r"\s+", "", s)
         if "," in s and "." in s:
             if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")
+                s = s.replace(".", "").replace(",", ".")   # EU -> .
             else:
-                s = s.replace(",", "")
+                s = s.replace(",", "")                    # US -> remove milhar
         else:
             if "," in s:
                 s = s.replace(",", ".")
@@ -174,31 +289,81 @@ def _price_from_text(txt: str) -> Optional[float]:
     if not txt: return None
     m = _PRICE_RE.search(txt)
     if not m: return None
-    return None if m is None else _parse_money_eu(m.group(1))
+    return _parse_money_eu(m.group(1))
+
+# ---------------------------------------------------------------------------------------
+# Sugestão de produtos a partir do RAG --------------------------------------------------
+def rag_guess_products_by_name(question: str, top_k: int = 3) -> List[dict]:
+    if not RAG_READY:
+        return []
+    # termos vindos da heurística + aliases
+    base_terms = _extract_name_terms(question)
+    alias_terms = _expand_alias_queries(question)
+    terms = []
+    seen_norm = set()
+    for q in (base_terms + alias_terms):
+        k = _norm(q)
+        if k and k not in seen_norm:
+            seen_norm.add(k); terms.append(q)
+
+    results = []
+    seen_urls = set()
+    for term in terms:
+        try:
+            hits = search_chunks(query=term, namespace=DEFAULT_NAMESPACE, top_k=top_k) or []
+        except Exception:
+            hits = []
+        for h in hits:
+            meta = h.get("metadata", {}) or {}
+            text = h.get("text") or ""
+            title = (meta.get("title") or "").strip() or term
+            url = _best_product_url(meta, text)
+            if url and url in seen_urls:
+                continue
+            if url: seen_urls.add(url)
+            price = _price_from_text(text) or _price_from_text(title)
+            entry = {
+                "ref": "",
+                "name": title,
+                "url": url or "sem URL",
+                "price_gross": price,  # COM IVA quando capturado do site
+                "source": "SITE" if (url and IG_HOST in (urlparse(url).netloc or "").lower()) else "CATALOGO_EXTERNO"
+            }
+            results.append(entry)
+    return results
 
 def build_rag_products_block(question: str) -> str:
-    """Dá ao LLM um bloco curto com nomes/links sugeridos pelo RAG (ajuda a pôr links)."""
     if not RAG_READY:
         return ""
-    hits = []
+    # tentar hits diretos
     try:
         hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K) or []
     except Exception:
         hits = []
-    # sumarizar pelos primeiros títulos/URLs
-    seen = set()
+
     lines = []
+    seen = set()
+    # 1) hits diretos com URL pelo meta/texto
     for h in hits[:6]:
         meta = h.get("metadata", {}) or {}
-        title = (meta.get("title") or "").strip()
-        url = _canon_ig_url(meta.get("url") or "")
+        title = (meta.get("title") or "").strip() or "-"
+        url = _best_product_url(meta, h.get("text") or "")
         key = (title, url)
-        if key in seen:
+        if key in seen: 
             continue
         seen.add(key)
-        if title or url:
-            lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
-    return ("Produtos sugeridos pelo RAG:\n" + "\n".join(lines)) if lines else ""
+        lines.append(f"- NOME={title}; URL={url or 'sem URL'}")
+    # 2) poucos? completar com guesses por nome
+    if len(lines) < 3:
+        for g in rag_guess_products_by_name(question, top_k=3)[:6]:
+            key = (g.get("name","-"), g.get("url","sem URL"))
+            if key in seen: 
+                continue
+            seen.add(key)
+            price = g.get("price_gross")
+            price_str = f"{price:.2f}" if isinstance(price,(int,float)) else "N/D"
+            lines.append(f"- NOME={g.get('name','-')}; URL={g.get('url','sem URL')}; PRECO_COM_IVA={price_str}")
+    return "Produtos sugeridos pelo RAG:\n" + "\n".join(lines) if lines else ""
 
 # ---------------------------------------------------------------------------------------
 # Memória Local + (opcional) Mem0
@@ -217,11 +382,13 @@ if MEM0_ENABLE:
             try:
                 import mem0ai as _mem0_pkg
                 from mem0ai import MemoryClient as _MC
+                pkg_name = "mem0ai"
             except Exception:
                 import mem0 as _mem0_pkg
                 from mem0 import MemoryClient as _MC
+                pkg_name = "mem0"
             MemoryClient = _MC
-            log.info(f"[mem0] import OK ({_mem0_pkg.__name__}) file={getattr(_mem0_pkg,'__file__','?')}")
+            log.info(f"[mem0] import OK ({pkg_name}) file={getattr(_mem0_pkg,'__file__','?')}")
         except Exception as e:
             log.error(f"[mem0] import FAILED: {e}")
             MemoryClient = None
@@ -269,8 +436,7 @@ def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
         if hasattr(mem0_client, "memories"):
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
         else:
-            # SDK alternativo (legacy) não suportado → ignora
-            raise AttributeError("mem0 client sem .memories")
+            mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
     except Exception as e:
         log.warning(f"[mem0] create falhou: {e}")
 
@@ -281,7 +447,7 @@ def _mem0_search(query: str, user_id: str, limit: int = 5) -> List[str]:
         if hasattr(mem0_client, "memories"):
             results = mem0_client.memories.search(query=query or "contexto", user_id=user_id, limit=limit)
         else:
-            raise AttributeError("mem0 client sem .memories")
+            results = mem0_client.search(query=query or "contexto", user_id=user_id, limit=limit)
         snippets = []
         for item in results or []:
             val = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
@@ -294,11 +460,15 @@ def _mem0_search(query: str, user_id: str, limit: int = 5) -> List[str]:
 
 def mem0_set_fact(user_id: str, key: str, value: str):
     local_set_fact(user_id, key, value)
-    _mem0_create(
-        content=f"{FACT_PREFIX}{key}={value}",
-        user_id=user_id,
-        metadata={"source": "alma-server", "type": "fact", "key": key}
-    )
+    if not (MEM0_ENABLE and mem0_client): return
+    try:
+        _mem0_create(
+            content=f"{FACT_PREFIX}{key}={value}",
+            user_id=user_id,
+            metadata={"source": "alma-server", "type": "fact", "key": key}
+        )
+    except Exception as e:
+        log.warning(f"[mem0] fact create falhou: {e}")
 
 def mem0_get_facts(user_id: str, limit: int = 50) -> Dict[str, str]:
     facts = local_get_facts(user_id)
@@ -308,7 +478,7 @@ def mem0_get_facts(user_id: str, limit: int = 50) -> Dict[str, str]:
         if hasattr(mem0_client, "memories"):
             results = mem0_client.memories.search(query=FACT_PREFIX, user_id=user_id, limit=limit)
         else:
-            raise AttributeError("mem0 client sem .memories")
+            results = mem0_client.search(query=FACT_PREFIX, user_id=user_id, limit=limit)
         for item in results or []:
             content = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
             if content.startswith(FACT_PREFIX) and "=" in content[len(FACT_PREFIX):]:
@@ -321,33 +491,39 @@ def mem0_get_facts(user_id: str, limit: int = 50) -> Dict[str, str]:
         log.warning(f"[mem0] get_facts falhou: {e}")
         return facts
 
-def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
-    """Puxa nome/localização/preferências se o utilizador as escrever naturalmente."""
-    NAME_PATTERNS = [
-        r"\bchamo-?me\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
-        r"\bo\s+meu\s+nome\s+é\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
-        r"\bsou\s+(?:o|a)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
-    ]
-    CITY_PATTERNS = [
-        r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
-        r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
-        r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
-    ]
-    PREF_PATTERNS = [
-        r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
-        r"\bprefiro\s+([^\.]{3,80})",
-        r"\badoro\s+([^\.]{3,80})",
-        r"\bquero\s+([^\.]{3,80})",
-    ]
-    ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", "escritório", "hall", "entrada", "lavandaria"]
+# ---------------------------------------------------------------------------------------
+# Extração de factos simples do texto (nome, localização, preferências, divisão)
+# ---------------------------------------------------------------------------------------
+NAME_PATTERNS = [
+    r"\bchamo-?me\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bo\s+meu\s+nome\s+é\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bsou\s+(?:o|a)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+]
+CITY_PATTERNS = [
+    r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+]
+PREF_PATTERNS = [
+    r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
+    r"\bprefiro\s+([^\.]{3,80})",
+    r"\badoro\s+([^\.]{3,80})",
+    r"\bquero\s+([^\.]{3,80})",
+]
+ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", "escritório", "hall", "entrada", "lavandaria"]
 
+def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
     facts: Dict[str, str] = {}
-    t = " " + (text or "").strip() + " "
+    t = " " + (text or "") + " "
     for pat in NAME_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            facts["name"] = m.group(1).strip()
-            break
+            name = m.group(1).strip()
+            if len(name.split()) == 1 and name.lower() in {"melhor", "pior", "arquiteto", "cliente"}:
+                pass
+            else:
+                facts["name"] = name
+                break
     for pat in CITY_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
@@ -358,12 +534,13 @@ def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
     for pat in PREF_PATTERNS:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m:
-            facts.setdefault("preferences", m.group(1).strip(" .,'\""))
-            break
+            pref = m.group(1).strip(" .,'\"")
+            if 3 <= len(pref) <= 80:
+                facts.setdefault("preferences", pref)
+                break
     for kw in ROOM_KEYWORDS:
         if re.search(rf"\b{re.escape(kw)}\b", t, flags=re.IGNORECASE):
             facts["room"] = kw
-            break
     return facts
 
 def facts_to_context_block(facts: Dict[str, str]) -> str:
@@ -383,7 +560,7 @@ def facts_block_for_user(user_id: str) -> str:
     return facts_to_context_block(facts)
 
 # ---------------------------------------------------------------------------------------
-# x.ai (Grok)
+# Config Grok (x.ai)
 # ---------------------------------------------------------------------------------------
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
@@ -408,19 +585,19 @@ def grok_chat(messages, timeout=120):
     return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
 
 # ---------------------------------------------------------------------------------------
-# Construção das mensagens (sem modo orçamento)
+# Construção das mensagens (RAG-first, sem módulo de orçamento)
 # ---------------------------------------------------------------------------------------
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # 0) factos leves
+    # 0) extrair e guardar factos rápidos
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 1) memória curto prazo
+    # 1) mem de curto prazo
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
     memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
-    # 2) RAG — bloco de conhecimento & produtos
+    # 2) RAG — bloco de conhecimento & produtos (sempre fornece nomes+URLs válidos)
     rag_block = ""
     rag_used = False
     if RAG_READY:
@@ -430,10 +607,12 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
             rag_used = bool(rag_block)
         except Exception as e:
             log.warning(f"[rag] search falhou: {e}")
+            rag_block = ""
+            rag_used = False
 
     products_block = build_rag_products_block(question)
 
-    # 3) mensagens
+    # 3) construir mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
     fb = facts_block_for_user(user_id)
     if fb: messages.append({"role": "system", "content": fb})
@@ -447,7 +626,7 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     return messages, new_facts, rag_used
 
 # ---------------------------------------------------------------------------------------
-# Páginas
+# ROTAS BÁSICAS
 # ---------------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
@@ -457,7 +636,7 @@ def serve_index():
     except Exception:
         return HTMLResponse("<h1>index.html não encontrado</h1>", status_code=404)
 
-# serve explicitamente o alma-chat.html (sem tocar no index)
+# Página do Alma Chat (serve alma-chat.html)
 @app.get("/alma-chat", response_class=HTMLResponse)
 @app.get("/alma-chat/", response_class=HTMLResponse)
 def alma_chat():
@@ -466,15 +645,12 @@ def alma_chat():
         return FileResponse(html_path, media_type="text/html")
     return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
 
-# ---------------------------------------------------------------------------------------
-# Status / Saúde
-# ---------------------------------------------------------------------------------------
 @app.get("/status")
 def status_json():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "message": "Alma server ativo. Usa POST /ask (Grok+Memória+RAG).",
+        "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG).",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
         "rag": {"available": RAG_READY, "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE},
         "endpoints": {
@@ -482,7 +658,7 @@ def status_json():
             "ask": "POST /ask {question, user_id?, namespace?}",
             "ask_get": "/ask_get?q=...&user_id=...&namespace=...",
             "ping_grok": "/ping_grok",
-            "csv_make": "POST /csv/make"
+            "rag_search_get": "/rag/search?q=...&namespace=...",
         }
     }
 
@@ -497,9 +673,6 @@ def health():
         "rag_default_namespace": DEFAULT_NAMESPACE
     }
 
-# ---------------------------------------------------------------------------------------
-# API básica
-# ---------------------------------------------------------------------------------------
 @app.post("/echo")
 async def echo(request: Request):
     data = await request.json()
@@ -514,6 +687,9 @@ def ping_grok():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------------------------------------------------------------------------------------
+# RAG: GET /rag/search (debug)
+# ---------------------------------------------------------------------------------------
 @app.get("/rag/search")
 def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     if not RAG_READY:
@@ -524,6 +700,9 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------------------------------------------------------------------------------------
+# ASK endpoints (sem orçamento/CSV; apenas resposta + pós-processo de links)
+# ---------------------------------------------------------------------------------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     if not q: return {"answer": "Falta query param ?q="}
@@ -533,14 +712,14 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
     answer = _postprocess_answer(answer)
-    local_append_dialog(user_id, q, answer)
-    _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-    return {
-        "answer": answer,
-        "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
-    }
+    try:
+        local_append_dialog(user_id, q, answer)
+        _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    except Exception:
+        pass
+    return {"answer": answer, "new_facts_detected": new_facts,
+            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
 
 @app.post("/ask")
 async def ask(request: Request):
@@ -558,58 +737,15 @@ async def ask(request: Request):
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
     answer = _postprocess_answer(answer)
-    local_append_dialog(user_id, question, answer)
-    _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-    return {
-        "answer": answer,
-        "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
-    }
+    try:
+        local_append_dialog(user_id, question, answer)
+        _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    except Exception:
+        pass
 
-# ---------------------------------------------------------------------------------------
-# CSV simples (opcional) — recebe linhas já estruturadas do frontend e devolve CSV.
-# NÃO tenta extrair nada do texto da Alma. É apenas um utilitário.
-# Exemplo payload:
-# {
-#   "headers": ["Item","Quant.","Preço UNI (c/IVA)","Link"],
-#   "rows": [
-#     ["Mesa Family", "1", "1802,00", "https://interiorguider.com/mesa-family"],
-#     ["Cadeira Cod", "4", "168,00", "https://interiorguider.com/cadeira-cod"]
-#   ],
-#   "delimiter": ";"
-# }
-# ---------------------------------------------------------------------------------------
-@app.post("/csv/make")
-async def csv_make(request: Request):
-    data = await request.json()
-    headers = data.get("headers") or ["Item","Quant.","Preço UNI (c/IVA)","Link"]
-    rows = data.get("rows") or []
-    delimiter = (data.get("delimiter") or ";")[0]
-    # normalizar links IG nas células
-    norm_rows = []
-    for r in rows:
-        rr = []
-        for c in r:
-            s = str(c or "")
-            # se a célula for um URL IG, canoniza
-            if s.startswith("http") and IG_HOST in (urlparse(s).netloc or "").lower():
-                s = _canon_ig_url(s)
-            rr.append(s)
-        norm_rows.append(rr)
-
-    sio = StringIO()
-    writer = csv.writer(sio, delimiter=delimiter)
-    writer.writerow(headers)
-    for r in norm_rows:
-        writer.writerow(r)
-    csv_bytes = sio.getvalue().encode("utf-8-sig")
-    fname = f"alma_export_{int(time.time())}.csv"
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
-    )
+    return {"answer": answer, "new_facts_detected": new_facts,
+            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
 
 # --- local run ----------------------------------------------------------
 if __name__ == "__main__":
