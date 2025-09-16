@@ -70,7 +70,7 @@ Funções
 4) Suporte Humano (condicional) — se houver stress, reconhecer e reduzir carga (“Vamos por partes…”).
 5) Procedimentos — explicar regras internas e leis relevantes de forma clara.
 6) Respostas Gerais — combinar RAG e Grok; se faltar evidência, diz o que não sabes e o passo para obter.
-7) Orçamentos — para queries com 'orçamento' ou múltiplos itens: usa APENAS os dados exatos do bloco 'Produtos para orçamento' (QTY, NOME, URL). Calcula subtotal por item e total. Inclui TODOS os URLs em [nome](url). Se faltar preço/URL no RAG, usa 'sem info no RAG' e sugere contacto. Mantém consistência: não inventes dados.
+7) Orçamentos — para queries com 'orçamento' ou múltiplos itens: usa APENAS os dados exatos do bloco 'Produtos para orçamento' (QTY, NOME, URL). Calcula subtotal por item e total. Inclui TODOS os URLs em [nome](url). Para itens como 'cadeiras cod', usa variantes como 'cadeira cod' no RAG. Sempre tenta mapear URLs do products_block para cada item listado. Se faltar preço/URL no RAG, usa 'sem info no RAG' e sugere contacto. Mantém consistência: não inventes dados.
 
 Contexto
 - Boa Safra: editora de design natural português para a casa, com coleção própria.
@@ -190,11 +190,12 @@ _NAME_HINTS = [
 ]
 _PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,6})")
 
-# --- padrões para orçamentos ---
+# --- padrões para orçamentos (melhorado: captura sem 'x') ---
 BUDGET_PATTERNS = [
     r"\borçament[oô]\s+(?:para|de)\s+(\d+)",  # "orçamento para 3"
     r"(\d+)\s*(?:artigos?|itens?|produtos?)",  # "3 artigos"
     r"(\d+)\s*(?:x|unid\.?|unidades?)\s*(?:de|da|do)?\s*([a-z0-9çáéíóúâêôãõ ]{3,})",  # "2x cadeira modelo"
+    r"(\d+)\s+([a-z0-9çáéíóúâêôãõ ]{3,})",  # Novo: "1 mesa family" ou "4 cadeiras cod" (número + nome direto)
 ]
 
 def _extract_name_terms(text:str) -> List[str]:
@@ -202,12 +203,20 @@ def _extract_name_terms(text:str) -> List[str]:
     terms = []
     for pat in _NAME_HINTS:
         for m in re.finditer(pat, t, flags=re.IGNORECASE):
-            terms.append(m.group(0).strip())
+            term = m.group(0).strip()
+            # Melhoria: filtra termos que incluem "e 1" ou conectores desnecessários
+            if " e " in term and re.search(r"\d+\s+(?:banco|mesa|cadeira)", term):
+                continue  # Evita termos compostos ruins como "cadeiras cod e 1 banco"
+            terms.append(term)
     pieces = re.split(r"[,;\n]| e | com | para | de ", text or "", flags=re.I)
     for c in pieces:
         c = c.strip()
         if 3 <= len(c) <= 60 and any(w in c.lower() for w in ["mesa","cadeira","banco","cama","luminária","luminaria"]):
-            terms.append(c)
+            # Melhoria: só adiciona se não for só número ou conector
+            if re.match(r"^\d+\s+", c):
+                c = re.sub(r"^\d+\s+", "", c).strip()
+            if len(c) >= 3:
+                terms.append(c)
     seen=set(); out=[]
     for s in map(_norm, terms):
         if s and s not in seen:
@@ -215,7 +224,7 @@ def _extract_name_terms(text:str) -> List[str]:
     return out[:8]
 
 def _extract_budget_items(text: str) -> List[Tuple[int, str]]:
-    """Extrai (quantidade, nome_item) de queries de orçamento."""
+    """Extrai (quantidade, nome_item) de queries de orçamento. Melhorado para capturar sem 'x'."""
     t = " " + (text or "") + " "
     items = []
     for pat in BUDGET_PATTERNS:
@@ -223,12 +232,13 @@ def _extract_budget_items(text: str) -> List[Tuple[int, str]]:
             if len(m.groups()) == 2:
                 qty = int(m.group(1))
                 name = m.group(2).strip()
-                if qty > 0 and len(name) > 2:
+                if qty > 0 and len(name) > 2 and any(w in name.lower() for w in ["mesa","cadeira","banco","cama","luminária"]):  # Filtra por keywords de produto
                     items.append((qty, name))
             elif len(m.groups()) == 1:
                 qty = int(m.group(1))
-                if qty >= 2:  # Assume multi-item se qty>1
-                    items.append((qty, "artigo genérico"))  # Fallback
+                if qty >= 2:
+                    # Fallback removido ou condicional; usa só se query tem "artigos" etc.
+                    pass
     # Deduplica e limita
     seen = set()
     out = []
@@ -266,10 +276,7 @@ def _price_from_text(txt: str) -> Optional[float]:
 # -------- Mini-pesquisa RAG por termo (links IG) --------
 def _expand_variants(term: str) -> List[str]:
     """
-    Gera variantes simples para melhorar a cobertura do RAG:
-    - remove quantidades ('4 cadeiras cod' -> 'cadeiras cod')
-    - tenta singular/plural básico (cadeiras <-> cadeira, etc.)
-    - recortes 2..4 tokens
+    Gera variantes simples para melhorar a cobertura do RAG. Melhorado para sufixos como 'cod'.
     """
     t = (term or "").strip()
     if not t:
@@ -302,6 +309,11 @@ def _expand_variants(term: str) -> List[str]:
         if w0 in inv:
             v = " ".join([inv[w0]] + words[1:])
             variants.add(v)
+        # Novo: para sufixos como 'cod', adiciona variantes com singular + sufixo
+        if len(words) > 1 and words[-1].lower() in ['cod', 'modelo']:
+            if w0 in sp_map:
+                v = f"{sp_map[w0]} {words[-1]}"
+                variants.add(v)
 
     if len(words) >= 2: variants.add(" ".join(words[:2]))
     if len(words) >= 3: variants.add(" ".join(words[:3]))
@@ -353,6 +365,7 @@ def rag_mini_search_urls(terms: List[str], namespace: Optional[str], top_k: int)
                 break
         if best_url:
             url_by_term[_norm(term)] = best_url
+    log.info(f"[debug] url_by_term for terms {terms}: {url_by_term}")  # Novo log
     return url_by_term
 
 # ---------------------------------------------------------------------------------------
@@ -555,7 +568,7 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
     1) Usa mini-pesquisa RAG por termo (query + resposta) com top_k consistente.
     2) Substitui '[...] (sem URL)' e 'sem URL' por links IG quando possível.
     3) Se um termo aparecer sem link, injeta 1 link markdown na primeira ocorrência.
-    4) Para orçamentos, injeta em linhas com quantidades/nomes.
+    4) Para orçamentos, injeta em linhas com quantidades/nomes, usando budget_items da query.
     """
     if not (RAG_READY and text):
         return text
@@ -582,7 +595,7 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
             chosen = list(url_by_term.values())[0]
         # 1c) último recurso: primeiro URL disponível
         if not chosen:
-            chosen = list(url_by_term.values())[0]
+            chosen = list(url_by_term.values())[0] if url_by_term else ""
         return f"[{label}]({chosen})" if chosen else m.group(0)
 
     out = re.sub(r"\[([^\]]+)\]\(\s*sem\s+url\s*\)", _fix_sem_url, out, flags=re.I)
@@ -629,17 +642,23 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
             if injected:
                 break
 
-    # 4) Para orçamentos, injeta em linhas com quantidades/nomes (ex.: "- 2 cadeiras: 150€")
+    # 4) Para orçamentos, injeta em linhas com quantidades/nomes (ex.: "- 2 cadeiras: 150€"), usando budget_items
     if "orçament" in user_query.lower():
         budget_items = _extract_budget_items(user_query)
+        log.info(f"[debug] budget_items for injection: {budget_items}")  # Novo log
         out_lines = out.splitlines()
         for i, line in enumerate(out_lines):
             for qty, item_name in budget_items:
                 tnorm = _norm(item_name)
                 if tnorm in _norm(line) and not _MD_LINK_RE.search(line):
                     url = url_by_term.get(tnorm, "")
+                    if not url and tnorm in url_by_term:  # Fallback para variantes (ex.: 'cadeiras cod' -> 'cadeira cod')
+                        for utnorm in url_by_term:
+                            if 'cod' in utnorm and 'cadeira' in utnorm:
+                                url = url_by_term[utnorm]
+                                break
                     if url:
-                        # Envolve o nome do item
+                        # Envolve o nome do item (case insensitive)
                         m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
                         if m:
                             nome_part = m.group(1)
@@ -689,8 +708,8 @@ def _decide_top_k(user_query: str, req_top_k: Optional[int]) -> int:
     
     n_terms = len(_extract_name_terms(user_query or ""))
     budget_items = _extract_budget_items(user_query)
-    if "orçament" in user_query.lower() or len(budget_items) >= 2:
-        base = 20 + (len(budget_items) * 4)  # Ex.: 3 itens -> top_k=32
+    if "orçament" in user_query.lower() or len(budget_items) >= 2 or n_terms >= 2:
+        base = 20 + (len(budget_items or [1] * n_terms) * 4)  # Boost se budget ou multi-term
     elif n_terms >= 3:
         base = 16
     elif n_terms == 2:
@@ -704,14 +723,15 @@ def build_rag_products_block(question: str) -> str:
         return ""
     
     budget_items = _extract_budget_items(question)
+    log.info(f"[debug] budget_items in products_block: {budget_items}")  # Novo log
     lines = []
     
     if budget_items:
         # Searches separados por item para melhor precisão
         for qty, item_name in budget_items[:6]:
-            query_item = f"{qty} {item_name}"  # Ex.: "2 cadeira modelo"
+            query_item = f"{item_name}"  # Foco no nome, qty no formato
             try:
-                hits = search_chunks(query=query_item, namespace=DEFAULT_NAMESPACE, top_k=5) or []  # Top-k menor por item
+                hits = search_chunks(query=query_item, namespace=DEFAULT_NAMESPACE, top_k=8) or []  # Aumenta top_k por item
             except Exception:
                 hits = []
             
@@ -724,25 +744,33 @@ def build_rag_products_block(question: str) -> str:
                 if key in seen: continue
                 seen.add(key)
                 lines.append(f"- QTY={qty}; NOME={title}; URL={url or 'sem URL'}")
-            if not lines:  # Fallback se sem hits
-                links = rag_mini_search_urls([item_name], DEFAULT_NAMESPACE, top_k=5)
+                break  # Pega o melhor hit por item
+            if not seen:  # Fallback se sem hits
+                links = rag_mini_search_urls([item_name], DEFAULT_NAMESPACE, top_k=8)
                 url = links.get(_norm(item_name), "sem URL")
                 lines.append(f"- QTY={qty}; NOME={item_name}; URL={url}")
     else:
-        # Lógica original para queries não-orçamento
-        try:
-            hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
-        except Exception:
-            hits = []
-        seen = set()
-        for h in hits[:8]:  # Aumenta para 8
-            meta = h.get("metadata", {}) or {}
-            title = (meta.get("title") or "").strip()
-            url = _canon_ig_url(meta.get("url") or "")
-            key = (title, url)
-            if key in seen: continue
-            seen.add(key)
-            lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
+        # Fallback melhorado: usa name_terms como itens com qty=1
+        name_terms = _extract_name_terms(question)
+        for term in name_terms[:6]:
+            try:
+                hits = search_chunks(query=term, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+            except Exception:
+                hits = []
+            seen = set()
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                title = (meta.get("title") or term).strip()
+                url = _canon_ig_url(meta.get("url") or "")
+                key = (title, url)
+                if key in seen: continue
+                seen.add(key)
+                lines.append(f"- QTY=1; NOME={title}; URL={url or 'sem URL'}")
+                break
+            if not seen:
+                links = rag_mini_search_urls([term], DEFAULT_NAMESPACE, top_k=8)
+                url = links.get(_norm(term), "sem URL")
+                lines.append(f"- QTY=1; NOME={term}; URL={url}")
     
     return "Produtos para orçamento (do RAG; usa estes dados exatos para preços e links):\n" + "\n".join(lines) if lines else ""
 
