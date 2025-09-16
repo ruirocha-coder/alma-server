@@ -740,6 +740,18 @@ def serve_index():
     except Exception:
         return HTMLResponse("<h1>index.html não encontrado</h1>", status_code=404)
 
+# ---------------------------------------------------------------------------------------
+# Página do Alma Chat (serve alma-chat.html)
+# ---------------------------------------------------------------------------------------
+@app.get("/alma-chat", response_class=HTMLResponse)
+@app.get("/alma-chat/", response_class=HTMLResponse)
+def alma_chat():
+    html_path = os.path.join(os.getcwd(), "alma-chat.html")
+    if os.path.exists(html_path):
+        return FileResponse(html_path, media_type="text/html")
+    return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
+
+
 @app.get("/status")
 def status_json():
     return {
