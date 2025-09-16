@@ -1,4 +1,4 @@
-# main.py — Alma Server (RAG-only + Memória + CSV automático no modo orçamento)
+# main.py — Alma Server (RAG-only + Memória + CSV on-demand)
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +38,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-auto-csv-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-on-demand-1")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma
@@ -89,7 +89,7 @@ Formato de resposta
 """
 
 # ---------------------------------------------------------------------------------------
-# Prompt adicional: MODO ORÇAMENTOS (RAG-first, sem catálogo)
+# Prompt adicional: MODO ORÇAMENTOS (regras para quando pedires CSV)
 # ---------------------------------------------------------------------------------------
 ALMA_ORCAMENTO_PROMPT = """
 REGRAS MODO ORÇAMENTO (ESTRITO):
@@ -126,7 +126,7 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
     host = p.netloc.lower().replace("www.", "")
     if IG_HOST not in host:
-        # mantemos como está para sites externos; só canonizamos IG
+        # manter como está para sites externos; só canonizamos IG
         return u or ""
     path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
     path = re.sub(r"//+", "/", path)
@@ -571,6 +571,10 @@ def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
             iva_pct = int(obj.get("iva_pct", 23))
             rows = obj.get("rows") or []
             if isinstance(rows, list) and rows:
+                # normalizar links que possam vir em markdown
+                for r in rows:
+                    if "link" in r:
+                        r["link"] = _normalize_link_field(r.get("link") or "")
                 return {"iva_pct": iva_pct, "rows": rows}
         except Exception:
             pass
@@ -599,7 +603,7 @@ def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
                 "quant": quant,
                 "preco_uni": preco,
                 "desc_pct": desc,
-                "link": link
+                "link": _normalize_link_field(link)
             })
     return {"iva_pct": iva_pct, "rows": rows}
 
@@ -751,7 +755,6 @@ def alma_chat():
         return FileResponse(html_path, media_type="text/html")
     return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
 
-
 @app.get("/status")
 def status_json():
     return {
@@ -830,16 +833,24 @@ def _normalize_link_field(v: str) -> str:
     return m.group(2).strip() if m else v
 
 def _urls_from_text(txt: str) -> List[str]:
+    """
+    Extrai 1 URL útil do texto, ignorando ruído (schema.org, w3.org/ogp, etc.),
+    priorizando interiorguider.com quando existir.
+    """
     if not txt: return []
     urls = _URL_RE.findall(txt)
     out, seen = [], set()
+    NOISE = ("w3.org/1999/02/22-rdf-syntax-ns", "schema.org", "ogp.me", "opengraphprotocol.org")
     for u in urls:
+        ul = u.lower()
+        if any(n in ul for n in NOISE):
+            continue
         host = (_urlparse(u).netloc or "").lower()
         cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
         if cu and cu not in seen:
             seen.add(cu); out.append(cu)
-    # preferir interiorguider.com
-    return sorted(out, key=lambda x: 0 if IG_HOST in (_urlparse(x).netloc or "").lower() else 1)
+    out.sort(key=lambda x: 0 if IG_HOST in (_urlparse(x).netloc or "").lower() else 1)
+    return out[:1]
 
 # --- enriquecer linhas do orçamento com dados do RAG --------------------
 def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
@@ -886,7 +897,46 @@ def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> Lis
         out.append(rr)
     return out
 
-# --- ASK endpoints (com enrich + preview + CSV) -------------------------
+# ---------------------------------------------------------------------------------------
+# CSV ON-DEMAND: POST /budget/csv
+# ---------------------------------------------------------------------------------------
+@app.post("/budget/csv")
+async def budget_csv(request: Request):
+    """
+    Gera CSV de orçamento **a pedido**.
+    Aceita:
+      - {"answer": "<texto da resposta do /ask>"}  -> extrai linhas automaticamente
+      - {"rows": [...], "iva_pct": 23}             -> usa linhas já estruturadas
+    Opcional: {"mode": "public"|"pro"} (default public)
+    """
+    data = await request.json()
+    answer_text = (data.get("answer") or "").strip()
+    rows_in = data.get("rows")
+    iva_pct = data.get("iva_pct")
+    mode = (data.get("mode") or "public").strip().lower()
+
+    if not rows_in:
+        obj = parse_budget_rows_from_answer(answer_text)
+    else:
+        obj = {"iva_pct": int(iva_pct or 23), "rows": rows_in}
+
+    # robustez extra: normalizar links malformados/markdown
+    for r in obj.get("rows", []) or []:
+        if "link" in r:
+            r["link"] = _normalize_link_field(r.get("link") or "")
+
+    enriched = enrich_rows_with_rag(obj.get("rows") or [], iva_pct_default=obj.get("iva_pct", 23))
+    csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode=mode, delimiter=";", decimal="comma")
+
+    return {
+        "ok": True,
+        "csv_download": csv_path,
+        "rows_enriched": enriched,
+        "iva_pct": obj.get("iva_pct", 23),
+        "mode": mode
+    }
+
+# --- ASK endpoints (sem CSV automático; inclui apenas CTA) ---------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     if not q: return {"answer": "Falta query param ?q="}
@@ -904,29 +954,11 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
             "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
 
     if _is_budget_request(q):
-        obj = parse_budget_rows_from_answer(answer)
-        if obj.get("rows"):
-            try:
-                enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
-                # preview compacta
-                preview = [
-                    "\n**(Corrigido — links/preços verificados no RAG):**",
-                    "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
-                    "|---|---:|---:|---:|---|"
-                ]
-                for e in enriched[:20]:
-                    ref_or_name = e.get("ref") or e.get("descricao","-")
-                    qtd = e.get("quant", 1)
-                    preco = e.get("preco_uni", "-")
-                    desc = e.get("desc_pct", "")
-                    link = _normalize_link_field(e.get("link", "")) or "sem URL"
-                    preview.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
-                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview))
-                resp["csv_download"] = csv_path
-                resp["rows_enriched"] = enriched
-            except Exception as e:
-                resp["csv_error"] = str(e)
+        resp["budget_hint"] = {
+            "message": "Queres que transforme esta resposta num CSV de orçamento?",
+            "how_to": "POST /budget/csv com {answer: resp.answer} ou com {rows:[...]}",
+            "endpoint": "/budget/csv"
+        }
     return resp
 
 @app.post("/ask")
@@ -953,28 +985,11 @@ async def ask(request: Request):
             "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
 
     if _is_budget_request(question):
-        obj = parse_budget_rows_from_answer(answer)
-        if obj.get("rows"):
-            try:
-                enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
-                preview = [
-                    "\n**(Corrigido — links/preços verificados no RAG):**",
-                    "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
-                    "|---|---:|---:|---:|---|"
-                ]
-                for e in enriched[:20]:
-                    ref_or_name = e.get("ref") or e.get("descricao","-")
-                    qtd = e.get("quant", 1)
-                    preco = e.get("preco_uni", "-")
-                    desc = e.get("desc_pct", "")
-                    link = _normalize_link_field(e.get("link", "")) or "sem URL"
-                    preview.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
-                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview))
-                resp["csv_download"] = csv_path
-                resp["rows_enriched"] = enriched
-            except Exception as e:
-                resp["csv_error"] = str(e)
+        resp["budget_hint"] = {
+            "message": "Queres que transforme esta resposta num CSV de orçamento?",
+            "how_to": "POST /budget/csv com {answer: resp.answer} ou com {rows:[...]}",
+            "endpoint": "/budget/csv"
+        }
     return resp
 
 # --- local run ----------------------------------------------------------
