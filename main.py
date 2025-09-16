@@ -1,4 +1,4 @@
-# main.py — Alma Server (RAG-only + Memória + CSV on-demand)
+# main.py — Alma Server (RAG-only + Memória + CSV a pedido)
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,8 +16,6 @@ import json
 from io import StringIO
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
-import difflib
-import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------------------
 # FastAPI & CORS
@@ -38,7 +36,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-on-demand-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag-only-1+mem-strong-1+budget-csv-on-demand-1")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma
@@ -89,27 +87,15 @@ Formato de resposta
 """
 
 # ---------------------------------------------------------------------------------------
-# Prompt adicional: MODO ORÇAMENTOS (regras para quando pedires CSV)
+# Prompt adicional: MODO ORÇAMENTOS — (apenas para orientar a escrita da Alma; CSV é a pedido)
 # ---------------------------------------------------------------------------------------
 ALMA_ORCAMENTO_PROMPT = """
 REGRAS MODO ORÇAMENTO (ESTRITO):
 - O preço do site interiorguider.com é COM IVA. Usa preço COM IVA quando houver URL do site.
 - NÃO inventes produtos nem URLs. Usa apenas itens encontrados no RAG. Se faltar URL, escreve "sem URL".
 - Se o item for de catálogo externo (sem link IG), acrescenta "disponibilidade a confirmar".
-- Se o pedido não indicar variante, assume a VARIANTE DEFAULT (dimensão/tecido/cor base) e lista explicitamente o que assumiste.
-- Quando faltar detalhe, sugere escolhas para afinar o orçamento (dimensão, tecido/cor/acabamento, estrutura, etc.).
-- A pré-visualização no chat deve ser uma TABELA COMPACTA (REF/NOME, QTD, PREÇO UNI (C/IVA), DESCONTO, TOTAL (C/IVA), LINK).
-- Mantém a lista completa; se for longa, devolve por blocos até 20 linhas por bloco.
-
-Saída no chat:
-- 1) Tabela curta no chat (pré-visualização).
-- 2) Linhas em JSON no final entre tags ```json ... ```, com este formato:
-  {
-    "iva_pct": 23,
-    "rows": [
-      {"ref":"", "descricao":"", "quant":1, "preco_uni":"219,00", "desc_pct":"", "link":"https://interiorguider.com/..."}
-    ]
-  }
+- Se o pedido não indicar variante, assume a VARIANTE DEFAULT e lista explicitamente o que assumiste.
+- A pré-visualização no chat pode usar tabela compacta; no fim, se quiser CSV, será pedido à parte.
 """
 
 # ---------------------------------------------------------------------------------------
@@ -126,7 +112,7 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
     host = p.netloc.lower().replace("www.", "")
     if IG_HOST not in host:
-        # manter como está para sites externos; só canonizamos IG
+        # mantemos como está para sites externos; só canonizamos IG
         return u or ""
     path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
     path = re.sub(r"//+", "/", path)
@@ -337,10 +323,15 @@ def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
 def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
     if not (MEM0_ENABLE and mem0_client):
         return
+    # tenta .memories.create; se não existir, tenta .create
     try:
-        if hasattr(mem0_client, "memories"):
+        if hasattr(mem0_client, "memories") and hasattr(mem0_client.memories, "create"):
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
-        else:
+            return
+    except Exception as e:
+        log.warning(f"[mem0] memories.create falhou: {e}")
+    try:
+        if hasattr(mem0_client, "create"):
             mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
     except Exception as e:
         log.warning(f"[mem0] create falhou: {e}")
@@ -495,7 +486,7 @@ def facts_to_context_block(facts: Dict[str, str]) -> str:
     return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------------------
-# DETETOR de orçamento
+# DETETOR de orçamento (apenas para orientar prompt; CSV é a pedido)
 # ---------------------------------------------------------------------------------------
 def _is_budget_request(text: str) -> bool:
     if not text:
@@ -555,10 +546,72 @@ def _fmt_money(x: float, decimal="comma"):
     s = f"{x:.2f}"
     return s.replace(".", ",") if decimal == "comma" else s
 
+def _normalize_link_field(v: str) -> str:
+    if not v: return ""
+    v = str(v).strip()
+    m = re.search(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", v, flags=re.I)
+    return m.group(2).strip() if m else v
+
+def _urls_from_text(txt: str) -> List[str]:
+    if not txt: return []
+    urls = re.findall(r"https?://[^\s)>\]]+", txt, flags=re.I)
+    out, seen = [], set()
+    for u in urls:
+        host = (urlparse(u).netloc or "").lower()
+        cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
+        if cu and cu not in seen:
+            seen.add(cu); out.append(cu)
+    # preferir interiorguider.com
+    return sorted(out, key=lambda x: 0 if IG_HOST in (urlparse(x).netloc or "").lower() else 1)
+
+def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
+    if not rows or not RAG_READY: return rows
+    out = []
+    for r in rows:
+        rr = dict(r)
+        name_q = rr.get("descricao") or rr.get("ref") or ""
+        raw_link = (rr.get("link") or "").strip()
+        link_norm = _normalize_link_field(raw_link)
+        rr["link"] = link_norm
+        need_link = (not link_norm) or (not link_norm.lower().startswith("http")) or (link_norm.lower() in {"sem url","-","n/d"})
+        need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0"))
+
+        if (need_link or need_price) and name_q:
+            try:
+                hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+            except Exception:
+                hits = []
+            # tentativa curta (melhor matching quando a frase é comprida)
+            if (not hits) and len(name_q) > 18:
+                key = " ".join([w for w in re.findall(r"[A-Za-z0-9]+", name_q) if len(w) <= 6][:3]).lower()
+                try:
+                    more = search_chunks(query=key, namespace=DEFAULT_NAMESPACE, top_k=8) or []
+                except Exception:
+                    more = []
+                hits = more or hits
+
+            best_url = ""
+            best_price = None
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                text = h.get("text") or ""
+                title = meta.get("title") or ""
+                urls = []
+                if meta.get("url"): urls.append(_canon_ig_url(meta["url"]))
+                urls.extend(_urls_from_text(text))
+                if urls and not best_url: best_url = urls[0]
+                price = _price_from_text(text) or _price_from_text(title)
+                if (price is not None) and (best_price is None): best_price = price
+
+            if need_link: rr["link"] = best_url if best_url else "sem URL"
+            if need_price and (best_price is not None): rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
+        out.append(rr)
+    return out
+
 def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
     """
-    Procura um bloco ```json ... ``` com {"iva_pct":..., "rows":[...]}
-    Se não encontrar, tenta extrair linhas de uma tabela Markdown simples.
+    Procura bloco ```json {iva_pct, rows} ``` OU tabela Markdown.
+    Devolve {"iva_pct": int, "rows": [ ... ]}.
     """
     iva_pct = 23
     rows: List[Dict] = []
@@ -571,10 +624,6 @@ def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
             iva_pct = int(obj.get("iva_pct", 23))
             rows = obj.get("rows") or []
             if isinstance(rows, list) and rows:
-                # normalizar links que possam vir em markdown
-                for r in rows:
-                    if "link" in r:
-                        r["link"] = _normalize_link_field(r.get("link") or "")
                 return {"iva_pct": iva_pct, "rows": rows}
         except Exception:
             pass
@@ -603,11 +652,12 @@ def parse_budget_rows_from_answer(llm_answer: str) -> Dict:
                 "quant": quant,
                 "preco_uni": preco,
                 "desc_pct": desc,
-                "link": _normalize_link_field(link)
+                "link": link
             })
     return {"iva_pct": iva_pct, "rows": rows}
 
-def make_budget_csv(iva_pct: float, rows: List[dict], mode: str = "public", delimiter: str = ";", decimal: str = "comma") -> str:
+def make_budget_csv(iva_pct: float, rows: List[dict], mode: str = "public",
+                    delimiter: str = ";", decimal: str = "comma") -> str:
     if mode not in ("public", "pro"):
         mode = "public"
     if not isinstance(rows, list) or not rows:
@@ -688,7 +738,6 @@ def grok_chat(messages, timeout=120):
 # ---------------------------------------------------------------------------------------
 # Blocos de contexto e construção das mensagens
 # ---------------------------------------------------------------------------------------
-
 def facts_block_for_user(user_id: str) -> str:
     facts = mem0_get_facts(user_id)
     return facts_to_context_block(facts)
@@ -734,7 +783,7 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     return messages, new_facts, rag_used
 
 # ---------------------------------------------------------------------------------------
-# ROTAS BÁSICAS
+# ROTAS BÁSICAS + /alma-chat
 # ---------------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
@@ -744,9 +793,7 @@ def serve_index():
     except Exception:
         return HTMLResponse("<h1>index.html não encontrado</h1>", status_code=404)
 
-# ---------------------------------------------------------------------------------------
 # Página do Alma Chat (serve alma-chat.html)
-# ---------------------------------------------------------------------------------------
 @app.get("/alma-chat", response_class=HTMLResponse)
 @app.get("/alma-chat/", response_class=HTMLResponse)
 def alma_chat():
@@ -760,24 +807,16 @@ def status_json():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG) ou endpoints RAG.",
+        "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG); CSV em POST /budget/csv.",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
         "rag": {"available": RAG_READY, "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE},
         "endpoints": {
             "health": "/health",
             "ask": "POST /ask {question, user_id?, namespace?}",
             "ask_get": "/ask_get?q=...&user_id=...&namespace=...",
+            "budget_csv": "POST /budget/csv {answer? or rows[], iva_pct?, mode?}",
             "ping_grok": "/ping_grok",
-            "mem_facts": "/mem/facts?user_id=...",
-            "mem_search": "/mem/search?user_id=...&q=...",
             "rag_search_get": "/rag/search?q=...&namespace=...",
-            "rag_crawl": "POST /rag/crawl",
-            "rag_ingest_sitemap": "POST /rag/ingest-sitemap",
-            "rag_ingest_url": "POST /rag/ingest-url",
-            "rag_ingest_text": "POST /rag/ingest-text",
-            "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
-            "rag_search_post": "POST /rag/search {query, namespace?, top_k?}",
-            "budget_csv": "POST /budget/csv"
         }
     }
 
@@ -819,124 +858,9 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# --- links do RAG (normalização e extração) -----------------------------
-import re as _re_local
-from urllib.parse import urlparse as _urlparse
-
-_MD_LINK_RE = _re_local.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _re_local.I)
-_URL_RE = _re_local.compile(r"https?://[^\s)>\]]+", _re_local.I)
-
-def _normalize_link_field(v: str) -> str:
-    if not v: return ""
-    v = str(v).strip()
-    m = _MD_LINK_RE.search(v)
-    return m.group(2).strip() if m else v
-
-def _urls_from_text(txt: str) -> List[str]:
-    """
-    Extrai 1 URL útil do texto, ignorando ruído (schema.org, w3.org/ogp, etc.),
-    priorizando interiorguider.com quando existir.
-    """
-    if not txt: return []
-    urls = _URL_RE.findall(txt)
-    out, seen = [], set()
-    NOISE = ("w3.org/1999/02/22-rdf-syntax-ns", "schema.org", "ogp.me", "opengraphprotocol.org")
-    for u in urls:
-        ul = u.lower()
-        if any(n in ul for n in NOISE):
-            continue
-        host = (_urlparse(u).netloc or "").lower()
-        cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
-        if cu and cu not in seen:
-            seen.add(cu); out.append(cu)
-    out.sort(key=lambda x: 0 if IG_HOST in (_urlparse(x).netloc or "").lower() else 1)
-    return out[:1]
-
-# --- enriquecer linhas do orçamento com dados do RAG --------------------
-def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
-    if not rows or not RAG_READY: return rows
-    out = []
-    for r in rows:
-        rr = dict(r)
-        name_q = rr.get("descricao") or rr.get("ref") or ""
-        raw_link = (rr.get("link") or "").strip()
-        link_norm = _normalize_link_field(raw_link)
-        rr["link"] = link_norm
-        need_link = (not link_norm) or (not link_norm.lower().startswith("http")) or (link_norm.lower() in {"sem url","-","n/d"})
-        need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0"))
-
-        if (need_link or need_price) and name_q:
-            try:
-                hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=8) or []
-            except Exception:
-                hits = []
-            # tentativa curta (melhor matching quando a frase é comprida)
-            if (not hits) and len(name_q) > 18:
-                key = " ".join([w for w in _re_local.findall(r"[A-Za-z0-9]+", name_q) if len(w) <= 6][:3]).lower()
-                try:
-                    more = search_chunks(query=key, namespace=DEFAULT_NAMESPACE, top_k=8) or []
-                except Exception:
-                    more = []
-                hits = more or hits
-
-            best_url = ""
-            best_price = None
-            for h in hits:
-                meta = h.get("metadata", {}) or {}
-                text = h.get("text") or ""
-                title = meta.get("title") or ""
-                urls = []
-                if meta.get("url"): urls.append(_canon_ig_url(meta["url"]))
-                urls.extend(_urls_from_text(text))
-                if urls and not best_url: best_url = urls[0]
-                price = _price_from_text(text) or _price_from_text(title)
-                if (price is not None) and (best_price is None): best_price = price
-
-            if need_link: rr["link"] = best_url if best_url else "sem URL"
-            if need_price and (best_price is not None): rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
-        out.append(rr)
-    return out
-
 # ---------------------------------------------------------------------------------------
-# CSV ON-DEMAND: POST /budget/csv
+# ASK endpoints (sem CSV automático)
 # ---------------------------------------------------------------------------------------
-@app.post("/budget/csv")
-async def budget_csv(request: Request):
-    """
-    Gera CSV de orçamento **a pedido**.
-    Aceita:
-      - {"answer": "<texto da resposta do /ask>"}  -> extrai linhas automaticamente
-      - {"rows": [...], "iva_pct": 23}             -> usa linhas já estruturadas
-    Opcional: {"mode": "public"|"pro"} (default public)
-    """
-    data = await request.json()
-    answer_text = (data.get("answer") or "").strip()
-    rows_in = data.get("rows")
-    iva_pct = data.get("iva_pct")
-    mode = (data.get("mode") or "public").strip().lower()
-
-    if not rows_in:
-        obj = parse_budget_rows_from_answer(answer_text)
-    else:
-        obj = {"iva_pct": int(iva_pct or 23), "rows": rows_in}
-
-    # robustez extra: normalizar links malformados/markdown
-    for r in obj.get("rows", []) or []:
-        if "link" in r:
-            r["link"] = _normalize_link_field(r.get("link") or "")
-
-    enriched = enrich_rows_with_rag(obj.get("rows") or [], iva_pct_default=obj.get("iva_pct", 23))
-    csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode=mode, delimiter=";", decimal="comma")
-
-    return {
-        "ok": True,
-        "csv_download": csv_path,
-        "rows_enriched": enriched,
-        "iva_pct": obj.get("iva_pct", 23),
-        "mode": mode
-    }
-
-# --- ASK endpoints (sem CSV automático; inclui apenas CTA) ---------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     if not q: return {"answer": "Falta query param ?q="}
@@ -950,16 +874,12 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
 
-    resp = {"answer": answer, "new_facts_detected": new_facts,
-            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
-
-    if _is_budget_request(q):
-        resp["budget_hint"] = {
-            "message": "Queres que transforme esta resposta num CSV de orçamento?",
-            "how_to": "POST /budget/csv com {answer: resp.answer} ou com {rows:[...]}",
-            "endpoint": "/budget/csv"
-        }
-    return resp
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE},
+        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>}.",
+    }
 
 @app.post("/ask")
 async def ask(request: Request):
@@ -981,17 +901,69 @@ async def ask(request: Request):
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
 
-    resp = {"answer": answer, "new_facts_detected": new_facts,
-            "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE},
+        "note": "Para CSV, chama POST /budget/csv com {'answer': <este answer>}.",
+    }
 
-    if _is_budget_request(question):
-        resp["budget_hint"] = {
-            "message": "Queres que transforme esta resposta num CSV de orçamento?",
-            "how_to": "POST /budget/csv com {answer: resp.answer} ou com {rows:[...]}",
-            "endpoint": "/budget/csv"
+# ---------------------------------------------------------------------------------------
+# BUDGET: POST /budget/csv (gera CSV A PEDIDO a partir do answer ou de rows)
+# ---------------------------------------------------------------------------------------
+@app.post("/budget/csv")
+async def budget_csv(request: Request):
+    """
+    Body pode ser:
+    - {"answer": "<texto da Alma>"}   # o servidor extrai linhas/tabela
+    - {"rows": [...], "iva_pct": 23}  # se já tiveres as linhas
+    Opções extra: {"mode":"public|pro", "delimiter":";", "decimal":"comma|dot"}
+    """
+    data = await request.json()
+    answer_text = (data.get("answer") or "").strip()
+    rows_in = data.get("rows")
+    iva_pct = int(data.get("iva_pct") or 23)
+    mode = (data.get("mode") or "public").strip()
+    delimiter = (data.get("delimiter") or ";")
+    decimal = (data.get("decimal") or "comma")
+
+    if not rows_in:
+        if not answer_text:
+            return JSONResponse({"ok": False, "error": "Fornece 'answer' (texto da Alma) ou 'rows'."}, status_code=400)
+        parsed = parse_budget_rows_from_answer(answer_text)
+        rows_in = parsed.get("rows") or []
+        iva_pct = int(parsed.get("iva_pct") or iva_pct)
+
+    if not isinstance(rows_in, list) or not rows_in:
+        return JSONResponse({"ok": False, "error": "Não encontrei linhas de orçamento no 'answer' e 'rows' não foi fornecido."}, status_code=400)
+
+    try:
+        enriched = enrich_rows_with_rag(rows_in, iva_pct_default=iva_pct)
+        csv_path = make_budget_csv(iva_pct, enriched, mode=mode, delimiter=delimiter, decimal=decimal)
+        # mini preview (apenas 20 linhas)
+        preview = [
+            "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
+            "|---|---:|---:|---:|---|"
+        ]
+        for e in enriched[:20]:
+            ref_or_name = (e.get("ref") or e.get("descricao") or "-")
+            qtd = e.get("quant", 1)
+            preco = e.get("preco_uni", "-")
+            desc = e.get("desc_pct", "")
+            link = _normalize_link_field(e.get("link", "")) or "sem URL"
+            preview.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
+
+        return {
+            "ok": True,
+            "iva_pct": iva_pct,
+            "rows_enriched": enriched,
+            "csv_download": csv_path,
+            "preview_table_md": "\n".join(preview),
         }
-    return resp
+    except Exception as e:
+        log.exception("Erro em /budget/csv")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # --- local run ----------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
