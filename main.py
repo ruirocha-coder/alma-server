@@ -684,17 +684,6 @@ def grok_chat(messages, timeout=120):
 # ---------------------------------------------------------------------------------------
 # Blocos de contexto e construção das mensagens
 # ---------------------------------------------------------------------------------------
-def facts_to_context_block(facts: Dict[str, str]) -> str:
-    if not facts: return ""
-    lines = []
-    if "name" in facts: lines.append(f"- Nome: {facts['name']}")
-    if "location" in facts: lines.append(f"- Localização: {facts['location']}")
-    if "room" in facts: lines.append(f"- Divisão/Projeto: {facts['room']}")
-    if "preferences" in facts: lines.append(f"- Preferências: {facts['preferences']}")
-    for k, v in facts.items():
-        if k not in {"name", "location", "room", "preferences"}:
-            lines.append(f"- {k}: {v}")
-    return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
 
 def facts_block_for_user(user_id: str) -> str:
     facts = mem0_get_facts(user_id)
@@ -815,91 +804,7 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------------------------------------------------------------------------------------
-# € — parsing robusto + CSV “PT-friendly” (Excel)
-# ---------------------------------------------------------------------------------------
-def _parse_money_eu(s: str) -> Optional[float]:
-    """
-    Aceita: "1.234,56", "1,234.56", "1234,56", "1234.56", "€1 234,56", "1 234,56 €", "1,000€"
-    Remove espaços/€; deteta decimal pelo último separador.
-    """
-    try:
-        if s is None:
-            return None
-        s = str(s).strip().replace("€", "").replace("\u00A0", " ").strip()
-        s = re.sub(r"\s+", "", s)
-        if "," in s and "." in s:
-            if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")   # EU -> .
-            else:
-                s = s.replace(",", "")                    # US -> remove milhar
-        else:
-            if "," in s:
-                s = s.replace(",", ".")
-        return float(s)
-    except Exception:
-        return None
-
-def _safe_float(v, default=0.0):
-    if isinstance(v, (int, float)):
-        return float(v)
-    f = _parse_money_eu(v)
-    return f if f is not None else float(default)
-
-# ---------------------------------------------------------------------------------------
-# Exportação CSV de Orçamentos
-# ---------------------------------------------------------------------------------------
-def make_budget_csv(iva_pct: float, rows: List[dict], mode: str = "public",
-                    delimiter: str = ";", decimal: str = "comma") -> str:
-    """
-    Gera ficheiro CSV e devolve o caminho no /tmp.
-    """
-    def fmt_money(x: float) -> str:
-        s = f"{x:.2f}"
-        return s.replace(".", ",") if decimal == "comma" else s
-
-    if mode == "public":
-        headers = ["REF.", "DESIGNAÇÃO", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL C/IVA"]
-        show_total_ci = True
-    else:
-        headers = ["REF.", "DESIGNAÇÃO", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA"]
-        show_total_ci = False
-
-    sio = StringIO()
-    writer = csv.writer(sio, delimiter=delimiter)
-    writer.writerow(headers)
-
-    for r in rows:
-        ref = (r.get("ref") or "").strip()
-        quant = int(_safe_float(r.get("quant"), 1))
-        preco_uni = _safe_float(r.get("preco_uni"), 0.0)
-        desc_pct = _safe_float(r.get("desc_pct"), 0.0)
-
-        desc_main = (r.get("descricao") or "").strip() or "Produto"
-        full_desc = desc_main
-
-        total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
-        total = total_si * (1.0 + iva_pct/100.0) if show_total_ci else total_si
-
-        writer.writerow([
-            ref,
-            full_desc,
-            str(quant),
-            fmt_money(preco_uni),
-            (f"{desc_pct:.0f}%" if desc_pct else ""),
-            fmt_money(total)
-        ])
-
-    csv_bytes = sio.getvalue().encode("utf-8-sig")
-    fname = f"orcamento_{mode}_{int(time.time())}.csv"
-    fpath = os.path.join("/tmp", fname)
-    with open(fpath, "wb") as f:
-        f.write(csv_bytes)
-    return fpath
-
-# ---------------------------------------------------------------------------------------
-# 🔗 PATCH — RAG links + orçamento
-# ---------------------------------------------------------------------------------------
+# --- links do RAG (normalização e extração) -----------------------------
 import re as _re_local
 from urllib.parse import urlparse as _urlparse
 
@@ -907,60 +812,26 @@ _MD_LINK_RE = _re_local.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _re_local
 _URL_RE = _re_local.compile(r"https?://[^\s)>\]]+", _re_local.I)
 
 def _normalize_link_field(v: str) -> str:
-    if not v:
-        return ""
+    if not v: return ""
     v = str(v).strip()
     m = _MD_LINK_RE.search(v)
-    if m:
-        return m.group(2).strip()
-    return v
+    return m.group(2).strip() if m else v
 
 def _urls_from_text(txt: str) -> List[str]:
-    if not txt:
-        return []
+    if not txt: return []
     urls = _URL_RE.findall(txt)
     out, seen = [], set()
     for u in urls:
         host = (_urlparse(u).netloc or "").lower()
         cu = _canon_ig_url(u) if (IG_HOST in host) else u.strip()
-        if not cu or cu in seen:
-            continue
-        seen.add(cu)
-        out.append(cu)
+        if cu and cu not in seen:
+            seen.add(cu); out.append(cu)
+    # preferir interiorguider.com
     return sorted(out, key=lambda x: 0 if IG_HOST in (_urlparse(x).netloc or "").lower() else 1)
 
-_NAME_HINTS = [
-    r"\bmesa[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
-    r"\bcadeira[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
-    r"\bbanco[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
-    r"\bcama[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
-    r"\bluminária[s]?\s+[a-z0-9çáéíóúâêôãõ\- ]{2,40}",
-    r"\bcod\b(?:\s+[a-z0-9]{1,10})?",
-]
-
-def _extract_name_terms(text: str) -> List[str]:
-    if not text:
-        return []
-    terms = []
-    for pat in _NAME_HINTS:
-        for m in _re_local.finditer(pat, text, flags=_re_local.I):
-            terms.append(m.group(0).strip())
-    t_norm = _re_local.sub(r"[^a-z0-9]+", " ", (text or "").lower())
-    if "cod" in t_norm and "cadeira" not in t_norm:
-        terms.append("cadeira cod")
-    if not terms:
-        parts = _re_local.split(r"[,\n;]| e ", text)
-        terms = [p.strip() for p in parts if len(p.strip()) >= 3][:8]
-    seen = set(); out = []
-    for t in terms:
-        tn = t.lower()
-        if tn not in seen:
-            seen.add(tn); out.append(t)
-    return out[:8]
-
+# --- enriquecer linhas do orçamento com dados do RAG --------------------
 def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> List[dict]:
-    if not rows or not RAG_READY:
-        return rows
+    if not rows or not RAG_READY: return rows
     out = []
     for r in rows:
         rr = dict(r)
@@ -968,22 +839,23 @@ def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> Lis
         raw_link = (rr.get("link") or "").strip()
         link_norm = _normalize_link_field(raw_link)
         rr["link"] = link_norm
-        need_link = (not link_norm) or (not link_norm.lower().startswith("http"))
+        need_link = (not link_norm) or (not link_norm.lower().startswith("http")) or (link_norm.lower() in {"sem url","-","n/d"})
         need_price = (rr.get("preco_uni") in (None, "", 0, "0", "0.0"))
+
         if (need_link or need_price) and name_q:
             try:
                 hits = search_chunks(query=name_q, namespace=DEFAULT_NAMESPACE, top_k=8) or []
             except Exception:
                 hits = []
+            # tentativa curta (melhor matching quando a frase é comprida)
             if (not hits) and len(name_q) > 18:
                 key = " ".join([w for w in _re_local.findall(r"[A-Za-z0-9]+", name_q) if len(w) <= 6][:3]).lower()
-                if "cod" in key and "cadeira" not in key:
-                    key = ("cadeira " + key).strip()
                 try:
                     more = search_chunks(query=key, namespace=DEFAULT_NAMESPACE, top_k=8) or []
                 except Exception:
                     more = []
                 hits = more or hits
+
             best_url = ""
             best_price = None
             for h in hits:
@@ -991,28 +863,21 @@ def enrich_rows_with_rag(rows: List[dict], iva_pct_default: float = 23.0) -> Lis
                 text = h.get("text") or ""
                 title = meta.get("title") or ""
                 urls = []
-                if meta.get("url"):
-                    urls.append(_canon_ig_url(meta["url"]))
+                if meta.get("url"): urls.append(_canon_ig_url(meta["url"]))
                 urls.extend(_urls_from_text(text))
-                if urls and not best_url:
-                    best_url = urls[0]
+                if urls and not best_url: best_url = urls[0]
                 price = _price_from_text(text) or _price_from_text(title)
-                if price and not best_price:
-                    best_price = price
-            if need_link:
-                rr["link"] = best_url if best_url else "sem URL"
-            if need_price and best_price is not None:
-                rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
+                if (price is not None) and (best_price is None): best_price = price
+
+            if need_link: rr["link"] = best_url if best_url else "sem URL"
+            if need_price and (best_price is not None): rr["preco_uni"] = f"{best_price:.2f}".replace(".", ",")
         out.append(rr)
     return out
 
-# ---------------------------------------------------------------------------------------
-# ASK endpoints (com RAG budget patch)
-# ---------------------------------------------------------------------------------------
+# --- ASK endpoints (com enrich + preview + CSV) -------------------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
-    if not q:
-        return {"answer": "Falta query param ?q="}
+    if not q: return {"answer": "Falta query param ?q="}
     messages, new_facts, rag_used = build_messages(user_id, q, namespace)
     try:
         answer = grok_chat(messages)
@@ -1022,16 +887,18 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
     resp = {"answer": answer, "new_facts_detected": new_facts,
             "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
+
     if _is_budget_request(q):
         obj = parse_budget_rows_from_answer(answer)
         if obj.get("rows"):
             try:
                 enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public",
-                                           delimiter=";", decimal="comma")
-                preview_lines = [
+                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
+                # preview compacta
+                preview = [
                     "\n**(Corrigido — links/preços verificados no RAG):**",
                     "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
                     "|---|---:|---:|---:|---|"
@@ -1042,8 +909,8 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
                     preco = e.get("preco_uni", "-")
                     desc = e.get("desc_pct", "")
                     link = _normalize_link_field(e.get("link", "")) or "sem URL"
-                    preview_lines.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
-                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview_lines))
+                    preview.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
+                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview))
                 resp["csv_download"] = csv_path
                 resp["rows_enriched"] = enriched
             except Exception as e:
@@ -1057,8 +924,8 @@ async def ask(request: Request):
     user_id = (data.get("user_id") or "").strip() or "anon"
     namespace = (data.get("namespace") or "").strip() or None
     log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} question={question!r}")
-    if not question:
-        return {"answer": "Coloca a tua pergunta em 'question'."}
+    if not question: return {"answer": "Coloca a tua pergunta em 'question'."}
+
     messages, new_facts, rag_used = build_messages(user_id, question, namespace)
     try:
         answer = grok_chat(messages)
@@ -1069,16 +936,17 @@ async def ask(request: Request):
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
     resp = {"answer": answer, "new_facts_detected": new_facts,
             "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}}
+
     if _is_budget_request(question):
         obj = parse_budget_rows_from_answer(answer)
         if obj.get("rows"):
             try:
                 enriched = enrich_rows_with_rag(obj["rows"], iva_pct_default=obj.get("iva_pct", 23))
-                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public",
-                                           delimiter=";", decimal="comma")
-                preview_lines = [
+                csv_path = make_budget_csv(obj.get("iva_pct", 23), enriched, mode="public", delimiter=";", decimal="comma")
+                preview = [
                     "\n**(Corrigido — links/preços verificados no RAG):**",
                     "| REF/NOME | QTD | PREÇO UNI (C/IVA) | DESC | LINK |",
                     "|---|---:|---:|---:|---|"
@@ -1089,16 +957,14 @@ async def ask(request: Request):
                     preco = e.get("preco_uni", "-")
                     desc = e.get("desc_pct", "")
                     link = _normalize_link_field(e.get("link", "")) or "sem URL"
-                    preview_lines.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
-                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview_lines))
+                    preview.append(f"| {ref_or_name} | {qtd} | {preco} | {desc} | {link} |")
+                resp["answer"] = _postprocess_answer(answer + "\n" + "\n".join(preview))
                 resp["csv_download"] = csv_path
                 resp["rows_enriched"] = enriched
             except Exception as e:
                 resp["csv_error"] = str(e)
     return resp
 
-# ---------------------------------------------------------------------------------------
-# Local run
-# ---------------------------------------------------------------------------------------
+# --- local run ----------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
