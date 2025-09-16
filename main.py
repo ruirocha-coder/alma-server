@@ -1,8 +1,8 @@
-# main.py — Alma Server (RAG + Memória; sem modo orçamento; links do RAG forçados)
+# main.py — Alma Server (RAG + Memória; sem modo orçamento; top-k dinâmico; mini-pesquisa e injeção de links)
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import os
@@ -34,7 +34,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag+mem-link-injector-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag+mem-link-injector-topk-mini-1")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma
@@ -107,17 +107,15 @@ def _canon_ig_url(u: str) -> str:
     p = p._replace(scheme="https", netloc=IG_HOST, path=path)
     return urlunparse(p)
 
-# --- robusto: normaliza quaisquer links IG dentro de markdown e converte URLs IG “nuas” em markdown
+# --- robusto: normaliza links IG existentes e converte URLs IG “nuas” em markdown; sem look-behind ---
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", re.I)
 _RAW_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
 
 def _already_inside_md(text: str, start_idx: int) -> bool:
     """Heurística: verifica se o URL em start_idx já está dentro de um [label](url)."""
-    # Procura um '[' não fechado imediatamente antes de start_idx
     open_br = text.rfind("[", 0, start_idx)
     close_br = text.rfind("]", 0, start_idx)
     paren_open = text.find("(", close_br if close_br != -1 else start_idx)
-    # Está no formato [ ... ](  AQUI  ) ?
     return (open_br != -1) and (close_br != -1) and (close_br > open_br) and (paren_open != -1) and (paren_open <= start_idx)
 
 def _fix_product_links_markdown(text: str) -> str:
@@ -169,9 +167,17 @@ except Exception as e:
     RAG_READY = False
     log.warning(f"[rag] a importar rag_client falhou: {e}")
 
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "6"))
+# -------- Top-K dinâmico --------
+RAG_TOP_K_DEFAULT = int(os.getenv("RAG_TOP_K", "12"))  # ENV como default
 RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
 DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None
+
+def _clamp_int(v, lo=1, hi=50, default=None):
+    try:
+        x = int(v)
+        return max(lo, min(hi, x))
+    except Exception:
+        return default if default is not None else lo
 
 # --- heurísticas de termos de produto + preço
 _NAME_HINTS = [
@@ -224,37 +230,97 @@ def _price_from_text(txt: str) -> Optional[float]:
     if not m: return None
     return None if m is None else _parse_money_eu(m.group(1))
 
-def rag_guess_products_by_name(question: str, top_k: int = 3) -> List[dict]:
-    if not RAG_READY:
+# -------- Mini-pesquisa RAG por termo (links IG) --------
+def _expand_variants(term: str) -> List[str]:
+    """
+    Gera variantes simples para melhorar a cobertura do RAG:
+    - remove quantidades ('4 cadeiras cod' -> 'cadeiras cod')
+    - tenta singular/plural básico (cadeiras <-> cadeira, etc.)
+    - recortes 2..4 tokens
+    """
+    t = (term or "").strip()
+    if not t:
         return []
-    terms = _extract_name_terms(question)
-    results = []
-    seen_urls = set()
+    t = re.sub(r"^\s*\d+\s*x?\s*", "", t, flags=re.I)
+    t = re.sub(r"^\s*\d+\s+", "", t, flags=re.I)
+
+    toks = re.findall(r"[A-Za-z0-9ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-]+", t)
+    base = " ".join(toks[:6]).strip()
+    if not base:
+        return []
+
+    variants = {base}
+
+    sp_map = {
+        "cadeiras": "cadeira",
+        "bancos": "banco",
+        "mesas": "mesa",
+        "camas": "cama",
+        "luminárias": "luminária",
+        "luminarias": "luminaria",
+    }
+    words = base.split()
+    if words:
+        w0 = words[0].lower()
+        if w0 in sp_map:
+            v = " ".join([sp_map[w0]] + words[1:])
+            variants.add(v)
+        inv = {v: k for k, v in sp_map.items()}
+        if w0 in inv:
+            v = " ".join([inv[w0]] + words[1:])
+            variants.add(v)
+
+    if len(words) >= 2: variants.add(" ".join(words[:2]))
+    if len(words) >= 3: variants.add(" ".join(words[:3]))
+    if len(words) >= 4: variants.add(" ".join(words[:4]))
+
+    out = []
+    seen = set()
+    for v in variants:
+        vn = _norm(v)
+        if vn and vn not in seen:
+            seen.add(vn)
+            out.append(v)
+    return out
+
+def rag_mini_search_urls(terms: List[str], namespace: Optional[str], top_k: int) -> Dict[str, str]:
+    """
+    Para cada termo, tenta encontrar o melhor URL (preferência interiorguider.com).
+    Retorna mapa {norm(term) -> url}.
+    """
+    if not (RAG_READY and terms):
+        return {}
+    url_by_term: Dict[str, str] = {}
     for term in terms:
-        try:
-            hits = search_chunks(query=term, namespace=DEFAULT_NAMESPACE, top_k=top_k) or []
-        except Exception:
-            hits = []
-        for h in hits:
-            meta = h.get("metadata", {}) or {}
-            url = meta.get("url") or ""
-            title = meta.get("title") or ""
-            text  = h.get("text") or ""
-            cu = _canon_ig_url(url) if url else ""
-            if cu and cu in seen_urls:
+        best_url = ""
+        tried = set()
+        for q in _expand_variants(term):
+            if q in tried:
                 continue
-            if cu: seen_urls.add(cu)
-            price = _price_from_text(text) or _price_from_text(title)
-            name  = title or term
-            entry = {
-                "ref": "",
-                "name": (name or term).strip(),
-                "url": cu or "sem URL",
-                "price_gross": price,  # COM IVA quando capturado do site
-                "source": "SITE" if (cu and IG_HOST in (urlparse(cu).netloc or "").lower()) else "CATALOGO_EXTERNO"
-            }
-            results.append(entry)
-    return results
+            tried.add(q)
+            try:
+                hits = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k) or []
+            except Exception:
+                hits = []
+            candidate = ""
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                u = meta.get("url") or ""
+                cu = _canon_ig_url(u) if u else ""
+                if not cu:
+                    continue
+                host = (urlparse(cu).netloc or "").lower()
+                if IG_HOST in host:
+                    candidate = cu
+                    break
+                if not candidate:
+                    candidate = cu
+            if candidate:
+                best_url = candidate
+                break
+        if best_url:
+            url_by_term[_norm(term)] = best_url
+    return url_by_term
 
 # ---------------------------------------------------------------------------------------
 # Memória Local + (opcional) Mem0
@@ -322,10 +388,8 @@ def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
     if not (MEM0_ENABLE and mem0_client):
         return
     try:
-        # API nova (preferred)
         if hasattr(mem0_client, "memories"):
             mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
-        # fallback antigo (apenas se existir)
         elif hasattr(mem0_client, "create"):
             mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
     except Exception as e:
@@ -393,7 +457,7 @@ NAME_PATTERNS = [
 CITY_PATTERNS = [
     r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
     r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
-    r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇ]{2,60})",
 ]
 PREF_PATTERNS = [
     r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
@@ -453,112 +517,91 @@ def facts_block_for_user(user_id: str) -> str:
 # ---------------------------------------------------------------------------------------
 # Injetor de links a partir do RAG (pós-processamento do texto)
 # ---------------------------------------------------------------------------------------
-def _inject_links_from_rag(text: str, user_query: str) -> str:
+def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
     """
-    1) Normaliza links IG existentes e URLs nuas -> markdown (feito em _fix_product_links_markdown)
-    2) Procura termos de produto no query e na própria resposta
-    3) Busca links no RAG e:
-       - substitui [ver produto](sem URL) por [ver produto](url)
-       - substitui 'sem URL' perto do item por link em markdown
-       - se não houver nenhum link, envolve o primeiro nome com [nome](url)
+    1) Usa mini-pesquisa RAG por termo (query + resposta) com top_k consistente.
+    2) Substitui '[...] (sem URL)' e 'sem URL' por links IG quando possível.
+    3) Se um termo aparecer sem link, injeta 1 link markdown na primeira ocorrência.
     """
-    if not RAG_READY or not text:
+    if not (RAG_READY and text):
         return text
 
     # termos a partir do query e da própria resposta
-    terms = []
+    terms: List[str] = []
     terms.extend(_extract_name_terms(user_query or ""))
     terms.extend(_extract_name_terms(text or ""))
 
-    # mapa nome_norm -> melhor URL do RAG
-    url_by_term: Dict[str, str] = {}
-    for term in terms:
-        try:
-            hits = search_chunks(query=term, namespace=DEFAULT_NAMESPACE, top_k=4) or []
-        except Exception:
-            hits = []
-        best_url = ""
-        for h in hits:
-            meta = h.get("metadata", {}) or {}
-            u = meta.get("url") or ""
-            cu = _canon_ig_url(u) if u else ""
-            if cu and IG_HOST in (urlparse(cu).netloc or "").lower():
-                best_url = cu
-                break
-        if best_url:
-            url_by_term[_norm(term)] = best_url
-
+    url_by_term = rag_mini_search_urls(terms, namespace, top_k=decided_top_k)
     if not url_by_term:
         return text
 
     out = text
 
-    # 1) corrige explicitamente "[ver produto](sem URL)" e variantes
+    # 1) corrige explicitamente "[qualquer coisa](sem URL)"
     def _fix_sem_url(m):
         label = m.group(1)
-        # tenta escolher um URL: se houver apenas um, usa-o; se vários, tenta mapear por label
         chosen = ""
-        if len(url_by_term) == 1:
+        # 1a) tentativa por label normalizado
+        chosen = url_by_term.get(_norm(label), "")
+        # 1b) fallback: se só houver um URL, usa-o
+        if not chosen and len(url_by_term) == 1:
             chosen = list(url_by_term.values())[0]
-        else:
-            # tentar com o label normalizado
-            chosen = url_by_term.get(_norm(label), "")
-            if not chosen:
-                # fallback: primeiro URL disponível
-                chosen = list(url_by_term.values())[0]
+        # 1c) último recurso: primeiro URL disponível
+        if not chosen:
+            chosen = list(url_by_term.values())[0]
         return f"[{label}]({chosen})" if chosen else m.group(0)
 
     out = re.sub(r"\[([^\]]+)\]\(\s*sem\s+url\s*\)", _fix_sem_url, out, flags=re.I)
 
-    # 2) se ainda existir "sem URL" sozinho na linha do item, tenta inserir um link ao lado
+    # 2) linhas com "sem URL" sem markdown
     def _replace_line_sem_url(line: str) -> str:
         if re.search(r"\bsem\s+url\b", line, flags=re.I):
-            # tenta detetar termo no próprio line
             for tnorm, url in url_by_term.items():
                 if tnorm in _norm(line):
-                    # se já houver link markdown, não duplica
                     if _MD_LINK_RE.search(line):
                         return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
-                    # senão, envolve o primeiro “nome” entre []()
-                    # procura palavra “mesa|cadeira|banco|...” como âncora
-                    m = re.search(r"(mesa|cadeira|banco|cama|luminária|luminaria)[^\-:]*", line, flags=re.I)
-                    if m:
-                        nome = m.group(0).strip()
+                    # envolve primeira palavra útil
+                    m2 = re.search(r"(mesa|cadeira|banco|cama|luminária|luminaria)[^\-:]*", line, flags=re.I)
+                    if m2:
+                        nome = m2.group(0).strip()
                         linked = line.replace(nome, f"[{nome}]({url})", 1)
                         return re.sub(r"\bsem\s+url\b", "", linked, flags=re.I)
-                    # fallback: só troca "sem URL" pelo URL
                     return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
         return line
 
-    out_lines = [ _replace_line_sem_url(l) for l in out.splitlines() ]
+    out_lines = [_replace_line_sem_url(l) for l in out.splitlines()]
     out = "\n".join(out_lines)
 
-    # 3) se para um termo não houver qualquer link no texto, injeta 1 link envolvendo o primeiro match
-    for tnorm, url in url_by_term.items():
-        if url and (IG_HOST in (urlparse(url).netloc or "").lower()):
-            if (url not in out) and (IG_HOST not in out):  # heurística: resposta ainda sem links IG
-                # encontra um fragmento da resposta que contenha o termo
-                parts = out.splitlines()
-                for i, l in enumerate(parts):
-                    if tnorm in _norm(l):
-                        # evita duplicar se já houver markdown link
-                        if not _MD_LINK_RE.search(l):
-                            # envolve primeira ocorrência “palavra-chave longa”
-                            words = l.split()
-                            for w in words:
-                                if len(w) >= 4 and _norm(w) in tnorm:
-                                    parts[i] = l.replace(w, f"[{w}]({url})", 1)
-                                    out = "\n".join(parts)
-                                    break
-                        break
+    # 3) se nenhum link IG aparecer, injeta 1 por termo detetado
+    has_ig_link = (IG_HOST in out)
+    if not has_ig_link:
+        for tnorm, url in url_by_term.items():
+            if IG_HOST not in (urlparse(url).netloc or "").lower():
+                continue
+            parts = out.splitlines()
+            injected = False
+            for i, l in enumerate(parts):
+                if tnorm in _norm(l) and not _MD_LINK_RE.search(l):
+                    # envolve uma palavra >=4 chars que pertença ao termo
+                    words = l.split()
+                    for w in words:
+                        if len(w) >= 4 and _norm(w) in tnorm:
+                            parts[i] = l.replace(w, f"[{w}]({url})", 1)
+                            injected = True
+                            break
+                if injected:
+                    break
+            out = "\n".join(parts)
+            if injected:
+                break
 
     return out
 
-def _postprocess_answer(answer: str, user_query: str) -> str:
+def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
     # 1) normaliza/insere links IG existentes
     step1 = _fix_product_links_markdown(answer or "")
-    # 2) injeta links do RAG com base no query + texto
-    step2 = _inject_links_from_rag(step1, user_query)
+    # 2) injeta links do RAG com base no query + texto (usando mini-pesquisa + top_k consistente)
+    step2 = _inject_links_from_rag(step1, user_query, namespace, decided_top_k)
     return step2
 
 # ---------------------------------------------------------------------------------------
@@ -589,16 +632,26 @@ def grok_chat(messages, timeout=120):
 # ---------------------------------------------------------------------------------------
 # Blocos de contexto e construção das mensagens
 # ---------------------------------------------------------------------------------------
+def _decide_top_k(user_query: str, req_top_k: Optional[int]) -> int:
+    if req_top_k:
+        return _clamp_int(req_top_k, lo=3, hi=40, default=RAG_TOP_K_DEFAULT)
+    n_terms = len(_extract_name_terms(user_query or ""))
+    if n_terms >= 3:
+        base = 16
+    elif n_terms == 2:
+        base = 12
+    else:
+        base = 10
+    return min(max(base, RAG_TOP_K_DEFAULT), 40)
+
 def build_rag_products_block(question: str) -> str:
     if not RAG_READY:
         return ""
     # tentar hits diretos
-    hits = []
     try:
-        hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K) or []
+        hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
     except Exception:
         hits = []
-    # se pouco, tentar por nome (heurístico)
     lines = []
     if hits:
         seen=set()
@@ -612,9 +665,12 @@ def build_rag_products_block(question: str) -> str:
             if title or url:
                 lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
     else:
-        guessed = rag_guess_products_by_name(question, top_k=3)
-        for g in guessed[:6]:
-            lines.append(f"- NOME={g.get('name') or '-'}; URL={g.get('url') or 'sem URL'}; PRECO_COM_IVA={g.get('price_gross') if g.get('price_gross') is not None else 'N/D'}; SOURCE={g.get('source') or '-'}")
+        # fallback heurístico por nome
+        guessed_terms = _extract_name_terms(question)
+        links = rag_mini_search_urls(guessed_terms, DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT)
+        for t in guessed_terms[:6]:
+            url = links.get(_norm(t), "sem URL")
+            lines.append(f"- NOME={t}; URL={url}")
     return "Produtos sugeridos pelo RAG:\n" + "\n".join(lines) if lines else ""
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
@@ -632,7 +688,7 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     rag_used = False
     if RAG_READY:
         try:
-            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K)
+            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT)
             rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
             rag_used = bool(rag_block)
         except Exception as e:
@@ -681,11 +737,11 @@ def status_json():
         "version": APP_VERSION,
         "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG).",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
-        "rag": {"available": RAG_READY, "top_k": RAG_TOP_K, "namespace": DEFAULT_NAMESPACE},
+        "rag": {"available": RAG_READY, "top_k_default": RAG_TOP_K_DEFAULT, "namespace": DEFAULT_NAMESPACE},
         "endpoints": {
             "health": "/health",
-            "ask": "POST /ask {question, user_id?, namespace?}",
-            "ask_get": "/ask_get?q=...&user_id=...&namespace=...",
+            "ask": "POST /ask {question, user_id?, namespace?, top_k?}",
+            "ask_get": "/ask_get?q=...&user_id=...&namespace=...&top_k=...",
             "ping_grok": "/ping_grok",
             "rag_search_get": "/rag/search?q=...&namespace=...",
         }
@@ -699,7 +755,8 @@ def health():
         "mem0_client_ready": bool(mem0_client),
         "model": MODEL,
         "rag_available": RAG_READY,
-        "rag_default_namespace": DEFAULT_NAMESPACE
+        "rag_default_namespace": DEFAULT_NAMESPACE,
+        "rag_top_k_default": RAG_TOP_K_DEFAULT
     }
 
 @app.post("/echo")
@@ -724,25 +781,29 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
     if not RAG_READY:
         return {"ok": False, "error": "rag_client indisponível no servidor"}
     try:
-        res = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k or RAG_TOP_K)
+        res = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k or RAG_TOP_K_DEFAULT)
         return {"ok": True, "query": q, "matches": res}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# ASK endpoints (sem orçamento; com injeção de links do RAG)
+# ASK endpoints (sem orçamento; com injeção de links do RAG e top-k dinâmico)
 # ---------------------------------------------------------------------------------------
 @app.get("/ask_get")
-def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
-    if not q: return {"answer": "Falta query param ?q="}
+def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
+    if not q:
+        return {"answer": "Falta query param ?q="}
+
+    decided_top_k = _decide_top_k(q, top_k)
     messages, new_facts, rag_used = build_messages(user_id, q, namespace)
+
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
     # pós-processamento com correção de links + injeção do RAG
-    answer = _postprocess_answer(answer, q)
+    answer = _postprocess_answer(answer, q, namespace, decided_top_k)
 
     # guardar histórico/memórias
     local_append_dialog(user_id, q, answer)
@@ -752,7 +813,12 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None):
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
+        }
     }
 
 @app.post("/ask")
@@ -761,8 +827,12 @@ async def ask(request: Request):
     question = (data.get("question") or "").strip()
     user_id = (data.get("user_id") or "").strip() or "anon"
     namespace = (data.get("namespace") or "").strip() or None
-    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} question={question!r}")
-    if not question: return {"answer": "Coloca a tua pergunta em 'question'."}
+    req_top_k = data.get("top_k")
+    decided_top_k = _decide_top_k(question, req_top_k)
+
+    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
+    if not question:
+        return {"answer": "Coloca a tua pergunta em 'question'."}
 
     messages, new_facts, rag_used = build_messages(user_id, question, namespace)
     try:
@@ -772,7 +842,7 @@ async def ask(request: Request):
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
     # pós-processamento com correção de links + injeção do RAG
-    answer = _postprocess_answer(answer, question)
+    answer = _postprocess_answer(answer, question, namespace, decided_top_k)
 
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
@@ -781,7 +851,12 @@ async def ask(request: Request):
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k": RAG_TOP_K, "namespace": namespace or DEFAULT_NAMESPACE}
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
+        }
     }
 
 # --- local run ----------------------------------------------------------
