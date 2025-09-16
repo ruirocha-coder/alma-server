@@ -12,10 +12,12 @@ import uvicorn
 import time
 import re
 import csv
+import json
 from io import StringIO
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, urlunparse
 import difflib
+import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------------------
 # FastAPI & CORS
@@ -36,7 +38,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/catalog-1+linkfix-2+csv-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/catalog-2+budget-pt-2+mem-refs-1")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma (deixa como está no teu projeto)
@@ -92,9 +94,10 @@ Formato de resposta
 ALMA_ORCAMENTO_PROMPT = """
 REGRAS MODO ORÇAMENTO (ESTRITO):
 - O preço do site interiorguider.com é COM IVA. Usa preço com IVA quando houver URL do site.
-- Não inventes produtos. Usa apenas PRODUTOS_RECONHECIDOS fornecidos abaixo.
+- NÃO inventes produtos. Usa apenas PRODUTOS_RECONHECIDOS fornecidos abaixo.
 - Se um item não estiver nos PRODUTOS_RECONHECIDOS: pede apenas a mínima especificação em falta (ex.: referência, variante, quantidade).
 - Se um item tiver "source=CATALOGO_EXTERNO": inclui nota "disponibilidade a confirmar".
+- Se um item tiver URL em falta, NÃO inventes; escreve "sem URL" e mantém a REF/NOME. Se SOURCE=CATALOGO_EXTERNO, acrescenta a nota "disponibilidade a confirmar".
 - Links: mostrar como Markdown clicável, preferindo interiorguider.com.
 
 Saída:
@@ -127,7 +130,9 @@ def _canon_ig_url(u: str) -> str:
 
 def _norm(s: str) -> str:
     s = (s or "").lower().strip()
-    s = s.replace("ã", "a").replace("õ", "o").replace("á","a").replace("à","a").replace("â","a").replace("é","e").replace("ê","e").replace("í","i").replace("ó","o").replace("ô","o").replace("ú","u").replace("ç","c")
+    s = (s.replace("ã","a").replace("õ","o").replace("á","a").replace("à","a").replace("â","a")
+           .replace("é","e").replace("ê","e").replace("í","i").replace("ó","o").replace("ô","o")
+           .replace("ú","u").replace("ç","c"))
     s = re.sub(r"[^a-z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -145,7 +150,7 @@ def catalog_index_item(item: dict):
     url  = _canon_ig_url(item.get("url") or "")
     price_gross = item.get("price_gross")  # preço com IVA
     aliases = item.get("aliases") or []
-    source = item.get("source") or ("SITE" if (url and IG_HOST in url) else "CATALOGO_EXTERNO")
+    source = item.get("source") or ("SITE" if (url and IG_HOST in (urlparse(url).netloc or "")) else "CATALOGO_EXTERNO")
 
     if not ref and not name:
         return
@@ -155,7 +160,7 @@ def catalog_index_item(item: dict):
     }
     if ref:
         CATALOG["by_ref"][ref] = entry
-    # index por nome
+    # index por nome e aliases
     keys = set([_norm(name)]) | {_norm(a) for a in aliases if a}
     for k in keys:
         if not k: continue
@@ -164,7 +169,6 @@ def catalog_index_item(item: dict):
             CATALOG["by_norm_name"][k].append(ref)
 
 def catalog_find_candidates(term: str, topn: int = 5) -> List[dict]:
-    """Procura por ref direta, nome normalizado e fuzzy."""
     term = (term or "").strip()
     if not term:
         return []
@@ -179,30 +183,70 @@ def catalog_find_candidates(term: str, topn: int = 5) -> List[dict]:
 
     # 3) fuzzy por chaves by_norm_name
     keys = list(CATALOG["by_norm_name"].keys())
-    for best in difflib.get_close_matches(nterm, keys, n=topn, cutoff=0.8):
+    for best in difflib.get_close_matches(nterm, keys, n=topn, cutoff=0.78):
         refs = CATALOG["by_norm_name"].get(best, [])
-        for r in refs:
+        for r in refs[:topn]:
             yield CATALOG["by_ref"][r]
 
-def resolve_products_from_text(text: str, limit_per_term: int = 3) -> List[dict]:
+def resolve_products_from_text(text: str, limit_per_term: int = 5) -> List[dict]:
     """
-    Heurística simples: extrai termos candidatos (palavras >2 chars, remove stopwords),
-    tenta matching no catálogo. Também tenta números de referência tipo BS.XY, M24, etc.
+    Extrai candidatos de:
+      - Tabelas Markdown (| REF | DESIGNAÇÃO | ...)
+      - Linhas com "REF" e "nome"
+      - Referências tipo "BS.X", "M24", "COD123", "BS.N.CA20."
+      - Nomes/aliases por frases/linhas
+    Matching por REF exata, nome normalizado e fuzzy.
     """
-    # candidatos de referência (ex.: BS.N.CA20, M24, COD123)
-    refs = re.findall(r"\b[A-Z]{1,4}(?:\.[A-Z0-9]{1,6})+\b|\b[A-Z]{1,4}\d{1,4}\b", text)
-    names = re.split(r"[,;\n]| e | com | para | de ", text, flags=re.I)
-    terms = [t.strip() for t in (refs + names) if t and len(t.strip()) >= 3]
-
-    seen = set()
+    if not text:
+        return []
     results = []
-    for t in terms:
-        for cand in catalog_find_candidates(t, topn=limit_per_term):
-            key = cand["ref"] or cand["name"]
-            if key in seen:
-                continue
-            seen.add(key)
-            results.append(cand)
+    seen_keys = set()
+
+    # 1) Refs explícitas
+    refs = re.findall(r"\b[A-Z]{1,4}(?:\.[A-Z0-9]{1,6})+\b|\b[A-Z]{1,4}\d{1,5}\b", text)
+
+    # 2) Tabelas/linhas
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    candidates = []
+    candidates += refs
+    for l in lines:
+        cells = [c.strip() for c in l.split("|") if c.strip()]
+        if len(cells) >= 2:
+            candidates.extend(cells[:2])
+        else:
+            parts = re.split(r"[,;]| e | com | para | de ", l, flags=re.I)
+            candidates.extend([p.strip() for p in parts if p and len(p.strip()) >= 3])
+
+    # 3) Pesquisa direta (REF e nomes)
+    for t in candidates:
+        if not t or len(t) < 2:
+            continue
+        if t in CATALOG["by_ref"]:
+            entry = CATALOG["by_ref"][t]
+            key = entry["ref"] or entry["name"]
+            if key not in seen_keys:
+                seen_keys.add(key); results.append(entry); continue
+
+        nterm = _norm(t)
+        if nterm in CATALOG["by_norm_name"]:
+            for r in CATALOG["by_norm_name"][nterm][:limit_per_term]:
+                entry = CATALOG["by_ref"][r]
+                key = entry["ref"] or entry["name"]
+                if key not in seen_keys:
+                    seen_keys.add(key); results.append(entry)
+
+    # 4) Fuzzy
+    keys = list(CATALOG["by_norm_name"].keys())
+    for t in candidates:
+        nterm = _norm(t)
+        for best in difflib.get_close_matches(nterm, keys, n=limit_per_term, cutoff=0.78):
+            refs = CATALOG["by_norm_name"].get(best, [])
+            for r in refs[:limit_per_term]:
+                entry = CATALOG["by_ref"][r]
+                key = entry["ref"] or entry["name"]
+                if key not in seen_keys:
+                    seen_keys.add(key); results.append(entry)
+
     return results
 
 # ---------------------------------------------------------------------------------------
@@ -261,10 +305,11 @@ if MEM0_ENABLE:
                 mem0_client = None
 
 # ---------------------------------------------------------------------------------------
-# Fallback local (se Mem0 off) — curto prazo + FACTs
+# Fallback local (se Mem0 off) — curto prazo + FACTs + memória de refs
 # ---------------------------------------------------------------------------------------
 LOCAL_FACTS: Dict[str, Dict[str, str]] = {}
 LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}
+LAST_PRODUCTS: Dict[str, List[str]] = {}  # user_id -> [refs]
 
 def local_set_fact(user_id: str, key: str, value: str):
     LOCAL_FACTS.setdefault(user_id, {})
@@ -288,6 +333,23 @@ def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
         if len(out) >= limit: break
         out.append(f"Alma: {a}")
     return out[:limit]
+
+def remember_products(user_id: str, refs: List[str], cap: int = 30):
+    if not refs: return
+    cur = LAST_PRODUCTS.get(user_id, [])
+    new = [r for r in refs if r and r not in cur]
+    LAST_PRODUCTS[user_id] = (cur + new)[-cap:]
+    try:
+        _mem0_create(content=f"{FACT_PREFIX}last_refs=" + ";".join(LAST_PRODUCTS[user_id]), user_id=user_id,
+                     metadata={"source": "alma-server", "type": "fact", "key": "last_refs"})
+    except Exception:
+        pass
+
+def recall_products(user_id: str) -> List[str]:
+    facts = mem0_get_facts(user_id)
+    if "last_refs" in facts:
+        return [x.strip() for x in facts["last_refs"].split(";") if x.strip()]
+    return LAST_PRODUCTS.get(user_id, [])
 
 # ---------------------------------------------------------------------------------------
 # Helpers Mem0 compat
@@ -453,10 +515,15 @@ def _is_budget_request(text: str) -> bool:
         return False
     t = text.lower()
     keys = [
-        "orçamento", "orcamento", "budget", "cotação", "cotacao",
-        "proposta", "quote", "preço total", "quanto fica", "fazer orçamento",
-        "faz um documento em excel", "folha de cálculo", "folha de calculo", "planilha",
-        "excel com o orçamento"
+        # PT
+        "orçamento", "orcamento", "cotação", "cotacao", "proposta", "preço total", "quanto fica",
+        "fazer orçamento", "encomenda", "proforma", "fatura proforma", "tabela de preços", "preventivo",
+        # formatos/ferramentas
+        "excel", "folha de cálculo", "folha de calculo", "planilha", ".csv", "csv", "orçamento em excel",
+        # ES
+        "presupuesto", "cotización", "cotizacion",
+        # gatilhos de tabela/linhas
+        "ref.", "designação", "descrição", "quant.", "preço uni."
     ]
     return any(k in t for k in keys)
 
@@ -488,10 +555,21 @@ def _postprocess_answer(answer: str) -> str:
 # ---------------------------------------------------------------------------------------
 # Consolidação de PRODUTOS_RECONHECIDOS para o LLM (modo orçamento)
 # ---------------------------------------------------------------------------------------
-def build_catalog_hints_block(question: str) -> str:
+def build_catalog_hints_block(question: str, user_id: Optional[str] = None) -> str:
     found = resolve_products_from_text(question)
+    # fallback: usar memória recente de produtos, se nada reconhecido no texto
+    if (not found) and user_id:
+        for r in recall_products(user_id):
+            if r in CATALOG["by_ref"]:
+                found.append(CATALOG["by_ref"][r])
+
     if not found:
         return ""
+
+    # memoriza refs agora detetadas
+    if user_id:
+        remember_products(user_id, [it.get("ref") for it in found if it.get("ref")])
+
     lines = ["PRODUTOS_RECONHECIDOS (usa só estes; não inventes):"]
     for it in found:
         ref = it.get("ref") or "-"
@@ -502,6 +580,8 @@ def build_catalog_hints_block(question: str) -> str:
         line = f"- REF={ref}; NOME={name}; PRECO_COM_IVA={price if price is not None else 'N/D'}; SOURCE={source}"
         if url:
             line += f"; URL={url}"
+        else:
+            line += "; URL="  # vazio, para forçar o LLM a não inventar
         lines.append(line)
     return "\n".join(lines)
 
@@ -542,6 +622,8 @@ def status_json():
             "rag_search_post": "POST /rag/search {query, namespace?, top_k?}",
             "catalog_load": "POST /catalog/load",
             "catalog_status": "GET /catalog/status",
+            "catalog_save": "POST /catalog/save",
+            "catalog_load_file": "POST /catalog/load-file",
             "budget_csv": "POST /budget/csv"
         }
     }
@@ -573,7 +655,7 @@ def ping_grok():
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# Catálogo: carregar e status
+# Catálogo: carregar / guardar / status
 # ---------------------------------------------------------------------------------------
 @app.post("/catalog/load")
 async def catalog_load(request: Request):
@@ -613,6 +695,31 @@ def catalog_status():
         "examples": list(list(CATALOG["by_ref"].values())[:3])
     }
 
+@app.post("/catalog/save")
+async def catalog_save(request: Request):
+    data = await request.json()
+    path = (data.get("path") or "/tmp/catalog.json").strip()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(CATALOG, f, ensure_ascii=False)
+    return {"ok": True, "saved_to": path}
+
+@app.post("/catalog/load-file")
+async def catalog_load_file(request: Request):
+    data = await request.json()
+    path = (data.get("path") or "/tmp/catalog.json").strip()
+    if not os.path.exists(path):
+        return {"ok": False, "error": f"ficheiro não encontrado: {path}"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        by_ref = obj.get("by_ref") or {}
+        count = 0
+        for _, it in by_ref.items():
+            catalog_index_item(it); count += 1
+        return {"ok": True, "loaded": count, "total": len(CATALOG["by_ref"])}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # ---------------------------------------------------------------------------------------
 # RAG: GET /rag/search (debug)
 # ---------------------------------------------------------------------------------------
@@ -637,9 +744,6 @@ def serve_console():
     except Exception:
         return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
 
-# ---------------------------------------------------------------------------------------
-# Alma Chat (modo consola full)
-# ---------------------------------------------------------------------------------------
 @app.get("/alma-chat", response_class=HTMLResponse)
 def serve_alma_chat():
     try:
@@ -687,7 +791,7 @@ def build_messages_with_memory_and_rag(
 
     # 4a) Modo Orçamentos → injetar catálogo reconhecido + regras estritas
     if _is_budget_request(question):
-        cat_block = build_catalog_hints_block(question)
+        cat_block = build_catalog_hints_block(question, user_id=user_id)
         if cat_block:
             messages.append({"role": "system", "content": cat_block})
         messages.append({"role": "system", "content": ALMA_ORCAMENTO_PROMPT})
@@ -819,7 +923,7 @@ async def say(request: Request):
     return {"video_url": result_url}
 
 # ---------------------------------------------------------------------------------------
-# HeyGen token demo
+# HeyGen token demo (mantido para compatibilidade)
 # ---------------------------------------------------------------------------------------
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
 
@@ -840,7 +944,7 @@ def heygen_token():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST)
+# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST) — inalterados funcionalmente
 # ---------------------------------------------------------------------------------------
 @app.post("/rag/crawl")
 async def rag_crawl(request: Request):
@@ -944,8 +1048,6 @@ async def rag_search_post(request: Request):
         return {"ok": False, "error": "search_failed", "detail": str(e)}
 
 # --- Proxy: extrair URLs -----------------------------------------------------
-import xml.etree.ElementTree as ET
-
 @app.post("/rag/extract-urls")
 async def rag_extract_urls(request: Request):
     try:
@@ -964,8 +1066,6 @@ async def rag_extract_urls(request: Request):
 
         if not raw_text:
             return {"ok": False, "error": "sem conteúdo"}
-
-        urls = []
 
         def dedup_keep(seq):
             seen = set(); out = []
@@ -999,29 +1099,51 @@ async def rag_extract_urls(request: Request):
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# Exportação CSV de Orçamentos
+# € — parsing robusto + CSV “PT-friendly” (Excel)
 # ---------------------------------------------------------------------------------------
-def _safe_float(v, default=0.0):
+def _parse_money_eu(s: str) -> Optional[float]:
+    """
+    Aceita: "1.234,56", "1,234.56", "1234,56", "1234.56", "€1 234,56", "1 234,56 €", "1,000€"
+    Remove espaços/€; deteta decimal pelo último separador.
+    """
     try:
-        if isinstance(v, str):
-            v = v.replace("€", "").replace(",", ".").strip()
-        return float(v)
+        if s is None:
+            return None
+        s = str(s).strip().replace("€", "").replace("\u00A0", " ").strip()
+        s = re.sub(r"\s+", "", s)
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")   # EU -> .
+            else:
+                s = s.replace(",", "")                    # US -> remove milhar
+        else:
+            if "," in s:
+                s = s.replace(",", ".")
+        return float(s)
     except Exception:
-        return float(default)
+        return None
 
-def _format_money(x: float) -> str:
-    return f"{x:.2f}"
+def _safe_float(v, default=0.0):
+    if isinstance(v, (int, float)):
+        return float(v)
+    f = _parse_money_eu(v)
+    return f if f is not None else float(default)
 
+# ---------------------------------------------------------------------------------------
+# Exportação CSV de Orçamentos (público: C/IVA; pro: S/IVA por omissão)
+# ---------------------------------------------------------------------------------------
 @app.post("/budget/csv")
 async def budget_csv(request: Request):
     """
     Body:
     {
-      "mode": "public" | "pro",    # public: TOTAL S/IVA ; pro: TOTAL C/IVA
+      "mode": "public" | "pro",
       "iva_pct": 23,
+      "force_total_ci": false,         # opcional (apenas útil em 'pro')
+      "delimiter": ";",                # ";", "," (default ";")
+      "decimal": "comma",              # "comma" | "dot" (default "comma")
       "rows": [
-        {"ref":"BS.01","descricao":"...","quant":1,"preco_uni":100,"desc_pct":5,"dim":"...","material":"...","marca":"...","link":"https://interiorguider.com/..."},
-        ...
+        {"ref":"BS.01","descricao":"...","quant":1,"preco_uni":"1.000,00","desc_pct":"5","dim":"...","material":"...","marca":"...","link":"https://interiorguider.com/..."}
       ]
     }
     """
@@ -1029,25 +1151,34 @@ async def budget_csv(request: Request):
     mode = (data.get("mode") or "public").lower().strip()
     iva_pct = _safe_float(data.get("iva_pct", 23.0))
     rows = data.get("rows") or []
+    force_total_ci = bool(data.get("force_total_ci", False))
+    delimiter = (data.get("delimiter") or ";").strip() or ";"
+    decimal = (data.get("decimal") or "comma").strip().lower()
 
     if mode not in ("public", "pro"):
         return PlainTextResponse("mode deve ser 'public' ou 'pro'", status_code=400)
     if not isinstance(rows, list) or not rows:
         return PlainTextResponse("rows vazio", status_code=400)
 
+    def fmt_money(x: float) -> str:
+        s = f"{x:.2f}"
+        return s.replace(".", ",") if decimal == "comma" else s
+
     if mode == "public":
-        headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA"]
-    else:
         headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL C/IVA"]
+        show_total_ci = True
+    else:
+        headers = ["REF.", "DESIGNAÇÃO / MATERIAL / ACABAMENTO / COR", "QUANT.", "PREÇO UNI.", "DESC.", "TOTAL S/IVA" if not force_total_ci else "TOTAL C/IVA"]
+        show_total_ci = bool(force_total_ci)
 
     sio = StringIO()
-    writer = csv.writer(sio)
+    writer = csv.writer(sio, delimiter=delimiter)
     writer.writerow(headers)
 
     for r in rows:
         ref = (r.get("ref") or "").strip()
-        quant = int(r.get("quant") or 1)
-        preco_uni = _safe_float(r.get("preco_uni"), 0.0)
+        quant = int(_safe_float(r.get("quant"), 1))
+        preco_uni = _safe_float(r.get("preco_uni"), 0.0)   # aceita "1.000,00" e variantes
         desc_pct = _safe_float(r.get("desc_pct"), 0.0)
 
         desc_main = (r.get("descricao") or "").strip() or "Produto"
@@ -1062,19 +1193,15 @@ async def budget_csv(request: Request):
         full_desc = desc_main + (("\n" + "\n".join(extra_lines)) if extra_lines else "")
 
         total_si = quant * preco_uni * (1.0 - desc_pct/100.0)
-        if mode == "public":
-            total_col = _format_money(total_si)
-        else:
-            total_ci = total_si * (1.0 + iva_pct/100.0)
-            total_col = _format_money(total_ci)
+        total = total_si * (1.0 + iva_pct/100.0) if show_total_ci else total_si
 
         writer.writerow([
             ref,
             full_desc,
             str(quant),
-            _format_money(preco_uni),
+            fmt_money(preco_uni),
             (f"{desc_pct:.0f}%" if desc_pct else ""),
-            total_col
+            fmt_money(total)
         ])
 
     csv_bytes = sio.getvalue().encode("utf-8-sig")
@@ -1084,6 +1211,12 @@ async def budget_csv(request: Request):
         f.write(csv_bytes)
 
     return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+# ---------------------------------------------------------------------------------------
+# Mensagens com memória + RAG + Orçamento
+# ---------------------------------------------------------------------------------------
+def build_messages_with_memory_and_rag_and_budget(user_id: str, question: str, namespace: Optional[str]):
+    return build_messages_with_memory_and_rag(user_id, question, namespace)
 
 # ---------------------------------------------------------------------------------------
 # Local run
