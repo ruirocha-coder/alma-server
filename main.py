@@ -70,6 +70,7 @@ Funções
 4) Suporte Humano (condicional) — se houver stress, reconhecer e reduzir carga (“Vamos por partes…”).
 5) Procedimentos — explicar regras internas e leis relevantes de forma clara.
 6) Respostas Gerais — combinar RAG e Grok; se faltar evidência, diz o que não sabes e o passo para obter.
+7) Orçamentos — para queries com 'orçamento' ou múltiplos itens: usa APENAS os dados exatos do bloco 'Produtos para orçamento' (QTY, NOME, URL). Calcula subtotal por item e total. Inclui TODOS os URLs em [nome](url). Se faltar preço/URL no RAG, usa 'sem info no RAG' e sugere contacto. Mantém consistência: não inventes dados.
 
 Contexto
 - Boa Safra: editora de design natural português para a casa, com coleção própria.
@@ -189,6 +190,13 @@ _NAME_HINTS = [
 ]
 _PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,6})")
 
+# --- padrões para orçamentos ---
+BUDGET_PATTERNS = [
+    r"\borçament[oô]\s+(?:para|de)\s+(\d+)",  # "orçamento para 3"
+    r"(\d+)\s*(?:artigos?|itens?|produtos?)",  # "3 artigos"
+    r"(\d+)\s*(?:x|unid\.?|unidades?)\s*(?:de|da|do)?\s*([a-z0-9çáéíóúâêôãõ ]{3,})",  # "2x cadeira modelo"
+]
+
 def _extract_name_terms(text:str) -> List[str]:
     t = " " + (text or "") + " "
     terms = []
@@ -205,6 +213,31 @@ def _extract_name_terms(text:str) -> List[str]:
         if s and s not in seen:
             seen.add(s); out.append(s)
     return out[:8]
+
+def _extract_budget_items(text: str) -> List[Tuple[int, str]]:
+    """Extrai (quantidade, nome_item) de queries de orçamento."""
+    t = " " + (text or "") + " "
+    items = []
+    for pat in BUDGET_PATTERNS:
+        for m in re.finditer(pat, t, flags=re.I):
+            if len(m.groups()) == 2:
+                qty = int(m.group(1))
+                name = m.group(2).strip()
+                if qty > 0 and len(name) > 2:
+                    items.append((qty, name))
+            elif len(m.groups()) == 1:
+                qty = int(m.group(1))
+                if qty >= 2:  # Assume multi-item se qty>1
+                    items.append((qty, "artigo genérico"))  # Fallback
+    # Deduplica e limita
+    seen = set()
+    out = []
+    for qty, name in items:
+        key = _norm(name)
+        if key not in seen:
+            seen.add(key)
+            out.append((qty, name))
+    return out[:5]  # Máx 5 itens
 
 def _parse_money_eu(s: str) -> Optional[float]:
     try:
@@ -522,6 +555,7 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
     1) Usa mini-pesquisa RAG por termo (query + resposta) com top_k consistente.
     2) Substitui '[...] (sem URL)' e 'sem URL' por links IG quando possível.
     3) Se um termo aparecer sem link, injeta 1 link markdown na primeira ocorrência.
+    4) Para orçamentos, injeta em linhas com quantidades/nomes.
     """
     if not (RAG_READY and text):
         return text
@@ -595,6 +629,23 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
             if injected:
                 break
 
+    # 4) Para orçamentos, injeta em linhas com quantidades/nomes (ex.: "- 2 cadeiras: 150€")
+    if "orçament" in user_query.lower():
+        budget_items = _extract_budget_items(user_query)
+        out_lines = out.splitlines()
+        for i, line in enumerate(out_lines):
+            for qty, item_name in budget_items:
+                tnorm = _norm(item_name)
+                if tnorm in _norm(line) and not _MD_LINK_RE.search(line):
+                    url = url_by_term.get(tnorm, "")
+                    if url:
+                        # Envolve o nome do item
+                        m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
+                        if m:
+                            nome_part = m.group(1)
+                            out_lines[i] = line.replace(nome_part, f"[{nome_part}]({url})", 1)
+        out = "\n".join(out_lines)
+
     return out
 
 def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
@@ -635,8 +686,12 @@ def grok_chat(messages, timeout=120):
 def _decide_top_k(user_query: str, req_top_k: Optional[int]) -> int:
     if req_top_k:
         return _clamp_int(req_top_k, lo=3, hi=40, default=RAG_TOP_K_DEFAULT)
+    
     n_terms = len(_extract_name_terms(user_query or ""))
-    if n_terms >= 3:
+    budget_items = _extract_budget_items(user_query)
+    if "orçament" in user_query.lower() or len(budget_items) >= 2:
+        base = 20 + (len(budget_items) * 4)  # Ex.: 3 itens -> top_k=32
+    elif n_terms >= 3:
         base = 16
     elif n_terms == 2:
         base = 12
@@ -647,31 +702,49 @@ def _decide_top_k(user_query: str, req_top_k: Optional[int]) -> int:
 def build_rag_products_block(question: str) -> str:
     if not RAG_READY:
         return ""
-    # tentar hits diretos
-    try:
-        hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
-    except Exception:
-        hits = []
+    
+    budget_items = _extract_budget_items(question)
     lines = []
-    if hits:
-        seen=set()
-        for h in hits[:6]:
+    
+    if budget_items:
+        # Searches separados por item para melhor precisão
+        for qty, item_name in budget_items[:6]:
+            query_item = f"{qty} {item_name}"  # Ex.: "2 cadeira modelo"
+            try:
+                hits = search_chunks(query=query_item, namespace=DEFAULT_NAMESPACE, top_k=5) or []  # Top-k menor por item
+            except Exception:
+                hits = []
+            
+            seen = set()
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                title = (meta.get("title") or item_name).strip()
+                url = _canon_ig_url(meta.get("url") or "")
+                key = (title, url)
+                if key in seen: continue
+                seen.add(key)
+                lines.append(f"- QTY={qty}; NOME={title}; URL={url or 'sem URL'}")
+            if not lines:  # Fallback se sem hits
+                links = rag_mini_search_urls([item_name], DEFAULT_NAMESPACE, top_k=5)
+                url = links.get(_norm(item_name), "sem URL")
+                lines.append(f"- QTY={qty}; NOME={item_name}; URL={url}")
+    else:
+        # Lógica original para queries não-orçamento
+        try:
+            hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
+        except Exception:
+            hits = []
+        seen = set()
+        for h in hits[:8]:  # Aumenta para 8
             meta = h.get("metadata", {}) or {}
             title = (meta.get("title") or "").strip()
             url = _canon_ig_url(meta.get("url") or "")
             key = (title, url)
             if key in seen: continue
             seen.add(key)
-            if title or url:
-                lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
-    else:
-        # fallback heurístico por nome
-        guessed_terms = _extract_name_terms(question)
-        links = rag_mini_search_urls(guessed_terms, DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT)
-        for t in guessed_terms[:6]:
-            url = links.get(_norm(t), "sem URL")
-            lines.append(f"- NOME={t}; URL={url}")
-    return "Produtos sugeridos pelo RAG:\n" + "\n".join(lines) if lines else ""
+            lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
+    
+    return "Produtos para orçamento (do RAG; usa estes dados exatos para preços e links):\n" + "\n".join(lines) if lines else ""
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
     # 0) extrair e guardar factos rápidos
@@ -795,12 +868,17 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Op
         return {"answer": "Falta query param ?q="}
 
     decided_top_k = _decide_top_k(q, top_k)
+    products_block = build_rag_products_block(q)
+    log.info(f"[debug] products_block: {products_block[:500]}...")
     messages, new_facts, rag_used = build_messages(user_id, q, namespace)
+    log.info(f"[debug] messages len: {len(messages)}")
 
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    log.info(f"[debug] answer raw: {answer[:300]}...")
 
     # pós-processamento com correção de links + injeção do RAG
     answer = _postprocess_answer(answer, q, namespace, decided_top_k)
@@ -834,12 +912,17 @@ async def ask(request: Request):
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
 
+    products_block = build_rag_products_block(question)
+    log.info(f"[debug] products_block: {products_block[:500]}...")
     messages, new_facts, rag_used = build_messages(user_id, question, namespace)
+    log.info(f"[debug] messages len: {len(messages)}")
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    log.info(f"[debug] answer raw: {answer[:300]}...")
 
     # pós-processamento com correção de links + injeção do RAG
     answer = _postprocess_answer(answer, question, namespace, decided_top_k)
