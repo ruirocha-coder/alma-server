@@ -1786,7 +1786,205 @@ def status_json():
     base["catalog"] = _status_catalog()
     return base
 
+# ---------------------------------------------------------------------------------------
+# 📚 Catálogo (SQLite) — constrói a partir do RAG ou de URLs explícitas
+# ---------------------------------------------------------------------------------------
+import sqlite3
+from datetime import datetime
 
+CATALOG_DB_PATH = os.getenv("CATALOG_DB_PATH", "/tmp/catalog.db")
+
+def _catalog_conn():
+    conn = sqlite3.connect(CATALOG_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _catalog_init():
+    with _catalog_conn() as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS catalog_items (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          namespace TEXT,
+          name TEXT,
+          summary TEXT,
+          url TEXT UNIQUE,
+          source TEXT,
+          created_at TEXT,
+          updated_at TEXT
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ns ON catalog_items(namespace)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog_items(name)")
+    log.info("[catalog] ready sqlite=%s", CATALOG_DB_PATH)
+
+_catalog_init()
+
+def _now():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _upsert_catalog_row(ns: Optional[str], name: str, summary: str, url: str, source: str = "rag"):
+    if not url: return
+    with _catalog_conn() as c:
+        cur = c.execute("SELECT id FROM catalog_items WHERE url=?", (url,))
+        row = cur.fetchone()
+        if row:
+            c.execute("""UPDATE catalog_items
+                         SET namespace=?, name=?, summary=?, source=?, updated_at=?
+                         WHERE url=?""",
+                      (ns, name, summary, source, _now(), url))
+        else:
+            c.execute("""INSERT INTO catalog_items(namespace,name,summary,url,source,created_at,updated_at)
+                         VALUES (?,?,?,?,?,?,?)""",
+                      (ns, name, summary, url, source, _now(), _now()))
+
+def _name_from_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        slug = (p.path or "/").rstrip("/").split("/")[-1]
+        slug = re.sub(r"[-_]+", " ", slug)
+        return slug.strip().title() or u
+    except Exception:
+        return u
+
+def _summary_from_match(meta: dict) -> str:
+    # tenta campos comuns do rag_client
+    return (meta.get("summary")
+            or meta.get("snippet")
+            or (meta.get("text") or "")[:260]
+            or (meta.get("content") or "")[:260])
+
+def _rag_lookup_by_url(u: str, namespace: Optional[str]) -> Tuple[str, str]:
+    """Procura no RAG um doc pelo URL (title/summary)."""
+    if not RAG_READY: 
+        return (_name_from_url(u), "")
+    try:
+        hits = search_chunks(query=u, namespace=namespace or DEFAULT_NAMESPACE, top_k=3) or []
+    except Exception:
+        hits = []
+    best_title, best_summary = "", ""
+    for h in hits:
+        meta = h.get("metadata") or {}
+        url_hit = (meta.get("url") or "").strip()
+        if not url_hit: 
+            continue
+        if _canon_ig_url(url_hit) == _canon_ig_url(u):
+            best_title = (meta.get("title") or "")[:160] or _name_from_url(u)
+            best_summary = _summary_from_match(meta) or ""
+            break
+    if not best_title:
+        # fallback: usa o melhor hit
+        for h in hits:
+            meta = h.get("metadata") or {}
+            if meta.get("url"):
+                best_title = (meta.get("title") or "")[:160] or _name_from_url(u)
+                best_summary = _summary_from_match(meta) or ""
+                break
+    return (best_title or _name_from_url(u), best_summary or "")
+
+@app.post("/catalog/build")
+async def catalog_build(request: Request):
+    """
+    Body: { "urls": ["https://...","..."], "namespace": "boasafra" }
+    Adiciona/atualiza URLs no catálogo, buscando título/sumário no RAG.
+    """
+    data = await request.json()
+    urls = data.get("urls") or []
+    namespace = (data.get("namespace") or None) or DEFAULT_NAMESPACE
+    if not isinstance(urls, list) or not urls:
+        return {"ok": False, "error": "fornece 'urls': lista"}
+    ok, fail = 0, 0
+    added = []
+    for u in urls:
+        u = _canon_ig_url(str(u).strip()) or str(u).strip()
+        if not u: 
+            continue
+        try:
+            title, summary = _rag_lookup_by_url(u, namespace)
+            _upsert_catalog_row(namespace, title, summary, u, source="manual")
+            ok += 1; added.append({"url": u, "title": title})
+        except Exception as e:
+            fail += 1
+            log.warning("[catalog] add fail url=%s err=%s", u, e)
+    return {"ok": True, "added": ok, "failed": fail, "items": added}
+
+@app.post("/catalog/build-from-rag")
+async def catalog_build_from_rag(request: Request):
+    """
+    Body: { "namespace": "boasafra", "limit": 500 }
+    Varre o RAG (busca ampla) e preenche/atualiza o catálogo.
+    """
+    if not RAG_READY:
+        return {"ok": False, "error": "RAG indisponível"}
+    data = await request.json()
+    namespace = (data.get("namespace") or None) or DEFAULT_NAMESPACE
+    limit = int(data.get("limit") or 400)
+    limit = max(10, min(5000, limit))
+
+    # Busca “ampla” — tenta apanhar páginas com URL nos metadados
+    # Dica: ajusta a query se o teu corpus for só produtos IG.
+    broad_queries = ["https", "http", "produto", "product", "interiorguider.com"]
+    seen = set(); rows = []
+    for q in broad_queries:
+        try:
+            hits = search_chunks(query=q, namespace=namespace, top_k=limit) or []
+        except Exception:
+            hits = []
+        for h in hits:
+            meta = h.get("metadata") or {}
+            url = _canon_ig_url(meta.get("url") or "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            title = (meta.get("title") or _name_from_url(url))[:160]
+            summary = _summary_from_match(meta) or ""
+            _upsert_catalog_row(namespace, title, summary, url, source="rag")
+            rows.append({"url": url, "title": title})
+            if len(rows) >= limit:
+                break
+        if len(rows) >= limit:
+            break
+
+    return {"ok": True, "namespace": namespace, "count": len(rows), "items": rows[:50]}
+
+@app.get("/catalog/list")
+def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
+    """
+    Lista o catálogo com paginação simples. Params: ?q=&limit=&offset=
+    """
+    limit = max(1, min(500, int(limit or 100)))
+    offset = max(0, int(offset or 0))
+    like = f"%{q.strip()}%" if q else None
+    with _catalog_conn() as c:
+        if like:
+            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at
+                               FROM catalog_items
+                               WHERE name LIKE ? OR summary LIKE ? OR url LIKE ?
+                               ORDER BY updated_at DESC
+                               LIMIT ? OFFSET ?""", (like, like, like, limit, offset))
+            items = [dict(r) for r in cur.fetchall()]
+            cur2 = c.execute("""SELECT count(*) as n FROM catalog_items
+                                WHERE name LIKE ? OR summary LIKE ? OR url LIKE ?""", (like, like, like))
+            total = int(cur2.fetchone()["n"])
+        else:
+            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at
+                               FROM catalog_items
+                               ORDER BY updated_at DESC
+                               LIMIT ? OFFSET ?""", (limit, offset))
+            items = [dict(r) for r in cur.fetchall()]
+            cur2 = c.execute("SELECT count(*) as n FROM catalog_items")
+            total = int(cur2.fetchone()["n"])
+    # adaptar campos aos nomes usados no console
+    out_items = []
+    for r in items:
+        out_items.append({
+            "id": r["id"],
+            "namespace": r["namespace"],
+            "name": r["name"],
+            "summary": r["summary"],
+            "url": r["url"],
+            "source": r["source"],
+            "updated_at": r["updated_at"],
+        })
+    return {"ok": True, "total": total, "items": out_items}
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
