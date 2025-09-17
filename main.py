@@ -715,88 +715,193 @@ def facts_block_for_user(user_id: str) -> str:
     facts = mem0_get_facts(user_id)
     return facts_to_context_block(facts)
 
+# ---------- Entity/link resolver (seguro) ----------
+def _canon_path(u: str) -> str:
+    try:
+        p = urlparse(_canon_ig_url(u) or u)
+        return (p.path or "").rstrip("/")
+    except Exception:
+        return ""
+
+def _tokens(s: str) -> List[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", _norm(s)) if t and len(t) > 1]
+
+def _compat_score(name: str, title: str, slug: str) -> float:
+    # mede compatibilidade entidade ↔ página (Jaccard sobre tokens)
+    nt = set(_tokens(name))
+    tt = set(_tokens(title))
+    st = set(_tokens(slug.replace("/", " ")))
+    if not nt:
+        return 0.0
+    j_title = len(nt & tt) / max(1, min(len(nt), len(tt))) if tt else 0.0
+    j_slug  = len(nt & st) / max(1, min(len(nt), len(st))) if st else 0.0
+    # reforços semânticos por palavras-chave (evita banco↔mesa, etc.)
+    kind_hit = 0.0
+    KINDS = [
+        ("mesa","table"), ("cadeira","chair"), ("banco","stool"),
+        ("cama","bed"), ("luminaria","lamp"), ("luminária","lamp")
+    ]
+    name_low = _norm(name)
+    text_all = _norm(title + " " + slug)
+    for pt,en in KINDS:
+        if re.search(rf"\b{pt}\b", name_low) and re.search(rf"\b({pt}|{en})\b", text_all):
+            kind_hit = 0.2; break
+    return (0.6*j_slug) + (0.4*j_title) + kind_hit
+
+class LinkResolver:
+    def __init__(self, namespace: Optional[str], prefer_host: str = IG_HOST, min_conf: float = 0.55):
+        self.ns = namespace or DEFAULT_NAMESPACE
+        self.prefer_host = (prefer_host or "").lower()
+        self.min_conf = min_conf
+
+    def best_url_for(self, term: str) -> Tuple[str,float,dict]:
+        """Procura candidatos (fulltext/embeddings) e escolhe o melhor link.
+        Retorna (url, conf, payload)."""
+        cands = _stage_a_candidates(term, namespace=self.ns, limit_per_q=50, hard_cap=120) or []
+        best = ("", 0.0, {})
+        lang_hint = _detect_lang_hint(_norm(term))
+        for c in cands:
+            p = c.get("payload") or {}
+            raw_url = p.get("url") or ""
+            url = _canon_ig_url(raw_url) or raw_url
+            if not url:
+                continue
+            title = (p.get("title") or "")
+            slug  = (p.get("slug")  or urlparse(url).path or "")
+            base  = _scorer(term, p, url, lang_hint)          # “parecido com a query”
+            compat= _compat_score(term, title, slug)          # “é MESMO este produto?”
+            host  = (urlparse(url).netloc or "").lower()
+            pref  = 0.25 if (self.prefer_host and self.prefer_host in host) else 0.0
+            score = 0.5*base + 0.5*compat + pref
+            if score > best[1]:
+                best = (url, score, p)
+        return best
+
+    def resolve_map(self, terms: List[str]) -> Dict[str, Tuple[str,float]]:
+        out = {}
+        for t in terms:
+            tnorm = _norm(t)
+            if not tnorm: 
+                continue
+            url, conf, _ = self.best_url_for(t)
+            if url and conf >= self.min_conf:
+                out[tnorm] = (url, conf)
+        return out
+
+    def smart_fix_text(self, text: str, url_by_term_conf: Dict[str, Tuple[str,float]]) -> str:
+        """Substitui apenas quando a confiança é suficiente e o destino é diferente/melhor."""
+        if not text or not url_by_term_conf:
+            return text
+        parts = text.splitlines()
+        for i, line in enumerate(parts):
+            ln = _norm(line)
+            for tnorm, (good_url, conf) in url_by_term_conf.items():
+                if tnorm not in ln:
+                    continue
+                good_path = _canon_path(good_url)
+                # 1) corrige markdown com URL IG errado
+                def _md_fix(m):
+                    label, url = m.group(1), m.group(2)
+                    host = (urlparse(url).netloc or "").lower()
+                    if IG_HOST in host and _canon_path(url) != good_path and conf >= self.min_conf:
+                        return f"[{label}]({good_url})"
+                    return m.group(0)
+                l2 = _MD_LINK_RE.sub(_md_fix, line)
+
+                # 2) corrige URLs “nus” IG errados
+                def _raw_fix(m):
+                    url = m.group(0)
+                    host = (urlparse(url).netloc or "").lower()
+                    if IG_HOST in host and _canon_path(url) != good_path and conf >= self.min_conf:
+                        return good_url
+                    return url
+                l2 = _RAW_URL_RE.sub(_raw_fix, l2)
+                line = l2
+            parts[i] = line
+        return "\n".join(parts)
 # ---------------------------------------------------------------------------------------
 # Injetor de links a partir do RAG (pós-processamento do texto) + Fallback
 # ---------------------------------------------------------------------------------------
+
 def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
     if not (RAG_READY and text):
         return text
-    # termos do query + da resposta
+
+    # 0) normalização de links já formatados (mantém)
+    out = _fix_product_links_markdown(text or "")
+
+    # 1) extrai termos das duas pontas (query + resposta)
     terms: List[str] = []
     terms.extend(_extract_name_terms(user_query or ""))
-    terms.extend(_extract_name_terms(text or ""))
+    terms.extend(_extract_name_terms(out or ""))
 
-    url_by_term = rag_mini_search_urls(terms, namespace, top_k=decided_top_k)
-    if not url_by_term:
-        return text
+    # 2) resolve entidades com LinkResolver
+    resolver = LinkResolver(namespace=namespace, min_conf=0.58)
+    url_by_term_conf = resolver.resolve_map(terms)
 
-    out = text
+    # 3) corrige “[label](sem URL)” e linhas “sem URL” usando o mapa resolvido
+    if url_by_term_conf:
+        def _fix_sem_url(m):
+            label = m.group(1)
+            tnorm = _norm(label)
+            if tnorm in url_by_term_conf:
+                return f"[{label}]({url_by_term_conf[tnorm][0]})"
+            # fallback: se só existir um link com boa confiança, usa-o
+            if len(url_by_term_conf) == 1:
+                only_url = list(url_by_term_conf.values())[0][0]
+                return f"[{label}]({only_url})"
+            return m.group(0)
+        out = re.sub(r"\[([^\]]+)\]\(\s*sem\s+url\s*\)", _fix_sem_url, out, flags=re.I)
 
-    # corrige "[label](sem URL)"
-    def _fix_sem_url(m):
-        label = m.group(1)
-        chosen = url_by_term.get(_norm(label), "")
-        if not chosen and len(url_by_term) == 1:
-            chosen = list(url_by_term.values())[0]
-        if not chosen:
-            chosen = list(url_by_term.values())[0]
-        return f"[{label}]({chosen})" if chosen else m.group(0)
-    out = re.sub(r"\[([^\]]+)\]\(\s*sem\s+url\s*\)", _fix_sem_url, out, flags=re.I)
-
-    # linhas que contêm "sem URL"
-    def _replace_line_sem_url(line: str) -> str:
-        if re.search(r"\bsem\s+url\b", line, flags=re.I):
-            for tnorm, url in url_by_term.items():
-                if tnorm in _norm(line):
+        def _replace_line_sem_url(line: str) -> str:
+            if re.search(r"\bsem\s+url\b", line, flags=re.I):
+                ln = _norm(line)
+                # escolhe o termo mais “compatível” com a linha
+                best = None
+                for tnorm, (url, conf) in url_by_term_conf.items():
+                    if tnorm in ln and conf >= resolver.min_conf:
+                        best = (tnorm, url, conf); break
+                if best:
+                    tnorm, url, _ = best
                     if _MD_LINK_RE.search(line):
                         return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
+                    # liga o primeiro nome de produto detetado
                     m2 = re.search(r"(mesa|cadeira|banco|cama|luminária|luminaria)[^\-:]*", line, flags=re.I)
                     if m2:
                         nome = m2.group(0).strip()
                         linked = line.replace(nome, f"[{nome}]({url})", 1)
                         return re.sub(r"\bsem\s+url\b", "", linked, flags=re.I)
                     return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
-        return line
-    out_lines = [_replace_line_sem_url(l) for l in out.splitlines()]
-    out = "\n".join(out_lines)
+            return line
+        out = "\n".join(_replace_line_sem_url(l) for l in out.splitlines())
 
-    # se ainda não há link IG, injeta 1
-    has_ig_link = (IG_HOST in out)
-    if not has_ig_link:
-        for tnorm, url in url_by_term.items():
-            if IG_HOST not in (urlparse(url).netloc or "").lower():
-                continue
-            parts = out.splitlines()
-            injected = False
-            for i, l in enumerate(parts):
-                if tnorm in _norm(l) and not _MD_LINK_RE.search(l):
-                    words = l.split()
-                    for w in words:
-                        if len(w) >= 4 and _norm(w) in tnorm:
-                            parts[i] = l.replace(w, f"[{w}]({url})", 1)
-                            injected = True
-                            break
-                if injected:
-                    break
-            out = "\n".join(parts)
-            if injected:
-                break
+    # 4) corrige URLs IG errados (apenas se confiança >= min_conf)
+    out = resolver.smart_fix_text(out, url_by_term_conf)
 
-    # reforço em pedidos de orçamento
-    if "orçament" in user_query.lower():
+    # 5) se ainda não houver nenhum link IG, tenta injetar 1 com maior confiança
+    if IG_HOST not in out.lower() and url_by_term_conf:
+        best_t = max(url_by_term_conf.items(), key=lambda kv: kv[1][1])  # maior confiança
+        best_url = best_t[1][0]
+        lines = out.splitlines()
+        for i, l in enumerate(lines):
+            if not _MD_LINK_RE.search(l):
+                lines[i] = l + f" — [ver produto]({best_url})"
+                out = "\n".join(lines); break
+
+    # 6) reforço para pedidos de orçamento: linka nomes dos itens
+    if "orçament" in (user_query or "").lower() and url_by_term_conf:
         budget_items = _extract_budget_items(user_query)
-        out_lines = out.splitlines()
-        for i, line in enumerate(out_lines):
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
             for qty, item_name in budget_items:
                 tnorm = _norm(item_name)
-                if tnorm in _norm(line) and not _MD_LINK_RE.search(line):
-                    url = url_by_term.get(tnorm, "")
-                    if url:
-                        m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
-                        if m:
-                            nome_part = m.group(1)
-                            out_lines[i] = line.replace(nome_part, f"[{nome_part}]({url})", 1)
-        out = "\n".join(out_lines)
+                if tnorm in url_by_term_conf and not _MD_LINK_RE.search(line):
+                    url = url_by_term_conf[tnorm][0]
+                    m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
+                    if m:
+                        nome_part = m.group(1)
+                        lines[i] = line.replace(nome_part, f"[{nome_part}]({url})", 1)
+        out = "\n".join(lines)
 
     return out
 
