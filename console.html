@@ -71,18 +71,10 @@
   .list{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
   .ok{color:var(--ok)} .err{color:var(--err)}
 
-  .result pre::-webkit-scrollbar,
-  .tile .res::-webkit-scrollbar,
-  .tile textarea::-webkit-scrollbar,
-  .list::-webkit-scrollbar{width:10px;height:10px}
-  .result pre::-webkit-scrollbar-thumb,
-  .tile .res::-webkit-scrollbar-thumb,
-  .tile textarea::-webkit-scrollbar-thumb,
-  .list::-webkit-scrollbar-thumb{background:#2a2a31;border-radius:10px}
-  .result pre::-webkit-scrollbar-track,
-  .tile .res::-webkit-scrollbar-track,
-  .tile textarea::-webkit-scrollbar-track,
-  .list::-webkit-scrollbar-track{background:transparent}
+  table.catalog{width:100%;border-collapse:collapse;font-size:13px}
+  table.catalog th, table.catalog td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
+  table.catalog th{position:sticky;top:0;background:#111217;z-index:1}
+  table.catalog td a{color:#fff;text-decoration:underline}
 </style>
 </head>
 <body>
@@ -101,7 +93,7 @@
       <pre id="resultBox">{}</pre>
     </section>
 
-    <!-- PARÂMETROS EM BARRA HORIZONTAL -->
+    <!-- PARÂMETROS -->
     <section class="param-bar">
       <div class="field" style="min-width:240px">
         <label>Namespace (default)</label>
@@ -183,24 +175,6 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
-      <!-- Catálogo -->
-      <div class="tile">
-        <h3>Catálogo</h3>
-        <div class="inline">
-          <input id="catalog_sitemap" type="text" placeholder="https://…/sitemap_products.xml">
-          <button id="btnCatalogBuild" class="btn">Construir Catálogo</button>
-        </div>
-        <div class="row" style="gap:8px">
-          <input id="catalog_q" type="text" placeholder="termo (ex.: cadeira)">
-          <button id="btnCatalogList" class="btn">Pesquisar</button>
-          <a href="/catalog/export.csv" target="_blank" class="btn">Exportar CSV</a>
-          <a href="/catalog/export.jsonl" target="_blank" class="btn">Exportar JSONL</a>
-        </div>
-        <div class="res" id="resCatalog">{}</div>
-        <textarea id="catalogOutput" placeholder="Itens do catálogo aparecerão aqui…" style="min-height:160px"></textarea>
-        <div class="tiny">Dica: a pesquisa do catálogo usa o índice em memória; limite por pedido: 200 (ajusta no backend se precisares).</div>
-      </div>
-
       <!-- Extrair URLs do Sitemap (com fallback) -->
       <div class="tile">
         <h3>Extrair URLs do Sitemap</h3>
@@ -219,7 +193,7 @@
       <!-- Ingerir em lote (lista de URLs) -->
       <div class="tile">
         <h3>Ingerir em lote (lista de URLs)</h3>
-        <textarea id="batchUrls" placeholder="Cola aqui uma URL por linha…"></textarea>
+        <textarea id="batchUrls" placeholder="Uma URL por linha (também aceita separado por vírgulas ou espaços)…"></textarea>
         <div class="inline">
           <input id="batchNamespace" type="text" placeholder="namespace (opcional, senão usa o da barra)">
           <input id="batchDeadline" type="number" value="900" min="10" placeholder="deadline_s">
@@ -231,6 +205,46 @@
         <div class="row" style="justify-content:flex-end">
           <button id="btnBatchStart" class="btn">Iniciar ingestão</button>
           <button id="btnBatchStop" class="btn" disabled>Parar</button>
+        </div>
+      </div>
+
+      <!-- 🔶 Catálogo -->
+      <div class="tile">
+        <h3>Catálogo</h3>
+        <div class="inline">
+          <input id="catLimit" type="number" value="200" min="10" step="10" placeholder="limite para gerar do RAG">
+          <button id="btnCatalogFromRag" class="btn">Construir do RAG</button>
+          <button id="btnCatalogOpen" class="btn">Abrir Catálogo</button>
+        </div>
+        <div class="tiny">“Construir do RAG” não reingere — lê o índice existente e preenche/atualiza a tabela.</div>
+
+        <h4 style="margin:10px 0 4px 0;font-size:13px;color:var(--muted)">Adicionar URLs ao Catálogo (log linha a linha)</h4>
+        <textarea id="catUrls" placeholder="Uma URL por linha (ou separadas por vírgulas/espaços)…" style="min-height:120px"></textarea>
+        <div class="inline">
+          <input id="catNs" type="text" placeholder="namespace (opcional)">
+          <button id="btnCatalogAddUrls" class="btn">Adicionar ao Catálogo</button>
+        </div>
+        <div class="progress"><div id="catBar"></div></div>
+        <div class="tiny" id="catStats">0/0 • OK: 0 • Falhas: 0</div>
+        <div class="list" id="catList"></div>
+
+        <div id="catalogTableWrap" style="margin-top:12px;max-height:280px;overflow:auto;border:1px solid var(--chip-br);border-radius:10px;display:none">
+          <table class="catalog" id="catalogTable">
+            <thead><tr>
+              <th style="width:20%">Nome</th>
+              <th style="width:45%">Resumo</th>
+              <th style="width:25%">URL</th>
+              <th style="width:10%">Fonte</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="row" id="catPager" style="display:none;align-items:center">
+          <div class="tiny" id="catInfo">—</div>
+          <div class="right">
+            <button id="catPrev" class="btn">◀</button>
+            <button id="catNext" class="btn">▶</button>
+          </div>
         </div>
       </div>
 
@@ -289,7 +303,7 @@
     return j;
   }
 
-  // ------- Ingestão via Sitemap -------
+  // ------- Tiles existentes -------
   $('#btnIngestSitemap').addEventListener('click', async ()=>{
     const sitemap_url = $('#sitemap_url').value.trim(); if (!sitemap_url) return;
     const p = readCommon();
@@ -300,7 +314,6 @@
     stopTimer(); $('#btnIngestSitemap').disabled = false; printResult(res); smallRes($('#resSitemap'),res);
   });
 
-  // ------- Crawler -------
   $('#btnCrawl').addEventListener('click', async ()=>{
     const seed_url = $('#seed_url').value.trim(); if (!seed_url) return;
     const p = readCommon();
@@ -311,7 +324,6 @@
     stopTimer(); $('#btnCrawl').disabled = false; printResult(res); smallRes($('#resCrawl'),res);
   });
 
-  // ------- Ingestão de URL -------
   $('#btnIngestURL').addEventListener('click', async ()=>{
     let page_url = $('#single_url').value.trim(); if (!page_url) return;
     page_url = normalizeGoogleDriveLink(page_url); $('#single_url').value = page_url;
@@ -323,7 +335,6 @@
     stopTimer(); $('#btnIngestURL').disabled = false; printResult(res); smallRes($('#resURL'),res);
   });
 
-  // ------- Ingestão de Texto -------
   $('#btnIngestText').addEventListener('click', async ()=>{
     const title = $('#text_title').value.trim(); const text = $('#text_body').value.trim();
     if (!title || !text) return; const p = readCommon();
@@ -333,7 +344,6 @@
     stopTimer(); $('#btnIngestText').disabled = false; printResult(res); smallRes($('#resText'),res);
   });
 
-  // ------- Ingestão de PDF -------
   $('#btnIngestPDF').addEventListener('click', async ()=>{
     let pdf_url = $('#pdf_url').value.trim(); const title = $('#pdf_title').value.trim() || null;
     if (!pdf_url) return; pdf_url = normalizeGoogleDriveLink(pdf_url); $('#pdf_url').value = pdf_url;
@@ -344,7 +354,6 @@
     stopTimer(); $('#btnIngestPDF').disabled = false; printResult(res); smallRes($('#resPDF'),res);
   });
 
-  // ------- Pesquisa RAG -------
   $('#btnSearch').addEventListener('click', async ()=>{
     const query = $('#search_q').value.trim(); const top_k = parseInt($('#search_topk').value || '6',10);
     const p = readCommon(); if (!query) return;
@@ -354,40 +363,6 @@
     stopTimer(); $('#btnSearch').disabled = false; printResult(res); smallRes($('#resSearch'),res);
   });
 
-  // ------- Catálogo (build/list/export) -------
-  $('#btnCatalogBuild').addEventListener('click', async ()=>{
-    const sitemap_url = $('#catalog_sitemap').value.trim();
-    if (!sitemap_url) return;
-    setTask(`ação: catalog-build   sitemap: ${sitemap_url}`);
-    setBadges([`Sitemap: ${sitemap_url}`]);
-    startTimer(); $('#btnCatalogBuild').disabled = true;
-    const res = await postJSON('/catalog/build', { sitemap_url, lang:'pt', max_urls: 200000 });
-    stopTimer(); $('#btnCatalogBuild').disabled = false;
-    printResult(res); smallRes($('#resCatalog'), res);
-  });
-
-  $('#btnCatalogList').addEventListener('click', async ()=>{
-    const q = $('#catalog_q').value.trim();
-    setTask(`ação: catalog-list   q: ${q||'(todos)'}`);
-    setBadges([`q: ${q||'—'}`]);
-    startTimer(); $('#btnCatalogList').disabled = true;
-    const url = `/catalog/list?q=${encodeURIComponent(q)}&limit=200&offset=0`;
-    try{
-      const r = await fetch(url); const j = await r.json();
-      stopTimer(); $('#btnCatalogList').disabled = false;
-      printResult(j);
-      smallRes($('#resCatalog'), {total:j.total, returned:j.returned});
-      $('#catalogOutput').value = (j.items||[]).map(it=>{
-        const p = [it.title||'-', it.price_str?`€${it.price_str}`:'', it.url||''].filter(Boolean).join(' — ');
-        return p;
-      }).join('\n');
-    }catch(e){
-      stopTimer(); $('#btnCatalogList').disabled = false;
-      printResult({ok:false,error:String(e)});
-    }
-  });
-
-  // ------- Limpar resultado topo -------
   $('#clearLogsBtn').addEventListener('click', ()=>{ printResult('{}'); setBadges([]); setTask('—'); });
 
   // ------- Extrair URLs (servidor com fallback cliente) -------
@@ -401,7 +376,7 @@
     $('#btnExtractSitemap').disabled = true; $('#btnCopyExtract').disabled = true;
     outTA.value = ''; resBox.textContent = 'A extrair…';
 
-    // 1) servidor
+    // 1) tenta no servidor
     let usedServer = false;
     try{
       const srv = await postJSON('/rag/extract-urls', { url: sitemap_url, max_urls: 20000 });
@@ -414,9 +389,11 @@
         try{ await navigator.clipboard.writeText(outTA.value); }catch{}
         printResult({ ok:true, via:'server', count:srv.urls.length });
       }
-    }catch(e){}
+    }catch(e){
+      // ignora e tenta cliente
+    }
 
-    // 2) cliente
+    // 2) fallback cliente (CORS pode falhar)
     if (!usedServer){
       try{
         async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
@@ -451,7 +428,7 @@
   const state = { stop:false };
   $('#btnBatchStart').addEventListener('click', async ()=>{
     const raw = $('#batchUrls').value.trim();
-    const urls = raw.split('\n').map(s=>s.trim()).filter(Boolean);
+    const urls = raw.split(/[\s,]+/).map(s=>s.trim()).filter(Boolean);
     if (!urls.length) return;
 
     const commonNs = $('#ns').value.trim() || undefined;
@@ -459,6 +436,7 @@
     const deadline_s = parseInt($('#batchDeadline').value || '0',10) || undefined;
     const concurrency = Math.max(1, Math.min(10, parseInt($('#batchConcurrency').value || '3',10)));
 
+    // UI init
     state.stop = false;
     $('#btnBatchStart').disabled = true;
     $('#btnBatchStop').disabled = false;
@@ -499,6 +477,7 @@
       done++; update();
     }
 
+    // scheduler com concorrência limitada
     let idx = 0, active = 0;
     await new Promise(resolve=>{
       const tick = ()=>{
@@ -521,6 +500,107 @@
   $('#btnBatchStop').addEventListener('click', ()=>{
     state.stop = true;
     $('#btnBatchStop').disabled = true;
+  });
+
+  // ------- 🔶 Catálogo: construir do RAG, adicionar URLs com log, abrir tabela -------
+  async function buildCatalogFromRag(){
+    const ns = $('#ns').value.trim() || undefined;
+    const limit = Math.max(10, parseInt($('#catLimit').value || '200', 10));
+    setTask(`ação: catalog-from-rag`); setBadges([`namespace: ${ns||'default'}`, `limit: ${limit}`]);
+    startTimer(); $('#btnCatalogFromRag').disabled = true;
+    const res = await postJSON('/catalog/build-from-rag', { namespace: ns, limit });
+    stopTimer(); $('#btnCatalogFromRag').disabled = false;
+    printResult(res);
+  }
+  $('#btnCatalogFromRag').addEventListener('click', buildCatalogFromRag);
+
+  // adicionar URLs ao catálogo (log linha a linha)
+  $('#btnCatalogAddUrls').addEventListener('click', async ()=>{
+    const raw = $('#catUrls').value.trim();
+    const urls = raw.split(/[\s,]+/).map(s=>s.trim()).filter(Boolean);
+    if (!urls.length) return;
+
+    const nsField = $('#catNs').value.trim();
+    const ns = nsField || ($('#ns').value.trim() || undefined);
+    const list = $('#catList'); list.innerHTML = '';
+    const bar = $('#catBar'); bar.style.width = '0%';
+    const statsEl = $('#catStats'); let done=0, ok=0, fail=0;
+
+    setTask(`ação: catalog-add-urls   urls: ${urls.length}`);
+    setBadges([`namespace: ${ns||'default'}`]);
+    startTimer();
+
+    function update(){
+      const pct = Math.round((done/urls.length)*100);
+      bar.style.width = pct + '%';
+      statsEl.textContent = `${done}/${urls.length} • OK: ${ok} • Falhas: ${fail}`;
+    }
+    function addLine(text, cls){
+      const div = document.createElement('div');
+      if (cls) div.className = cls;
+      div.textContent = text;
+      list.appendChild(div);
+      list.scrollTop = list.scrollHeight;
+    }
+    async function addOne(u){
+      addLine(`→ catalog/build ${u}`);
+      const res = await postJSON('/catalog/build', { urls:[u], namespace: ns });
+      if (res && res.ok !== false) { ok++; addLine(`✔ OK ${u}`, 'ok'); }
+      else { fail++; addLine(`✖ Falha ${u} :: ${JSON.stringify(res).slice(0,200)}`, 'err'); }
+      done++; update();
+    }
+
+    for (const u of urls) { /* sequencial p/ ver o log ordenado; muda para paralelo se quiseres */
+      // eslint-disable-next-line no-await-in-loop
+      await addOne(u);
+    }
+
+    stopTimer();
+    printResult({ ok:true, total: urls.length, ok, fail });
+  });
+
+  // abrir tabela do catálogo
+  let catOffset = 0, catLimit = 50, lastCount = 0, lastQuery = '';
+  async function loadCatalogPage(){
+    const q = ''; // podes ligar a um input de pesquisa no futuro
+    const limit = catLimit;
+    const offset = catOffset;
+    const url = `/catalog/list?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`;
+    const r = await fetch(url);
+    const j = await r.json().catch(()=>({ ok:false }));
+    const wrap = $('#catalogTableWrap'); const tb = $('#catalogTable tbody'); const info = $('#catInfo'); const pager = $('#catPager');
+    if (!j || j.ok === false || !Array.isArray(j.items)){
+      wrap.style.display = 'none'; pager.style.display = 'none';
+      printResult(j || { ok:false, error:'catalog/list falhou' }); return;
+    }
+    tb.innerHTML = '';
+    (j.items || []).forEach(row=>{
+      const tr = document.createElement('tr');
+      const name = row.name || row.title || '-';
+      const url = row.url || row.link || '';
+      const src = row.source || row.host || '';
+      const summary = row.summary || row.snippet || '';
+      tr.innerHTML = `
+        <td>${name}</td>
+        <td>${summary}</td>
+        <td>${ url ? `<a href="${url}" target="_blank" rel="noopener">${url}</a>` : '—' }</td>
+        <td>${src||'—'}</td>
+      `;
+      tb.appendChild(tr);
+    });
+    wrap.style.display = 'block';
+    pager.style.display = 'flex';
+    lastCount = (j.total||((j.items||[]).length+offset));
+    info.textContent = `offset ${offset} • mostrando ${ (j.items||[]).length } de ${ lastCount }`;
+  }
+  $('#btnCatalogOpen').addEventListener('click', async ()=>{
+    catLimit = 50; catOffset = 0; await loadCatalogPage();
+  });
+  $('#catPrev').addEventListener('click', async ()=>{
+    catOffset = Math.max(0, catOffset - catLimit); await loadCatalogPage();
+  });
+  $('#catNext').addEventListener('click', async ()=>{
+    catOffset = catOffset + catLimit; await loadCatalogPage();
   });
 
 })();
