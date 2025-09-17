@@ -1495,6 +1495,297 @@ async def ask(request: Request):
             "namespace": namespace or DEFAULT_NAMESPACE
         }
     }
+# ---------------------------------------------------------------------------------------
+# Catálogo — build/list/add/clear/export (sem limite “curto”)
+# ---------------------------------------------------------------------------------------
+from dataclasses import dataclass, asdict
+
+CATALOG_DEFAULT_LIMIT = int(os.getenv("CATALOG_DEFAULT_LIMIT", "100000"))
+CATALOG_MAX_URLS_BUILD = int(os.getenv("CATALOG_MAX_URLS_BUILD", "200000"))
+
+@dataclass
+class CatalogItem:
+    url: str
+    title: str
+    handle: str
+    price: Optional[float] = None
+    currency: str = "EUR"
+    brand: str = ""
+    sku: str = ""
+    availability: str = ""  # ex: in_stock / out_of_stock / pre_order
+    image: str = ""
+    lang: str = "pt"
+
+_catalog_store: List[CatalogItem] = []
+
+def _cat_norm_handle(url_or_title: str) -> str:
+    if not url_or_title:
+        return ""
+    # preferir slug do URL como handle
+    try:
+        u = _canon_ig_url(url_or_title) or url_or_title
+        path = (urlparse(u).path or "").strip("/")
+        if path:
+            return path
+    except Exception:
+        pass
+    # senão, normaliza o título
+    return re.sub(r"[^a-z0-9]+", "-", _norm(url_or_title)).strip("-")
+
+def _extract_price_from_text(html_or_text: str) -> Optional[float]:
+    if not html_or_text:
+        return None
+    m = _PRICE_RE.search(html_or_text)
+    return _parse_money_eu(m.group(1)) if m else None
+
+def _fetch(url: str, timeout=25) -> str:
+    r = requests.get(url, headers={"User-Agent": "AlmaBot/1.0 (+catalog)"}, timeout=timeout)
+    r.raise_for_status()
+    return r.text or ""
+
+def _guess_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I|re.S)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    m = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', html, flags=re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+def _guess_image(html: str) -> str:
+    m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\'](.*?)["\']', html, flags=re.I)
+    return (m.group(1).strip() if m else "")
+
+def _dedup_append(item: CatalogItem):
+    # chave por URL canonizada
+    url_key = _canon_ig_url(item.url) or item.url
+    handle_key = item.handle
+    for i, it in enumerate(_catalog_store):
+        if (_canon_ig_url(it.url) or it.url) == url_key or it.handle == handle_key:
+            _catalog_store[i] = item  # update/merge simples
+            return
+    _catalog_store.append(item)
+
+def _build_from_urls(urls: List[str], lang="pt"):
+    ok, fail = 0, 0
+    for u in urls:
+        try:
+            u_fixed = _canon_ig_url(u) or u
+            html = _fetch(u_fixed, timeout=20)
+            title = _guess_title(html) or u_fixed
+            price = _extract_price_from_text(html)
+            image = _guess_image(html)
+            handle = _cat_norm_handle(u_fixed)
+            # heurísticas simples de brand/availability/sku
+            brand = "Interior Guider" if IG_HOST in (urlparse(u_fixed).netloc or "") else ""
+            availability = "in_stock" if re.search(r"\b(em\s+stock|in\s+stock|dispon[ií]vel)\b", html, flags=re.I) else ""
+            sku_match = re.search(r'\bSKU[:\s#]*([A-Z0-9\.\-_/]{3,32})\b', html, flags=re.I)
+            sku = sku_match.group(1) if sku_match else ""
+            item = CatalogItem(
+                url=u_fixed, title=title, handle=handle, price=price,
+                brand=brand, availability=availability, sku=sku, image=image, lang=lang
+            )
+            _dedup_append(item)
+            ok += 1
+        except Exception:
+            fail += 1
+    return {"ok": ok, "fail": fail, "total": ok + fail}
+
+@app.post("/catalog/build")
+async def catalog_build(request: Request):
+    """
+    Constrói/atualiza o catálogo a partir de:
+    - sitemap_url (prioritário), ou
+    - urls: lista explícita
+    Params:
+      {"sitemap_url": "...", "urls": ["..."], "max_urls": 200000, "lang": "pt"}
+    """
+    data = await request.json()
+    sitemap_url = (data.get("sitemap_url") or "").strip()
+    urls_in = data.get("urls") or []
+    lang = (data.get("lang") or "pt").strip().lower()
+    max_urls = int(data.get("max_urls") or CATALOG_MAX_URLS_BUILD)
+
+    urls: List[str] = []
+    if sitemap_url:
+        try:
+            txt = _fetch(sitemap_url, timeout=40)
+            # Primeiro: XML parsing
+            try:
+                root = ET.fromstring(txt)
+                locs = [(el.text or "").strip() for el in root.findall(".//{*}loc")]
+                urls = [u for u in locs if u][:max_urls]
+            except Exception:
+                # Fallback: regex
+                locs = re.findall(r"<loc>(.*?)</loc>", txt, flags=re.I|re.S)
+                urls = [u.strip() for u in locs if u.strip()][:max_urls]
+        except Exception as e:
+            return {"ok": False, "error": "sitemap_fetch_failed", "detail": str(e)}
+
+    if urls_in:
+        urls.extend([str(u).strip() for u in urls_in if u])
+
+    # Normalizar/filtrar: manter só http/https e preferir interiorguider.com se existir
+    clean = []
+    seen = set()
+    for u in urls:
+        if not u or not u.startswith(("http://", "https://")):
+            continue
+        cu = _canon_ig_url(u) or u
+        if cu in seen:
+            continue
+        seen.add(cu)
+        clean.append(cu)
+
+    if not clean:
+        return {"ok": True, "summary": "0 URLs válidos", "count": 0}
+
+    stats = _build_from_urls(clean, lang=lang)
+    return {"ok": True, "summary": f"build: {stats['ok']} ok / {stats['fail']} falhas", "count": len(_catalog_store)}
+
+@app.get("/catalog/list")
+def catalog_list(q: str = "", limit: Optional[int] = None, offset: int = 0, only_ig: bool = False):
+    """
+    Lista o catálogo com pesquisa simples:
+      - q: procura em title/handle/url/sku/brand
+      - limit: por defeito muito alto (CATALOG_DEFAULT_LIMIT); usa paginação via offset
+      - only_ig: se True, restringe a interiorguider.com
+    """
+    lim = CATALOG_DEFAULT_LIMIT if (limit is None) else max(1, int(limit))
+    off = max(0, int(offset))
+    qn = _norm(q)
+    out = []
+    for it in _catalog_store:
+        if only_ig and IG_HOST not in (urlparse(it.url).netloc or "").lower():
+            continue
+        hay = " ".join([
+            _norm(it.title), _norm(it.handle), _norm(it.url),
+            _norm(it.brand), _norm(it.sku)
+        ])
+        if qn and qn not in hay:
+            continue
+        out.append(asdict(it))
+    total = len(out)
+    # paginação “barata” para respostas gigantes
+    out = out[off:off+lim]
+    return {
+        "ok": True,
+        "total": total,
+        "returned": len(out),
+        "offset": off,
+        "limit": lim,
+        "items": out
+    }
+
+@app.post("/catalog/add")
+async def catalog_add(request: Request):
+    data = await request.json()
+    url = (data.get("url") or "").strip()
+    title = (data.get("title") or "").strip()
+    if not url:
+        return {"ok": False, "error": "Falta url"}
+    if not title:
+        try:
+            html = _fetch(url, timeout=20)
+            title = _guess_title(html) or url
+            price = _extract_price_from_text(html)
+            image = _guess_image(html)
+        except Exception:
+            price = None
+            image = ""
+    else:
+        price = _parse_money_eu(str(data.get("price"))) if data.get("price") is not None else None
+        image = (data.get("image") or "").strip()
+    item = CatalogItem(
+        url=_canon_ig_url(url) or url,
+        title=title,
+        handle=_cat_norm_handle(url or title),
+        price=price,
+        brand=(data.get("brand") or "").strip(),
+        sku=(data.get("sku") or "").strip(),
+        availability=(data.get("availability") or "").strip() or "",
+        image=image,
+        lang=(data.get("lang") or "pt").strip().lower()
+    )
+    _dedup_append(item)
+    return {"ok": True, "count": len(_catalog_store)}
+
+@app.post("/catalog/clear")
+async def catalog_clear():
+    _catalog_store.clear()
+    return {"ok": True, "count": 0}
+
+@app.get("/catalog/stats")
+def catalog_stats():
+    brands = {}
+    ig_count = 0
+    for it in _catalog_store:
+        if it.brand:
+            brands[it.brand] = brands.get(it.brand, 0) + 1
+        if IG_HOST in (urlparse(it.url).netloc or "").lower():
+            ig_count += 1
+    return {
+        "ok": True,
+        "total": len(_catalog_store),
+        "ig_host": IG_HOST,
+        "ig_items": ig_count,
+        "brands": brands
+    }
+
+# --------- Exportações grandes (para validação/offline) ----------
+@app.get("/catalog/export.csv", response_class=FileResponse)
+def catalog_export_csv():
+    # gera CSV em /tmp para descarregar
+    sio = StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(["title", "url", "handle", "price", "currency", "brand", "sku", "availability", "image", "lang"])
+    for it in _catalog_store:
+        writer.writerow([
+            it.title, it.url, it.handle,
+            ("" if it.price is None else f"{it.price:.2f}"),
+            it.currency, it.brand, it.sku, it.availability, it.image, it.lang
+        ])
+    data = sio.getvalue().encode("utf-8-sig")
+    fname = f"catalogo_{int(time.time())}.csv"
+    fpath = os.path.join("/tmp", fname)
+    with open(fpath, "wb") as f:
+        f.write(data)
+    return FileResponse(fpath, media_type="text/csv", filename=fname)
+
+@app.get("/catalog/export.jsonl", response_class=FileResponse)
+def catalog_export_jsonl():
+    import json
+    fname = f"catalogo_{int(time.time())}.jsonl"
+    fpath = os.path.join("/tmp", fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        for it in _catalog_store:
+            f.write(json.dumps(asdict(it), ensure_ascii=False) + "\n")
+    return FileResponse(fpath, media_type="application/json", filename=fname)
+
+# ---- exposição no /status ----
+def _status_catalog():
+    return {
+        "count": len(_catalog_store),
+        "default_limit": CATALOG_DEFAULT_LIMIT,
+        "build_max_urls": CATALOG_MAX_URLS_BUILD,
+        "endpoints": {
+            "build": "POST /catalog/build {sitemap_url?, urls?, max_urls?, lang?}",
+            "list": "GET /catalog/list?q=&limit=&offset=&only_ig=",
+            "add": "POST /catalog/add",
+            "clear": "POST /catalog/clear",
+            "stats": "GET /catalog/stats",
+            "export_csv": "GET /catalog/export.csv",
+            "export_jsonl": "GET /catalog/export.jsonl"
+        }
+    }
+
+# patch no /status existente: acrescentar info de catalogo
+_old_status = status_json
+def status_json():
+    base = _old_status()
+    base["catalog"] = _status_catalog()
+    return base
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
