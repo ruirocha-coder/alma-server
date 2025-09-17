@@ -287,40 +287,242 @@ def _expand_variants(term: str) -> List[str]:
             out.append(v)
     return out
 
+# --- Two-stage retrieval helpers (full-text + re-rank) -----------------------
+# Nota: se rag_client expuser search_fulltext(...), usamos. Caso contrário,
+# fazemos fallback para search_chunks(...) com variantes de query (embeddings).
+
+NUMERAL_MAP = {
+    # pt
+    "um": "1", "uma": "1", "dois": "2", "duas": "2", "tres": "3", "três": "3",
+    # en
+    "one": "1", "two": "2", "three": "3",
+    # es
+    "uno": "1", "dos": "2", "tres": "3",
+}
+
+LANG_HINTS = {
+    "pt": {"cadeira", "banco", "mesa", "cama", "luminaria", "luminária"},
+    "en": {"chair", "stool", "table", "bed", "lamp"},
+    "es": {"silla", "taburete", "mesa", "cama", "lampara", "lámpara"},
+}
+
+def _detect_lang_hint(qnorm: str) -> str:
+    toks = set(qnorm.split())
+    for lang, vocab in LANG_HINTS.items():
+        if toks & vocab:
+            return lang
+    # fallback: se contiver acentos pt/es assume pt
+    if any(ch in qnorm for ch in "áàâãéêíóôõúç"):
+        return "pt"
+    return ""
+
+def _slugify_tokens(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", _norm(s)).strip("-")
+
+def _tokenize(s: str) -> List[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", _norm(s)) if t]
+
+def _ngram_variants(tokens: List[str], min_n=1, max_n=4) -> List[str]:
+    out = []
+    n = len(tokens)
+    for size in range(min_n, min(max_n, n) + 1):
+        for i in range(0, n - size + 1):
+            out.append(" ".join(tokens[i:i+size]))
+    return out
+
+def _word_number_swaps(tokens: List[str]) -> List[str]:
+    out = set()
+    for i, t in enumerate(tokens):
+        repl = NUMERAL_MAP.get(t, "")
+        if repl:
+            alt = tokens[:]
+            alt[i] = repl
+            out.add(" ".join(alt))
+        if t.isdigit():
+            # trocar 3->three/ tres
+            for w, d in NUMERAL_MAP.items():
+                if d == t:
+                    alt = tokens[:]
+                    alt[i] = w
+                    out.add(" ".join(alt))
+    return list(out)
+
+def _make_query_variants(term: str) -> List[str]:
+    """
+    Gera variantes robustas: base, hífen<->espaço, numerais, n-gramas encurtados.
+    Mantém no máx. ~12 queries para custo controlado.
+    """
+    base = term.strip()
+    if not base:
+        return []
+    toks = _tokenize(base)
+    variants = set()
+    # base
+    variants.add(" ".join(toks))
+    # hífenizações
+    variants.add(_slugify_tokens(base).replace("-", " "))
+    variants.add(_slugify_tokens(base))
+    # numerais ↔ palavras
+    variants.update(_word_number_swaps(toks))
+    # n-gramas (encurtar cauda)
+    ngs = _ngram_variants(toks, min_n=2, max_n=min(4, len(toks)))
+    variants.update(ngs[-6:])  # últimas combinações mais específicas
+    # dedup e limites
+    out = []
+    seen = set()
+    for v in variants:
+        vn = _norm(v)
+        if vn and vn not in seen:
+            seen.add(vn)
+            out.append(v)
+        if len(out) >= 12:
+            break
+    return out
+
+def _overlap(a_tokens: List[str], b_tokens: List[str]) -> float:
+    if not a_tokens or not b_tokens:
+        return 0.0
+    A, B = set(a_tokens), set(b_tokens)
+    inter = len(A & B)
+    denom = max(1, min(len(A), len(B)))
+    return inter / denom
+
+def _scorer(query: str, payload: dict, url: str, lang_hint: str) -> float:
+    qtok = _tokenize(query)
+    title = (payload.get("title") or "").strip()
+    slug  = (payload.get("slug") or "") or (urlparse(url).path if url else "")
+    search_text = (payload.get("search_text") or "")
+    # tokens
+    ttok = _tokenize(title)
+    slugtok = _tokenize(slug.replace("/", " "))
+    utok = _tokenize(url or "")
+    sttok = _tokenize(search_text)
+    # overlaps
+    s_slug  = _overlap(qtok, slugtok)
+    s_title = _overlap(qtok, ttok)
+    s_url   = _overlap(qtok, utok)
+    s_stext = _overlap(qtok, sttok)
+    score = (2.0*s_slug) + (1.25*s_title) + (0.5*s_url) + (0.75*s_stext)
+    # domínio IG
+    host = (urlparse(url).netloc or "").lower()
+    if IG_HOST in host:
+        score += 0.40
+    # pista de idioma (ligeiro)
+    text_all = " ".join([title, slug, search_text, url or ""])
+    if lang_hint:
+        if lang_hint == "pt" and re.search(r"[ãõáàâéêíóôõúç]|/pt/|/pt-", text_all, flags=re.I):
+            score += 0.10
+        elif lang_hint == "en" and re.search(r"/en/|/en-", text_all, flags=re.I):
+            score += 0.10
+        elif lang_hint == "es" and re.search(r"/es/|/es-", text_all, flags=re.I):
+            score += 0.10
+    return score
+
+def _stage_a_candidates(term: str, namespace: Optional[str], limit_per_q: int = 50, hard_cap: int = 150):
+    """
+    Tenta usar full-text (se existir em rag_client: search_fulltext).
+    Caso contrário, fallback para search_chunks com queries variantes.
+    Retorna lista de dicts com {payload, metadata(url,title,...)}.
+    """
+    variants = _make_query_variants(term)
+    seen_ids = set()
+    cands = []
+
+    # tenta full-text nativo, se existir no rag_client
+    search_fulltext = None
+    try:
+        from rag_client import search_fulltext as _sf  # opcional
+        search_fulltext = _sf
+    except Exception:
+        search_fulltext = None
+
+    for v in variants[:6]:  # não exagerar
+        try:
+            if search_fulltext:
+                hits = search_fulltext(query=v, namespace=namespace or DEFAULT_NAMESPACE, limit=limit_per_q) or []
+            else:
+                hits = search_chunks(query=v, namespace=namespace or DEFAULT_NAMESPACE, top_k=min( max(10, limit_per_q//2), 50)) or []
+        except Exception:
+            hits = []
+
+        for h in hits:
+            # Qdrant: pode vir {"id","payload","score"} ou formato do teu search_chunks
+            pid = str(h.get("id") or id(h))
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            meta = h.get("metadata") or h.get("payload") or {}
+            # normalizar “payload/metadata”
+            payload = dict(meta)
+            # espelhar title/url no payload se vierem noutro nível
+            if not payload.get("title"): payload["title"] = h.get("title") or ""
+            if not payload.get("url"):   payload["url"]   = h.get("url") or meta.get("url") or ""
+            # tentar derivar slug
+            if not payload.get("slug") and payload.get("url"):
+                payload["slug"] = (urlparse(payload["url"]).path or "").strip("/")
+            cands.append({"payload": payload, "score": h.get("score", 0.0)})
+            if len(cands) >= hard_cap:
+                break
+        if len(cands) >= hard_cap:
+            break
+    return cands
+
+def _rerank_and_choose(term: str, candidates: List[dict], lang_hint: str, prefer_ig: bool = True, threshold: float = 0.55):
+    """
+    Reordena candidatos por _scorer. Devolve (best_url, ranked[:3]) para debug/fallback.
+    """
+    ranked = []
+    for c in candidates:
+        p = c.get("payload", {}) or {}
+        url = _canon_ig_url(p.get("url") or "")
+        if not url:
+            continue
+        s = _scorer(term, p, url, lang_hint=lang_hint)
+        ranked.append((s, url, p))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    # aplica threshold e preferência por IG
+    top = [r for r in ranked if r[0] >= threshold] or ranked[:1]
+    if not top:
+        return "", []
+    if prefer_ig:
+        ig = [r for r in top if IG_HOST in (urlparse(r[1]).netloc or "").lower()]
+        if ig:
+            return ig[0][1], top[:3]
+    return top[0][1], top[:3]
+
+
 def rag_mini_search_urls(terms: List[str], namespace: Optional[str], top_k: int) -> Dict[str, str]:
+    """
+    Two-stage: Stage A (full-text se existir / fallback embeddings com variantes) -> Stage B (re-rank textual).
+    Retorna o melhor URL por termo, com preferência por interiorguider.com.
+    """
     if not (RAG_READY and terms):
         return {}
     url_by_term: Dict[str, str] = {}
     for term in terms:
-        best_url = ""
-        tried = set()
-        for q in _expand_variants(term):
-            if q in tried:
-                continue
-            tried.add(q)
+        tnorm = _norm(term)
+        if not tnorm:
+            continue
+        lang_hint = _detect_lang_hint(tnorm)
+        # Stage A: recolha de candidatos
+        candidates = _stage_a_candidates(term, namespace=namespace, limit_per_q=50, hard_cap=150)
+        if not candidates:
+            # fallback final: uma pesquisa “crua” única
             try:
-                hits = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k) or []
+                hits = search_chunks(query=term, namespace=namespace or DEFAULT_NAMESPACE, top_k=max(10, min(40, top_k or 10))) or []
             except Exception:
                 hits = []
-            candidate = ""
-            for h in hits:
-                meta = h.get("metadata", {}) or {}
-                u = meta.get("url") or ""
-                cu = _canon_ig_url(u) if u else ""
-                if not cu:
-                    continue
-                host = (urlparse(cu).netloc or "").lower()
-                if IG_HOST in host:
-                    candidate = cu
-                    break
-                if not candidate:
-                    candidate = cu
-            if candidate:
-                best_url = candidate
-                break
+            candidates = [{"payload": (h.get("metadata") or {}), "score": h.get("score", 0.0)} for h in hits]
+
+        # Stage B: re-rank e escolha
+        best_url, _ = _rerank_and_choose(term, candidates, lang_hint=lang_hint, prefer_ig=True, threshold=0.55)
+
         if best_url:
-            url_by_term[_norm(term)] = best_url
+            url_by_term[tnorm] = best_url
     return url_by_term
+    
+
 
 # ---------------------------------------------------------------------------------------
 # Memória Local + (opcional) Mem0
