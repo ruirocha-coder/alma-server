@@ -1,476 +1,1014 @@
-<!doctype html>
-<html lang="pt">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Alma Data — Console RAG</title>
-<style>
-  :root{
-    --bg:#0a0a0b; --panel:#0f0f11; --panel-2:#141418;
-    --text:#f3f3f3; --muted:#cfcfd3;
-    --ok:#39d98a; --err:#ff6b6b;
-    --chip:#101217; --chip-br:#26262b;
-    --tile-gap:16px; --accent:#d4a017; --accent-700:#be8f13; --accent-800:#a47c12;
-    --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 10px 28px rgba(0,0,0,.35);
-  }
-  *{box-sizing:border-box} html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--text);
-       font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans"}
-  .container{max-width:1200px;margin:0 auto;padding:20px}
+# main.py — Alma Server (RAG + Memória; top-k dinâmico; mini-pesquisa; injeção de links; console RAG)
+# ---------------------------------------------------------------------------------------
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-  header .brand{font-weight:800;font-size:20px;letter-spacing:.2px}
-  header .status{font-size:12px;color:var(--muted);opacity:.9}
+import os
+import requests
+import logging
+import uvicorn
+import re
+from typing import Dict, List, Tuple, Optional
+from urllib.parse import urlparse, urlunparse
+from xml.etree import ElementTree as ET
 
-  .result{background:linear-gradient(180deg,var(--panel),var(--panel-2));
-    border:1px solid var(--chip-br);border-radius:14px;padding:16px;margin-bottom:16px;position:relative;box-shadow:var(--shadow)}
-  .result h2{margin:0 0 10px 0;font-size:16px;letter-spacing:.2px}
-  .result pre{margin:0;background:var(--panel-2);border:1px solid var(--chip-br);
-    color:var(--text);border-radius:10px;padding:12px;overflow:auto;max-height:38vh;
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+# ---------------------------------------------------------------------------------------
+# FastAPI & CORS
+# ---------------------------------------------------------------------------------------
+app = FastAPI(title="Alma Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0 0}
-  .badge{background:var(--chip);border:1px solid var(--chip-br);border-radius:999px;padding:6px 12px;font-size:12px;color:var(--muted)}
+# --- servir a pasta static (onde fica o alma.png) ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-  .param-bar{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:18px}
-  .field{display:flex;flex-direction:column;gap:6px;min-width:160px}
-  label{font-size:12px;color:var(--muted)}
-  input[type=text], input[type=number], textarea{
-    background:#101014;border:1px solid var(--chip-br);color:var(--text);
-    border-radius:10px;padding:12px;outline:none;width:100%;
-    transition:border-color .12s, box-shadow .12s
-  }
-  input[type=text]:focus, input[type=number]:focus, textarea:focus{
-    border-color:#32323a; box-shadow:0 0 0 3px rgba(212,160,23,.12)
-  }
-  textarea{min-height:110px;resize:vertical}
+# ---------------------------------------------------------------------------------------
+# Logging / Versão
+# ---------------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("alma")
 
-  .btn{background:var(--accent);color:#121212;border:none;border-radius:12px;
-    padding:11px 16px;font-weight:800;cursor:pointer;transition:.12s;
-    box-shadow:0 1px 0 rgba(0,0,0,.35) inset, 0 0 0 1px rgba(0,0,0,.25);letter-spacing:.2px}
-  .btn:hover{background:var(--accent-700)} .btn:active{background:var(--accent-800);transform:translateY(1px)}
-  .btn:disabled{opacity:.45;cursor:not-allowed}
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag+mem-link-injector-topk-mini-console-1")
 
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .right{margin-left:auto}
-  .tiny{font-size:12px;color:var(--muted)}
-  .timer{font-size:12px;color:var(--muted)}
+# ---------------------------------------------------------------------------------------
+# Prompt nuclear da Alma
+# ---------------------------------------------------------------------------------------
+ALMA_MISSION = """
+És a Alma, inteligência da Boa Safra Lda (Boa Safra + Interior Guider).
+A tua missão é apoiar a direção (Rui Rocha) e a equipa para que a empresa
+sobreviva e prospere, com respostas úteis, objetivas e calmas.
 
-  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--tile-gap)}
-  @media (max-width:980px){ .grid{grid-template-columns:1fr} }
-  .tile{background:linear-gradient(180deg,var(--panel),var(--panel-2));
-    border:1px solid var(--chip-br);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px;box-shadow:var(--shadow)}
-  .tile h3{margin:0 0 4px 0;font-size:15px;letter-spacing:.2px}
-  .tile .res{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;
-    padding:12px;min-height:46px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;white-space:pre-wrap;word-break:break-word}
-  .inline{display:flex;gap:10px} .inline > *{flex:1}
+Estilo (estrito)
+- Clareza e concisão: vai direto ao ponto. Máximo 1 frase de abertura.
+- Empatia sob medida: só comenta o estado emocional quando houver sinais de stress.
+- Valores implícitos: mantém o alinhamento sem o declarar.
+- Vocabulário disciplinado; evita entusiasmismos.
+- Seguimento: termina com 1 próxima ação concreta.
 
-  .progress{height:10px;border-radius:999px;background:#1b1b1f;border:1px solid #2a2a31;overflow:hidden}
-  .progress > div{height:100%;width:0;background:var(--accent);transition:width .15s ease}
+Proibido
+- Small talk, emojis ou tom efusivo.
+- Inventar links ou preços.
 
-  .list{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
-  .ok{color:var(--ok)} .err{color:var(--err)}
+Funções
+1) Estratégia e apoio comercial (produtos, prazos, preços).
+2) Método e procedimentos (quando relevante).
+3) RAG + Grok; se faltar evidência, diz o que falta e o próximo passo.
 
-  .result pre::-webkit-scrollbar,
-  .tile .res::-webkit-scrollbar,
-  .tile textarea::-webkit-scrollbar,
-  .list::-webkit-scrollbar{width:10px;height:10px}
-  .result pre::-webkit-scrollbar-thumb,
-  .tile .res::-webkit-scrollbar-thumb,
-  .tile textarea::-webkit-scrollbar-thumb,
-  .list::-webkit-scrollbar-thumb{background:#2a2a31;border-radius:10px}
-  .result pre::-webkit-scrollbar-track,
-  .tile .res::-webkit-scrollbar-track,
-  .tile textarea::-webkit-scrollbar-track,
-  .list::-webkit-scrollbar-track{background:transparent}
-</style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="brand">Alma Data</div>
-      <div class="status tiny">Versão do servidor: <span id="sv-version">—</span> • RAG: <span id="sv-rag">—</span> • Mem0: <span id="sv-mem">—</span></div>
-    </header>
+Links de produtos
+- Usa SEMPRE o link presente no RAG (interiorguider.com quando existir).
+- Se não tiveres URL no RAG, escreve literalmente "sem URL". Não inventes.
 
-    <!-- RESULTADO NO TOPO -->
-    <section class="result">
-      <div class="row" style="justify-content:space-between;align-items:center">
-        <h2>Resultado</h2><div class="timer" id="globalTimer">⏱︎ 00:00</div>
-      </div>
-      <div class="badges" id="summaryBadges"></div>
-      <pre id="resultBox">{}</pre>
-    </section>
+Formato
+- 1 bloco curto; bullets só quando ajudam a agir.
+"""
 
-    <!-- PARÂMETROS EM BARRA HORIZONTAL -->
-    <section class="param-bar">
-      <div class="field" style="min-width:240px">
-        <label>Namespace (default)</label>
-        <input type="text" id="ns" placeholder="ex.: boasafra">
-      </div>
-      <div class="field">
-        <label>max_pages</label>
-        <input type="number" id="max_pages" min="1" value="500">
-      </div>
-      <div class="field">
-        <label>deadline_s</label>
-        <input type="number" id="deadline_s" min="10" value="900">
-      </div>
-      <div class="field">
-        <label>max_depth (crawler)</label>
-        <input type="number" id="max_depth" min="0" value="4">
-      </div>
-      <div class="right tiny">Tarefa atual: <span id="taskLabel">—</span></div>
-      <button class="btn right" id="clearLogsBtn">Limpar resultado</button>
-    </section>
+# ---------------------------------------------------------------------------------------
+# Utilidades de URL e normalização
+# ---------------------------------------------------------------------------------------
+IG_HOST = os.getenv("IG_HOST", "interiorguider.com").lower()
 
-    <!-- TILES -->
-    <section class="grid">
+def _canon_ig_url(u: str) -> str:
+    try:
+        p = urlparse((u or "").strip())
+    except Exception:
+        return u or ""
+    if not p.netloc:
+        return u or ""
+    host = p.netloc.lower().replace("www.", "")
+    if IG_HOST not in host:
+        return u or ""
+    path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
+    path = re.sub(r"//+", "/", path)
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    p = p._replace(scheme="https", netloc=IG_HOST, path=path)
+    return urlunparse(p)
 
-      <!-- Ingestão via Sitemap -->
-      <div class="tile">
-        <h3>Ingestão via Sitemap</h3>
-        <div class="inline">
-          <input id="sitemap_url" type="text" placeholder="https://exemplo.com/sitemap.xml">
-          <button id="btnIngestSitemap" class="btn">Ingerir Sitemap</button>
-        </div>
-        <div class="res" id="resSitemap">{}</div>
-      </div>
+# --- normaliza links IG existentes e converte URLs IG “nuas” em markdown (sem look-behind) ---
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", re.I)
+_RAW_URL_RE = re.compile(r"https?://[^\s)>\]]+", re.I)
 
-      <!-- Crawler (mesmo domínio) -->
-      <div class="tile">
-        <h3>Crawler (mesmo domínio)</h3>
-        <div class="inline">
-          <input id="seed_url" type="text" placeholder="https://exemplo.com/">
-          <button id="btnCrawl" class="btn">Rastrear & Ingerir</button>
-        </div>
-        <div class="res" id="resCrawl">{}</div>
-      </div>
+def _already_inside_md(text: str, start_idx: int) -> bool:
+    open_br = text.rfind("[", 0, start_idx)
+    close_br = text.rfind("]", 0, start_idx)
+    paren_open = text.find("(", close_br if close_br != -1 else start_idx)
+    return (open_br != -1) and (close_br != -1) and (close_br > open_br) and (paren_open != -1) and (paren_open <= start_idx)
 
-      <!-- Ingestão de URL individual -->
-      <div class="tile">
-        <h3>Ingestão de URL individual</h3>
-        <input id="single_url" type="text" placeholder="https://exemplo.com/pagina/  (aceita Google Drive)">
-        <button id="btnIngestURL" class="btn">Ingerir URL</button>
-        <div class="res" id="resURL">{}</div>
-        <div class="tiny">Dica: cola links do Google Drive (view/open/file). Convertimos automaticamente para download direto.</div>
-      </div>
+def _fix_product_links_markdown(text: str) -> str:
+    if not text:
+        return text
+    def _md_repl(m):
+        label, url = m.group(1), m.group(2)
+        fixed = _canon_ig_url(url)
+        return f"[{label}]({fixed})" if fixed else m.group(0)
+    text = _MD_LINK_RE.sub(_md_repl, text)
+    out = []
+    last = 0
+    for m in _RAW_URL_RE.finditer(text):
+        url = m.group(0)
+        host = (urlparse(url).netloc or "").lower()
+        if IG_HOST in host and not _already_inside_md(text, m.start()):
+            out.append(text[last:m.start()])
+            fixed = _canon_ig_url(url)
+            out.append(f"[ver produto]({fixed})" if fixed else url)
+            last = m.end()
+    out.append(text[last:])
+    return "".join(out)
 
-      <!-- Ingestão de Texto -->
-      <div class="tile">
-        <h3>Ingestão de Texto</h3>
-        <input id="text_title" type="text" placeholder="Título do bloco">
-        <textarea id="text_body" placeholder="Texto a indexar…"></textarea>
-        <button id="btnIngestText" class="btn">Ingerir Texto</button>
-        <div class="res" id="resText">{}</div>
-      </div>
+def _norm(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = (s.replace("ã","a").replace("õ","o").replace("á","a").replace("à","a").replace("â","a")
+           .replace("é","e").replace("ê","e").replace("í","i").replace("ó","o").replace("ô","o")
+           .replace("ú","u").replace("ç","c"))
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-      <!-- Ingestão de PDF (URL) -->
-      <div class="tile">
-        <h3>Ingestão de PDF (URL)</h3>
-        <input id="pdf_url" type="text" placeholder="https://…/ficheiro.pdf  (aceita Google Drive)">
-        <input id="pdf_title" type="text" placeholder="Título (opcional)">
-        <button id="btnIngestPDF" class="btn">Ingerir PDF</button>
-        <div class="res" id="resPDF">{}</div>
-        <div class="tiny">Para Google Drive, podes colar o link “view” — fazemos a conversão para download direto.</div>
-      </div>
+# ---------------------------------------------------------------------------------------
+# RAG (qdrant + openai embeddings) — usa rag_client.py
+# ---------------------------------------------------------------------------------------
+try:
+    from rag_client import (
+        ingest_text, ingest_pdf_url, ingest_url,
+        crawl_and_ingest, ingest_sitemap,
+        search_chunks, build_context_block
+    )
+    RAG_READY = True
+    log.info("[rag] rag_client import OK")
+except Exception as e:
+    RAG_READY = False
+    log.warning(f"[rag] a importar rag_client falhou: {e}")
 
-      <!-- Pesquisar (RAG) -->
-      <div class="tile">
-        <h3>Pesquisar (RAG)</h3>
-        <input id="search_q" type="text" placeholder="ex.: diretora da Boa Safra">
-        <input id="search_topk" type="number" value="6" min="1" max="50" />
-        <button id="btnSearch" class="btn">Pesquisar</button>
-        <div class="res" id="resSearch">{}</div>
-      </div>
+# -------- Top-K dinâmico --------
+RAG_TOP_K_DEFAULT = int(os.getenv("RAG_TOP_K", "12"))
+RAG_CONTEXT_TOKEN_BUDGET = int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1600"))
+DEFAULT_NAMESPACE = os.getenv("RAG_DEFAULT_NAMESPACE", "").strip() or None
 
-      <!-- Extrair URLs do Sitemap (com fallback) -->
-      <div class="tile">
-        <h3>Extrair URLs do Sitemap</h3>
-        <div class="inline">
-          <input id="sitemap_extract_url" type="text" placeholder="https://exemplo.com/sitemap.xml">
-          <button id="btnExtractSitemap" class="btn">Extrair URLs</button>
-        </div>
-        <div class="res" id="resExtract">—</div>
-        <textarea id="extractOutput" placeholder="URLs extraídas aparecerão aqui (uma por linha)…" style="min-height:160px"></textarea>
-        <div class="row" style="justify-content:flex-end;gap:8px">
-          <button id="btnCopyExtract" class="btn" disabled>Copiar tudo</button>
-        </div>
-        <div class="tiny">Tenta primeiro no servidor. Se falhar, cai para extração no cliente (pode falhar por CORS).</div>
-      </div>
+def _clamp_int(v, lo=1, hi=50, default=None):
+    try:
+        x = int(v)
+        return max(lo, min(hi, x))
+    except Exception:
+        return default if default is not None else lo
 
-      <!-- Ingerir em lote (lista de URLs) -->
-      <div class="tile">
-        <h3>Ingerir em lote (lista de URLs)</h3>
-        <textarea id="batchUrls" placeholder="Cola aqui uma URL por linha…"></textarea>
-        <div class="inline">
-          <input id="batchNamespace" type="text" placeholder="namespace (opcional, senão usa o da barra)">
-          <input id="batchDeadline" type="number" value="900" min="10" placeholder="deadline_s">
-          <input id="batchConcurrency" type="number" value="3" min="1" max="10" placeholder="concorrência">
-        </div>
-        <div class="progress"><div id="batchBar"></div></div>
-        <div class="tiny" id="batchStats">0/0 • OK: 0 • Falhas: 0</div>
-        <div class="list" id="batchList"></div>
-        <div class="row" style="justify-content:flex-end">
-          <button id="btnBatchStart" class="btn">Iniciar ingestão</button>
-          <button id="btnBatchStop" class="btn" disabled>Parar</button>
-        </div>
-      </div>
+# --- heurísticas de termos de produto + preço
+_NAME_HINTS = [
+    r"\bmesa\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
+    r"\bcadeira[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
+    r"\bbanco[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
+    r"\bcama[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
+    r"\bluminária[s]?\s+[a-z0-9çáéíóúâêôãõ ]{2,40}",
+]
+_PRICE_RE = re.compile(r"(?:€|\bEUR?\b)\s*([\d\.\s]{1,12}[,\.]\d{2}|\d{1,6})")
 
-    </section>
-  </div>
+BUDGET_PATTERNS = [
+    r"\borçament[oô]\s+(?:para|de)\s+(\d+)",
+    r"(\d+)\s*(?:artigos?|itens?|produtos?)",
+    r"(\d+)\s*(?:x|unid\.?|unidades?)\s*(?:de|da|do)?\s*([a-z0-9çáéíóúâêôãõ ]{3,})",
+]
 
-<script>
-(function(){
-  const $ = sel => document.querySelector(sel);
-  const resultBox = $('#resultBox');
-  const badgesBox = $('#summaryBadges');
-  const taskLabel = $('#taskLabel');
-  const svVersion = $('#sv-version');
-  const svRag = $('#sv-rag');
-  const svMem = $('#sv-mem');
+def _extract_name_terms(text:str) -> List[str]:
+    t = " " + (text or "") + " "
+    terms = []
+    for pat in _NAME_HINTS:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            terms.append(m.group(0).strip())
+    pieces = re.split(r"[,;\n]| e | com | para | de ", text or "", flags=re.I)
+    for c in pieces:
+        c = c.strip()
+        if 3 <= len(c) <= 60 and any(w in c.lower() for w in ["mesa","cadeira","banco","cama","luminária","luminaria"]):
+            terms.append(c)
+    seen=set(); out=[]
+    for s in map(_norm, terms):
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out[:8]
 
-  let timerInterval = null;
-  function startTimer(){ const t0 = Date.now(); const el = $('#globalTimer');
-    clearInterval(timerInterval);
-    timerInterval = setInterval(()=>{ const s = Math.floor((Date.now()-t0)/1000);
-      el.textContent = `⏱︎ ${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`; }, 200);
-  }
-  function stopTimer(){ clearInterval(timerInterval); }
-  function setTask(t){ taskLabel.textContent = t || '—'; }
-  function setBadges(list){ badgesBox.innerHTML=''; (list||[]).forEach(txt=>{ const b=document.createElement('div'); b.className='badge'; b.textContent=txt; badgesBox.appendChild(b);}); }
-  function printResult(obj){ resultBox.textContent = (typeof obj==='string')?obj:JSON.stringify(obj,null,2); }
-  function smallRes(el,obj){ el.textContent = (typeof obj==='string')?obj:JSON.stringify(obj,null,2); }
+def _extract_budget_items(text: str) -> List[Tuple[int, str]]:
+    t = " " + (text or "") + " "
+    items = []
+    for pat in BUDGET_PATTERNS:
+        for m in re.finditer(pat, t, flags=re.I):
+            if len(m.groups()) == 2:
+                try:
+                    qty = int(m.group(1))
+                except Exception:
+                    continue
+                name = m.group(2).strip()
+                if qty > 0 and len(name) > 2:
+                    items.append((qty, name))
+            elif len(m.groups()) == 1:
+                try:
+                    qty = int(m.group(1))
+                except Exception:
+                    continue
+                if qty >= 2:
+                    items.append((qty, "artigo genérico"))
+    seen = set()
+    out = []
+    for qty, name in items:
+        key = _norm(name)
+        if key not in seen:
+            seen.add(key)
+            out.append((qty, name))
+    return out[:5]
 
-  async function loadHealth(){
-    try{ const r = await fetch('/health'); const j = await r.json();
-      svVersion.textContent = (j.model || '—'); svRag.textContent = j.rag_available ? 'disponível' : 'off'; svMem.textContent = j.mem0_enabled ? 'on' : 'off';
-    }catch{ svVersion.textContent='—'; svRag.textContent='—'; svMem.textContent='—'; }
-  }
-  loadHealth();
+def _parse_money_eu(s: str) -> Optional[float]:
+    try:
+        if s is None:
+            return None
+        s = str(s).strip().replace("€", "").replace("\u00A0", " ").strip()
+        s = re.sub(r"\s+", "", s)
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        else:
+            if "," in s:
+                s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return None
 
-  function normalizeGoogleDriveLink(url){
-    try{ const u=new URL(url);
-      if (u.hostname!=='drive.google.com') return url;
-      if (u.pathname==='/uc' && (u.searchParams.get('id')||u.searchParams.get('export'))) return url;
-      const m=u.pathname.match(/\/file\/d\/([^/]+)/); if (m&&m[1]) return `https://drive.google.com/uc?export=download&id=${m[1]}`;
-      if (u.pathname==='/open' && u.searchParams.get('id')) return `https://drive.google.com/uc?export=download&id=${u.searchParams.get('id')}`;
-      return url;
-    }catch(e){ return url; }
-  }
+def _price_from_text(txt: str) -> Optional[float]:
+    if not txt: return None
+    m = _PRICE_RE.search(txt)
+    if not m: return None
+    return None if m is None else _parse_money_eu(m.group(1))
 
-  function readCommon(){ return {
-    namespace: $('#ns').value.trim() || undefined,
-    max_pages: parseInt($('#max_pages').value || '0',10) || undefined,
-    deadline_s: parseInt($('#deadline_s').value || '0',10) || undefined,
-    max_depth: parseInt($('#max_depth').value || '0',10) || undefined,
-  };}
-
-  async function postJSON(path, payload){
-    const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});
-    let j; try{ j = await r.json(); }catch{ j = {ok:false, http_status:r.status}; }
-    return j;
-  }
-
-  // ------- Tiles existentes -------
-  $('#btnIngestSitemap').addEventListener('click', async ()=>{
-    const sitemap_url = $('#sitemap_url').value.trim(); if (!sitemap_url) return;
-    const p = readCommon();
-    setTask(`ação: ingest-sitemap   item: ${sitemap_url}`);
-    setBadges([`Sitemap: ${sitemap_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`]);
-    startTimer(); $('#btnIngestSitemap').disabled = true;
-    const res = await postJSON('/rag/ingest-sitemap',{ sitemap_url, namespace:p.namespace, max_pages:p.max_pages, deadline_s:p.deadline_s });
-    stopTimer(); $('#btnIngestSitemap').disabled = false; printResult(res); smallRes($('#resSitemap'),res);
-  });
-
-  $('#btnCrawl').addEventListener('click', async ()=>{
-    const seed_url = $('#seed_url').value.trim(); if (!seed_url) return;
-    const p = readCommon();
-    setTask(`ação: crawl   seed: ${seed_url}`);
-    setBadges([`Seed: ${seed_url}`, `namespace: ${p.namespace||'default'}`, `deadline_s: ${p.deadline_s||'—'}`, `max_pages: ${p.max_pages||'—'}`, `max_depth: ${p.max_depth||'—'}`]);
-    startTimer(); $('#btnCrawl').disabled = true;
-    const res = await postJSON('/rag/crawl',{ seed_url, namespace:p.namespace, max_pages:p.max_pages, max_depth:p.max_depth, deadline_s:p.deadline_s });
-    stopTimer(); $('#btnCrawl').disabled = false; printResult(res); smallRes($('#resCrawl'),res);
-  });
-
-  $('#btnIngestURL').addEventListener('click', async ()=>{
-    let page_url = $('#single_url').value.trim(); if (!page_url) return;
-    page_url = normalizeGoogleDriveLink(page_url); $('#single_url').value = page_url;
-    const p = readCommon();
-    setTask(`ação: ingest-url   item: ${page_url}`);
-    setBadges([`URL: ${page_url}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer(); $('#btnIngestURL').disabled = true;
-    const res = await postJSON('/rag/ingest-url',{ page_url, namespace:p.namespace, deadline_s:p.deadline_s });
-    stopTimer(); $('#btnIngestURL').disabled = false; printResult(res); smallRes($('#resURL'),res);
-  });
-
-  $('#btnIngestText').addEventListener('click', async ()=>{
-    const title = $('#text_title').value.trim(); const text = $('#text_body').value.trim();
-    if (!title || !text) return; const p = readCommon();
-    setTask(`ação: ingest-text   título: ${title}`); setBadges([`Título: ${title}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer(); $('#btnIngestText').disabled = true;
-    const res = await postJSON('/rag/ingest-text',{ title, text, namespace:p.namespace });
-    stopTimer(); $('#btnIngestText').disabled = false; printResult(res); smallRes($('#resText'),res);
-  });
-
-  $('#btnIngestPDF').addEventListener('click', async ()=>{
-    let pdf_url = $('#pdf_url').value.trim(); const title = $('#pdf_title').value.trim() || null;
-    if (!pdf_url) return; pdf_url = normalizeGoogleDriveLink(pdf_url); $('#pdf_url').value = pdf_url;
-    const p = readCommon(); setTask(`ação: ingest-pdf-url   item: ${pdf_url}`);
-    setBadges([`PDF: ${pdf_url}`, `namespace: ${p.namespace||'default'}`]);
-    startTimer(); $('#btnIngestPDF').disabled = true;
-    const res = await postJSON('/rag/ingest-pdf-url',{ pdf_url, title, namespace:p.namespace });
-    stopTimer(); $('#btnIngestPDF').disabled = false; printResult(res); smallRes($('#resPDF'),res);
-  });
-
-  $('#btnSearch').addEventListener('click', async ()=>{
-    const query = $('#search_q').value.trim(); const top_k = parseInt($('#search_topk').value || '6',10);
-    const p = readCommon(); if (!query) return;
-    setTask(`ação: search   q: ${query}`); setBadges([`q: ${query}`, `namespace: ${p.namespace||'default'}`, `top_k: ${top_k}`]);
-    startTimer(); $('#btnSearch').disabled = true;
-    const res = await postJSON('/rag/search',{ query, namespace:p.namespace, top_k });
-    stopTimer(); $('#btnSearch').disabled = false; printResult(res); smallRes($('#resSearch'),res);
-  });
-
-  $('#clearLogsBtn').addEventListener('click', ()=>{ printResult('{}'); setBadges([]); setTask('—'); });
-
-  // ------- Extrair URLs (servidor com fallback cliente) -------
-  $('#btnExtractSitemap').addEventListener('click', async ()=>{
-    const sitemap_url = $('#sitemap_extract_url').value.trim();
-    const outTA = $('#extractOutput'); const resBox = $('#resExtract');
-    if (!sitemap_url) return;
-
-    setTask(`ação: extrair-urls   sitemap: ${sitemap_url}`);
-    setBadges([`Sitemap: ${sitemap_url}`]); startTimer();
-    $('#btnExtractSitemap').disabled = true; $('#btnCopyExtract').disabled = true;
-    outTA.value = ''; resBox.textContent = 'A extrair…';
-
-    // 1) tenta no servidor
-    let usedServer = false;
-    try{
-      const srv = await postJSON('/rag/extract-urls', { url: sitemap_url, max_urls: 20000 });
-      if (srv && srv.ok && Array.isArray(srv.urls) && srv.urls.length){
-        usedServer = true;
-        stopTimer();
-        smallRes(resBox,{ via:'server', type:srv.type, count:srv.count, examples:srv.urls.slice(0,3) });
-        outTA.value = srv.urls.join('\n');
-        $('#btnCopyExtract').disabled = srv.urls.length===0;
-        try{ await navigator.clipboard.writeText(outTA.value); }catch{}
-        printResult({ ok:true, via:'server', count:srv.urls.length });
-      }
-    }catch(e){
-      // ignora e tenta cliente
+def _expand_variants(term: str) -> List[str]:
+    t = (term or "").strip()
+    if not t:
+        return []
+    t = re.sub(r"^\s*\d+\s*x?\s*", "", t, flags=re.I)
+    t = re.sub(r"^\s*\d+\s+", "", t, flags=re.I)
+    toks = re.findall(r"[A-Za-z0-9ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-]+", t)
+    base = " ".join(toks[:6]).strip()
+    if not base:
+        return []
+    variants = {base}
+    sp_map = {
+        "cadeiras": "cadeira",
+        "bancos": "banco",
+        "mesas": "mesa",
+        "camas": "cama",
+        "luminárias": "luminária",
+        "luminarias": "luminaria",
     }
+    words = base.split()
+    if words:
+        w0 = words[0].lower()
+        if w0 in sp_map:
+            variants.add(" ".join([sp_map[w0]] + words[1:]))
+        inv = {v: k for k, v in sp_map.items()}
+        if w0 in inv:
+            variants.add(" ".join([inv[w0]] + words[1:]))
+    if len(words) >= 2: variants.add(" ".join(words[:2]))
+    if len(words) >= 3: variants.add(" ".join(words[:3]))
+    if len(words) >= 4: variants.add(" ".join(words[:4]))
+    out = []
+    seen = set()
+    for v in variants:
+        vn = _norm(v)
+        if vn and vn not in seen:
+            seen.add(vn)
+            out.append(v)
+    return out
 
-    // 2) fallback cliente (CORS pode falhar)
-    if (!usedServer){
-      try{
-        async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
-        const seen=new Set(), urls=[];
-        async function walk(u){ if(seen.has(u)) return; seen.add(u);
-          const doc=await fetchXml(u);
-          urls.push(...[...doc.querySelectorAll('url > loc')].map(n=>n.textContent.trim()).filter(Boolean));
-          for (const s of [...doc.querySelectorAll('sitemap > loc')].map(n=>n.textContent.trim()).filter(Boolean)) await walk(s);
+def rag_mini_search_urls(terms: List[str], namespace: Optional[str], top_k: int) -> Dict[str, str]:
+    if not (RAG_READY and terms):
+        return {}
+    url_by_term: Dict[str, str] = {}
+    for term in terms:
+        best_url = ""
+        tried = set()
+        for q in _expand_variants(term):
+            if q in tried:
+                continue
+            tried.add(q)
+            try:
+                hits = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k) or []
+            except Exception:
+                hits = []
+            candidate = ""
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                u = meta.get("url") or ""
+                cu = _canon_ig_url(u) if u else ""
+                if not cu:
+                    continue
+                host = (urlparse(cu).netloc or "").lower()
+                if IG_HOST in host:
+                    candidate = cu
+                    break
+                if not candidate:
+                    candidate = cu
+            if candidate:
+                best_url = candidate
+                break
+        if best_url:
+            url_by_term[_norm(term)] = best_url
+    return url_by_term
+
+# ---------------------------------------------------------------------------------------
+# Memória Local + (opcional) Mem0
+# ---------------------------------------------------------------------------------------
+MEM0_ENABLE = os.getenv("MEM0_ENABLE", "false").lower() in ("1", "true", "yes")
+MEM0_API_KEY = (os.getenv("MEM0_API_KEY") or "").strip()
+
+MemoryClient = None
+mem0_client = None
+
+if MEM0_ENABLE:
+    if not MEM0_API_KEY:
+        log.warning("[mem0] MEM0_ENABLE=true mas falta MEM0_API_KEY")
+    else:
+        try:
+            try:
+                import mem0ai as _mem0_pkg
+                from mem0ai import MemoryClient as _MC
+            except Exception:
+                import mem0 as _mem0_pkg
+                from mem0 import MemoryClient as _MC
+            MemoryClient = _MC
+            log.info(f"[mem0] import OK ({getattr(_mem0_pkg,'__name__','mem0')}) file={getattr(_mem0_pkg,'__file__','?')}")
+        except Exception as e:
+            log.error(f"[mem0] import FAILED: {e}")
+            MemoryClient = None
+        if MemoryClient is not None:
+            try:
+                mem0_client = MemoryClient(api_key=MEM0_API_KEY)
+                log.info("[mem0] MemoryClient inicializado.")
+            except Exception as e:
+                log.error(f"[mem0] não inicializou: {e}")
+                mem0_client = None
+
+LOCAL_FACTS: Dict[str, Dict[str, str]] = {}
+LOCAL_HISTORY: Dict[str, List[Tuple[str, str]]] = {}
+
+FACT_PREFIX = "FACT|"
+
+def local_set_fact(user_id: str, key: str, value: str):
+    LOCAL_FACTS.setdefault(user_id, {})
+    LOCAL_FACTS[user_id][key] = value.strip()
+
+def local_get_facts(user_id: str) -> Dict[str, str]:
+    return dict(LOCAL_FACTS.get(user_id, {}))
+
+def local_append_dialog(user_id: str, question: str, answer: str, cap: int = 50):
+    LOCAL_HISTORY.setdefault(user_id, [])
+    LOCAL_HISTORY[user_id].append((question, answer))
+    if len(LOCAL_HISTORY[user_id]) > cap:
+        LOCAL_HISTORY[user_id] = LOCAL_HISTORY[user_id][-cap:]
+
+def local_search_snippets(user_id: str, limit: int = 5) -> List[str]:
+    items = LOCAL_HISTORY.get(user_id, [])
+    out = []
+    for q, a in reversed(items[-limit*2:]):
+        if len(out) >= limit: break
+        out.append(f"User: {q}")
+        if len(out) >= limit: break
+        out.append(f"Alma: {a}")
+    return out[:limit]
+
+def _mem0_create(content: str, user_id: str, metadata: Optional[dict] = None):
+    if not (MEM0_ENABLE and mem0_client):
+        return
+    try:
+        if hasattr(mem0_client, "memories"):
+            mem0_client.memories.create(content=content, user_id=user_id, metadata=metadata or {})
+        elif hasattr(mem0_client, "create"):
+            mem0_client.create(content=content, user_id=user_id, metadata=metadata or {})
+    except Exception as e:
+        log.warning(f"[mem0] create falhou: {e}")
+
+def _mem0_search(query: str, user_id: str, limit: int = 5) -> List[str]:
+    if not (MEM0_ENABLE and mem0_client):
+        return []
+    try:
+        if hasattr(mem0_client, "memories"):
+            results = mem0_client.memories.search(query=query or "contexto", user_id=user_id, limit=limit)
+        else:
+            results = mem0_client.search(query=query or "contexto", user_id=user_id, limit=limit)
+        snippets = []
+        for item in results or []:
+            val = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
+            if val:
+                snippets.append(val)
+        return snippets
+    except Exception as e:
+        log.warning(f"[mem0] search falhou: {e}")
+        return []
+
+def mem0_set_fact(user_id: str, key: str, value: str):
+    local_set_fact(user_id, key, value)
+    if not (MEM0_ENABLE and mem0_client): return
+    try:
+        _mem0_create(
+            content=f"{FACT_PREFIX}{key}={value}",
+            user_id=user_id,
+            metadata={"source": "alma-server", "type": "fact", "key": key}
+        )
+    except Exception as e:
+        log.warning(f"[mem0] fact create falhou: {e}")
+
+def mem0_get_facts(user_id: str, limit: int = 50) -> Dict[str, str]:
+    facts = local_get_facts(user_id)
+    if not (MEM0_ENABLE and mem0_client):
+        return facts
+    try:
+        if hasattr(mem0_client, "memories"):
+            results = mem0_client.memories.search(query=FACT_PREFIX, user_id=user_id, limit=limit)
+        else:
+            results = mem0_client.search(query=FACT_PREFIX, user_id=user_id, limit=limit)
+        for item in results or []:
+            content = (item.get("text") or item.get("memory") or item.get("content") or "").strip()
+            if content.startswith(FACT_PREFIX) and "=" in content[len(FACT_PREFIX):]:
+                body = content[len(FACT_PREFIX):]
+                k, v = body.split("=", 1)
+                if k and v:
+                    facts[k.strip()] = v.strip()
+        return facts
+    except Exception as e:
+        log.warning(f"[mem0] get_facts falhou: {e}")
+        return facts
+
+# ---------------------------------------------------------------------------------------
+# Extração de factos simples do texto
+# ---------------------------------------------------------------------------------------
+NAME_PATTERNS = [
+    r"\bchamo-?me\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bo\s+meu\s+nome\s+é\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+    r"\bsou\s+(?:o|a)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç\-']{1,40}){0,3})\b",
+]
+CITY_PATTERNS = [
+    r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇ]{2,60})",
+]
+PREF_PATTERNS = [
+    r"\bgosto\s+(?:de|do|da|dos|das)\s+([^\.]{3,80})",
+    r"\bprefiro\s+([^\.]{3,80})",
+    r"\badoro\s+([^\.]{3,80})",
+    r"\bquero\s+([^\.]{3,80})",
+]
+ROOM_KEYWORDS = ["sala", "cozinha", "quarto", "wc", "casa de banho", "varanda", "escritório", "hall", "entrada", "lavandaria"]
+
+def extract_contextual_facts_pt(text: str) -> Dict[str, str]:
+    facts: Dict[str, str] = {}
+    t = " " + (text or "") + " "
+    for pat in NAME_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            if len(name.split()) == 1 and name.lower() in {"melhor", "pior", "arquiteto", "cliente"}:
+                pass
+            else:
+                facts["name"] = name
+                break
+    for pat in CITY_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            city = m.group(1).strip(" .,'\"").title()
+            if 2 <= len(city) <= 60:
+                facts["location"] = city
+                break
+    for pat in PREF_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            pref = m.group(1).strip(" .,'\"")
+            if 3 <= len(pref) <= 80:
+                facts.setdefault("preferences", pref)
+                break
+    for kw in ROOM_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", t, flags=re.IGNORECASE):
+            facts["room"] = kw
+    return facts
+
+def facts_to_context_block(facts: Dict[str, str]) -> str:
+    if not facts: return ""
+    lines = []
+    if "name" in facts: lines.append(f"- Nome: {facts['name']}")
+    if "location" in facts: lines.append(f"- Localização: {facts['location']}")
+    if "room" in facts: lines.append(f"- Divisão/Projeto: {facts['room']}")
+    if "preferences" in facts: lines.append(f"- Preferências: {facts['preferences']}")
+    for k, v in facts.items():
+        if k not in {"name", "location", "room", "preferences"}:
+            lines.append(f"- {k}: {v}")
+    return "Perfil do utilizador (memória contextual):\n" + "\n".join(lines)
+
+def facts_block_for_user(user_id: str) -> str:
+    facts = mem0_get_facts(user_id)
+    return facts_to_context_block(facts)
+
+# ---------------------------------------------------------------------------------------
+# Injetor de links a partir do RAG (pós-processamento do texto)
+# ---------------------------------------------------------------------------------------
+def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
+    if not (RAG_READY and text):
+        return text
+    terms: List[str] = []
+    terms.extend(_extract_name_terms(user_query or ""))
+    terms.extend(_extract_name_terms(text or ""))
+    url_by_term = rag_mini_search_urls(terms, namespace, top_k=decided_top_k)
+    if not url_by_term:
+        return text
+    out = text
+
+    def _fix_sem_url(m):
+        label = m.group(1)
+        chosen = url_by_term.get(_norm(label), "")
+        if not chosen and len(url_by_term) == 1:
+            chosen = list(url_by_term.values())[0]
+        if not chosen:
+            chosen = list(url_by_term.values())[0]
+        return f"[{label}]({chosen})" if chosen else m.group(0)
+
+    out = re.sub(r"\[([^\]]+)\]\(\s*sem\s+url\s*\)", _fix_sem_url, out, flags=re.I)
+
+    def _replace_line_sem_url(line: str) -> str:
+        if re.search(r"\bsem\s+url\b", line, flags=re.I):
+            for tnorm, url in url_by_term.items():
+                if tnorm in _norm(line):
+                    if _MD_LINK_RE.search(line):
+                        return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
+                    m2 = re.search(r"(mesa|cadeira|banco|cama|luminária|luminaria)[^\-:]*", line, flags=re.I)
+                    if m2:
+                        nome = m2.group(0).strip()
+                        linked = line.replace(nome, f"[{nome}]({url})", 1)
+                        return re.sub(r"\bsem\s+url\b", "", linked, flags=re.I)
+                    return re.sub(r"\bsem\s+url\b", f"{url}", line, flags=re.I)
+        return line
+
+    out_lines = [_replace_line_sem_url(l) for l in out.splitlines()]
+    out = "\n".join(out_lines)
+
+    has_ig_link = (IG_HOST in out)
+    if not has_ig_link:
+        for tnorm, url in url_by_term.items():
+            if IG_HOST not in (urlparse(url).netloc or "").lower():
+                continue
+            parts = out.splitlines()
+            injected = False
+            for i, l in enumerate(parts):
+                if tnorm in _norm(l) and not _MD_LINK_RE.search(l):
+                    words = l.split()
+                    for w in words:
+                        if len(w) >= 4 and _norm(w) in tnorm:
+                            parts[i] = l.replace(w, f"[{w}]({url})", 1)
+                            injected = True
+                            break
+                if injected:
+                    break
+            out = "\n".join(parts)
+            if injected:
+                break
+
+    if "orçament" in user_query.lower():
+        budget_items = _extract_budget_items(user_query)
+        out_lines = out.splitlines()
+        for i, line in enumerate(out_lines):
+            for qty, item_name in budget_items:
+                tnorm = _norm(item_name)
+                if tnorm in _norm(line) and not _MD_LINK_RE.search(line):
+                    url = url_by_term.get(tnorm, "")
+                    if url:
+                        m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
+                        if m:
+                            nome_part = m.group(1)
+                            out_lines[i] = line.replace(nome_part, f"[{nome_part}]({url})", 1)
+        out = "\n".join(out_lines)
+
+    return out
+
+def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
+    step1 = _fix_product_links_markdown(answer or "")
+    step2 = _inject_links_from_rag(step1, user_query, namespace, decided_top_k)
+    return step2
+
+# ---------------------------------------------------------------------------------------
+# Config Grok (x.ai)
+# ---------------------------------------------------------------------------------------
+XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
+XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
+
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+_session.mount("https://", _adapter); _session.mount("http://", _adapter)
+
+def grok_chat(messages, timeout=120):
+    if not XAI_API_KEY:
+        raise RuntimeError("Falta XAI_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+    }
+    payload = {"model": MODEL, "messages": messages}
+    r = _session.post(XAI_API_URL, headers=headers, json=payload, timeout=timeout)
+    log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
+    r.raise_for_status()
+    return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+
+# ---------------------------------------------------------------------------------------
+# Blocos de contexto e construção das mensagens
+# ---------------------------------------------------------------------------------------
+def _decide_top_k(user_query: str, req_top_k: Optional[int]) -> int:
+    if req_top_k:
+        return _clamp_int(req_top_k, lo=3, hi=40, default=RAG_TOP_K_DEFAULT)
+    n_terms = len(_extract_name_terms(user_query or ""))
+    budget_items = _extract_budget_items(user_query)
+    if "orçament" in user_query.lower() or len(budget_items) >= 2:
+        base = 20 + (len(budget_items) * 4)
+    elif n_terms >= 3:
+        base = 16
+    elif n_terms == 2:
+        base = 12
+    else:
+        base = 10
+    return min(max(base, RAG_TOP_K_DEFAULT), 40)
+
+def build_rag_products_block(question: str) -> str:
+    if not RAG_READY:
+        return ""
+    budget_items = _extract_budget_items(question)
+    lines = []
+    if budget_items:
+        for qty, item_name in budget_items[:6]:
+            query_item = f"{qty} {item_name}"
+            try:
+                hits = search_chunks(query=query_item, namespace=DEFAULT_NAMESPACE, top_k=5) or []
+            except Exception:
+                hits = []
+            seen = set()
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                title = (meta.get("title") or item_name).strip()
+                url = _canon_ig_url(meta.get("url") or "")
+                key = (title, url)
+                if key in seen: continue
+                seen.add(key)
+                lines.append(f"- QTY={qty}; NOME={title}; URL={url or 'sem URL'}")
+            if not hits:
+                links = rag_mini_search_urls([item_name], DEFAULT_NAMESPACE, top_k=5)
+                url = links.get(_norm(item_name), "sem URL")
+                lines.append(f"- QTY={qty}; NOME={item_name}; URL={url}")
+    else:
+        try:
+            hits = search_chunks(query=question, namespace=DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
+        except Exception:
+            hits = []
+        seen = set()
+        for h in hits[:8]:
+            meta = h.get("metadata", {}) or {}
+            title = (meta.get("title") or "").strip()
+            url = _canon_ig_url(meta.get("url") or "")
+            key = (title, url)
+            if key in seen: continue
+            seen.add(key)
+            lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
+    return "Produtos para orçamento (do RAG; usa estes dados exatos para links):\n" + "\n".join(lines) if lines else ""
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    new_facts = extract_contextual_facts_pt(question)
+    for k, v in new_facts.items():
+        mem0_set_fact(user_id, k, v)
+
+    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
+    memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
+
+    rag_block = ""
+    rag_used = False
+    if RAG_READY:
+        try:
+            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT)
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
+            rag_used = bool(rag_block)
+        except Exception as e:
+            log.warning(f"[rag] search falhou: {e}")
+            rag_block = ""
+            rag_used = False
+
+    products_block = build_rag_products_block(question)
+
+    messages = [{"role": "system", "content": ALMA_MISSION}]
+    fb = facts_block_for_user(user_id)
+    if fb: messages.append({"role": "system", "content": fb})
+    if rag_block:
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
+    if products_block:
+        messages.append({"role": "system", "content": products_block})
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
+    messages.append({"role": "user", "content": question})
+    return messages, new_facts, rag_used
+
+# ---------------------------------------------------------------------------------------
+# ROTAS BÁSICAS + páginas
+# ---------------------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def serve_index():
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return HTMLResponse("<h1>index.html não encontrado</h1>", status_code=404)
+
+@app.get("/alma-chat", response_class=HTMLResponse)
+@app.get("/alma-chat/", response_class=HTMLResponse)
+def alma_chat():
+    html_path = os.path.join(os.getcwd(), "alma-chat.html")
+    if os.path.exists(html_path):
+        return FileResponse(html_path, media_type="text/html")
+    return HTMLResponse("<h1>alma-chat.html não encontrado</h1>", status_code=404)
+
+@app.get("/console", response_class=HTMLResponse)
+def serve_console():
+    html_path = os.path.join(os.getcwd(), "console.html")
+    if os.path.exists(html_path):
+        return FileResponse(html_path, media_type="text/html")
+    return HTMLResponse("<h1>console.html não encontrado</h1>", status_code=404)
+
+@app.get("/status")
+def status_json():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG).",
+        "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
+        "rag": {"available": RAG_READY, "top_k_default": RAG_TOP_K_DEFAULT, "namespace": DEFAULT_NAMESPACE},
+        "endpoints": {
+            "health": "/health",
+            "ask": "POST /ask {question, user_id?, namespace?, top_k?}",
+            "ask_get": "/ask_get?q=...&user_id=...&namespace=...&top_k=...",
+            "ping_grok": "/ping_grok",
+            "rag_search_get": "/rag/search?q=...&namespace=...",
+            "rag_search_post": "POST /rag/search",
+            "rag_ingest_sitemap": "POST /rag/ingest-sitemap",
+            "rag_crawl": "POST /rag/crawl",
+            "rag_ingest_url": "POST /rag/ingest-url",
+            "rag_ingest_text": "POST /rag/ingest-text",
+            "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
+            "rag_extract_urls": "POST /rag/extract-urls",
+            "console": "/console",
         }
-        await walk(sitemap_url);
-        stopTimer();
-        smallRes(resBox,{ via:'client', count:urls.length, examples:urls.slice(0,3) });
-        outTA.value = urls.join('\n'); $('#btnCopyExtract').disabled = urls.length===0;
-        try{ await navigator.clipboard.writeText(outTA.value); }catch{}
-        printResult({ ok:true, via:'client', count:urls.length });
-      }catch(e){
-        stopTimer();
-        smallRes(resBox,{ error:String(e && e.message || e) });
-        printResult({ ok:false, error:String(e && e.message || e) });
-      }
     }
 
-    $('#btnExtractSitemap').disabled = false;
-  });
-
-  $('#btnCopyExtract').addEventListener('click', async ()=>{
-    const txt = $('#extractOutput').value; if (!txt.trim()) return;
-    try{ await navigator.clipboard.writeText(txt); printResult({ok:true,copied:true,lines:txt.split('\n').filter(Boolean).length}); }catch{ printResult({ok:false,error:'Clipboard bloqueado'}); }
-  });
-
-  // ------- Ingestão em lote -------
-  const state = { stop:false };
-  $('#btnBatchStart').addEventListener('click', async ()=>{
-    const raw = $('#batchUrls').value.trim();
-    const urls = raw.split('\n').map(s=>s.trim()).filter(Boolean);
-    if (!urls.length) return;
-
-    const commonNs = $('#ns').value.trim() || undefined;
-    const ns = ($('#batchNamespace').value.trim() || commonNs);
-    const deadline_s = parseInt($('#batchDeadline').value || '0',10) || undefined;
-    const concurrency = Math.max(1, Math.min(10, parseInt($('#batchConcurrency').value || '3',10)));
-
-    // UI init
-    state.stop = false;
-    $('#btnBatchStart').disabled = true;
-    $('#btnBatchStop').disabled = false;
-    setTask(`ação: ingest-batch   urls: ${urls.length}`);
-    setBadges([`namespace: ${ns||'default'}`, `concorrência: ${concurrency}`, `deadline_s: ${deadline_s||'—'}`]);
-    startTimer();
-
-    const list = $('#batchList'); list.innerHTML = '';
-    const bar = $('#batchBar'); bar.style.width = '0%';
-    const statsEl = $('#batchStats'); let done=0, ok=0, fail=0;
-
-    function update(){
-      const pct = Math.round((done/urls.length)*100);
-      bar.style.width = pct + '%';
-      statsEl.textContent = `${done}/${urls.length} • OK: ${ok} • Falhas: ${fail}`;
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "mem0_enabled": MEM0_ENABLE,
+        "mem0_client_ready": bool(mem0_client),
+        "model": MODEL,
+        "rag_available": RAG_READY,
+        "rag_default_namespace": DEFAULT_NAMESPACE,
+        "rag_top_k_default": RAG_TOP_K_DEFAULT
     }
 
-    function addLine(text, cls){
-      const div = document.createElement('div');
-      if (cls) div.className = cls;
-      div.textContent = text;
-      list.appendChild(div);
-      list.scrollTop = list.scrollHeight;
+@app.post("/echo")
+async def echo(request: Request):
+    data = await request.json()
+    return {"echo": data}
+
+@app.get("/ping_grok")
+def ping_grok():
+    try:
+        msg = [{"role": "user", "content": "Diz apenas: pong"}]
+        content = grok_chat(msg, timeout=20)
+        return {"ok": True, "reply": content}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---------------------------------------------------------------------------------------
+# RAG: GET /rag/search (debug)
+# ---------------------------------------------------------------------------------------
+@app.get("/rag/search")
+def rag_search_get(q: str, namespace: str = None, top_k: int = None):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = search_chunks(query=q, namespace=namespace or DEFAULT_NAMESPACE, top_k=top_k or RAG_TOP_K_DEFAULT)
+        return {"ok": True, "query": q, "matches": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---------------------------------------------------------------------------------------
+# ENDPOINTS USADOS PELO CONSOLE RAG
+# ---------------------------------------------------------------------------------------
+class IngestSitemapBody(BaseModel):
+    sitemap_url: str
+    namespace: Optional[str] = None
+    max_pages: Optional[int] = None
+    deadline_s: Optional[int] = None
+
+class CrawlBody(BaseModel):
+    seed_url: str
+    namespace: Optional[str] = None
+    max_pages: Optional[int] = 200
+    max_depth: Optional[int] = 4
+    deadline_s: Optional[int] = None
+
+class IngestURLBody(BaseModel):
+    page_url: str
+    namespace: Optional[str] = None
+    deadline_s: Optional[int] = None
+
+class IngestTextBody(BaseModel):
+    title: str
+    text: str
+    namespace: Optional[str] = None
+    url: Optional[str] = None
+
+class IngestPDFBody(BaseModel):
+    pdf_url: str
+    title: Optional[str] = None
+    namespace: Optional[str] = None
+
+class RagSearchBody(BaseModel):
+    query: str
+    namespace: Optional[str] = None
+    top_k: Optional[int] = None
+
+class ExtractUrlsBody(BaseModel):
+    url: str
+    max_urls: Optional[int] = 20000
+
+def _ns(ns: Optional[str]) -> Optional[str]:
+    return (ns or DEFAULT_NAMESPACE)
+
+@app.post("/rag/ingest-sitemap")
+def rag_ingest_sitemap_api(body: IngestSitemapBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = ingest_sitemap(body.sitemap_url, namespace=_ns(body.namespace))
+        return {"ok": True, "namespace": _ns(body.namespace), "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/rag/crawl")
+def rag_crawl_api(body: CrawlBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = crawl_and_ingest(
+            root_url=body.seed_url,
+            namespace=_ns(body.namespace),
+            max_pages=body.max_pages or 200,
+            max_depth=body.max_depth or 4,
+        )
+        return {"ok": True, "namespace": _ns(body.namespace), "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/rag/ingest-url")
+def rag_ingest_url_api(body: IngestURLBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = ingest_url(body.page_url, namespace=_ns(body.namespace))
+        return {"ok": True, "namespace": _ns(body.namespace), "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/rag/ingest-text")
+def rag_ingest_text_api(body: IngestTextBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = ingest_text(
+            body.text,
+            title=(body.title or ""),
+            url=(body.url or ""),
+            namespace=_ns(body.namespace),
+        )
+        return {"ok": True, "namespace": _ns(body.namespace), "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/rag/ingest-pdf-url")
+def rag_ingest_pdf_api(body: IngestPDFBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        res = ingest_pdf_url(body.pdf_url, namespace=_ns(body.namespace))
+        return {"ok": True, "namespace": _ns(body.namespace), "result": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/rag/search")
+def rag_search_post(body: RagSearchBody):
+    if not RAG_READY:
+        return {"ok": False, "error": "rag_client indisponível no servidor"}
+    try:
+        tk = body.top_k or RAG_TOP_K_DEFAULT
+        res = search_chunks(query=body.query, namespace=_ns(body.namespace), top_k=tk)
+        return {"ok": True, "query": body.query, "top_k": tk, "matches": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def _fetch_text(url: str, timeout: int = 30) -> str:
+    r = _session.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+def _extract_from_sitemap(url: str, max_urls: int = 20000) -> Tuple[str, List[str]]:
+    text = _fetch_text(url)
+    doc = ET.fromstring(text)
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    urls: List[str] = []
+    if doc.tag.endswith("sitemapindex"):
+        typ = "sitemapindex"
+        for loc in doc.findall(".//sm:sitemap/sm:loc", ns) or doc.findall(".//sitemap/loc"):
+            if len(urls) >= max_urls:
+                break
+            child = (loc.text or "").strip()
+            if not child:
+                continue
+            try:
+                _typ, child_urls = _extract_from_sitemap(child, max_urls=max_urls - len(urls))
+                urls.extend(child_urls)
+            except Exception:
+                continue
+        return (typ, urls)
+    typ = "urlset"
+    for loc in doc.findall(".//sm:url/sm:loc", ns) or doc.findall(".//url/loc"):
+        if len(urls) >= max_urls:
+            break
+        u = (loc.text or "").strip()
+        if u:
+            urls.append(u)
+    return (typ, urls)
+
+@app.post("/rag/extract-urls")
+def rag_extract_urls(body: ExtractUrlsBody):
+    try:
+        typ, urls = _extract_from_sitemap(body.url, max_urls=body.max_urls or 20000)
+        return {"ok": True, "type": typ, "count": len(urls), "urls": urls[: body.max_urls or 20000]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---------------------------------------------------------------------------------------
+# ASK endpoints (sem módulo de orçamento; com injeção de links e top-k dinâmico)
+# ---------------------------------------------------------------------------------------
+@app.get("/ask_get")
+def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
+    if not q:
+        return {"answer": "Falta query param ?q="}
+    decided_top_k = _decide_top_k(q, top_k)
+    _ = build_rag_products_block(q)  # opcional: mantém a dica no contexto
+    messages, new_facts, rag_used = build_messages(user_id, q, namespace)
+    try:
+        answer = grok_chat(messages)
+    except Exception as e:
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+    answer = _postprocess_answer(answer, q, namespace, decided_top_k)
+    local_append_dialog(user_id, q, answer)
+    _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {"used": rag_used, "top_k_default": RAG_TOP_K_DEFAULT, "top_k_effective": decided_top_k, "namespace": namespace or DEFAULT_NAMESPACE}
     }
 
-    async function postJSON(path, payload){
-      const r = await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})});
-      let j; try{ j = await r.json(); }catch{ j = {ok:false, http_status:r.status}; }
-      return j;
+@app.post("/ask")
+async def ask(request: Request):
+    data = await request.json()
+    question = (data.get("question") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or "anon"
+    namespace = (data.get("namespace") or "").strip() or None
+    req_top_k = data.get("top_k")
+    decided_top_k = _decide_top_k(question, req_top_k)
+    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
+    if not question:
+        return {"answer": "Coloca a tua pergunta em 'question'."}
+    _ = build_rag_products_block(question)
+    messages, new_facts, rag_used = build_messages(user_id, question, namespace)
+    try:
+        answer = grok_chat(messages)
+    except Exception as e:
+        log.exception("Erro ao chamar a x.ai")
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+    answer = _postprocess_answer(answer, question, namespace, decided_top_k)
+    local_append_dialog(user_id, question, answer)
+    _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {"used": rag_used, "top_k_default": RAG_TOP_K_DEFAULT, "top_k_effective": decided_top_k, "namespace": namespace or DEFAULT_NAMESPACE}
     }
 
-    async function ingestOne(u){
-      const page_url = normalizeGoogleDriveLink(u);
-      addLine(`→ ${page_url}`);
-      const res = await postJSON('/rag/ingest-url', { page_url, namespace: ns, deadline_s });
-      if (res && (res.ok === true || res.status === 'ok')) { ok++; addLine(`✔ OK ${page_url}`, 'ok'); }
-      else { fail++; addLine(`✖ Falha ${page_url} :: ${JSON.stringify(res).slice(0,200)}`, 'err'); }
-      done++; update();
-    }
-
-    // scheduler com concorrência limitada
-    let idx = 0, active = 0;
-    await new Promise(resolve=>{
-      const tick = ()=>{
-        if (state.stop) { if (active===0) resolve(); return; }
-        while (active < concurrency && idx < urls.length){
-          const u = urls[idx++]; active++;
-          ingestOne(u).finally(()=>{ active--; tick(); });
-        }
-        if (done >= urls.length && active === 0) resolve();
-      };
-      tick();
-    });
-
-    stopTimer();
-    $('#btnBatchStart').disabled = false;
-    $('#btnBatchStop').disabled = true;
-    printResult({ ok:true, total: urls.length, ok, fail });
-  });
-
-  $('#btnBatchStop').addEventListener('click', ()=>{
-    state.stop = true;
-    $('#btnBatchStop').disabled = true;
-  });
-
-})();
-</script>
-</body>
-</html>
+# --- local run ----------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
