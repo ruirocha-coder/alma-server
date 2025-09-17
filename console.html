@@ -183,6 +183,24 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
+      <!-- Catálogo -->
+      <div class="tile">
+        <h3>Catálogo</h3>
+        <div class="inline">
+          <input id="catalog_sitemap" type="text" placeholder="https://…/sitemap_products.xml">
+          <button id="btnCatalogBuild" class="btn">Construir Catálogo</button>
+        </div>
+        <div class="row" style="gap:8px">
+          <input id="catalog_q" type="text" placeholder="termo (ex.: cadeira)">
+          <button id="btnCatalogList" class="btn">Pesquisar</button>
+          <a href="/catalog/export.csv" target="_blank" class="btn">Exportar CSV</a>
+          <a href="/catalog/export.jsonl" target="_blank" class="btn">Exportar JSONL</a>
+        </div>
+        <div class="res" id="resCatalog">{}</div>
+        <textarea id="catalogOutput" placeholder="Itens do catálogo aparecerão aqui…" style="min-height:160px"></textarea>
+        <div class="tiny">Dica: a pesquisa do catálogo usa o índice em memória; limite por pedido: 200 (ajusta no backend se precisares).</div>
+      </div>
+
       <!-- Extrair URLs do Sitemap (com fallback) -->
       <div class="tile">
         <h3>Extrair URLs do Sitemap</h3>
@@ -271,7 +289,7 @@
     return j;
   }
 
-  // ------- Tiles existentes -------
+  // ------- Ingestão via Sitemap -------
   $('#btnIngestSitemap').addEventListener('click', async ()=>{
     const sitemap_url = $('#sitemap_url').value.trim(); if (!sitemap_url) return;
     const p = readCommon();
@@ -282,6 +300,7 @@
     stopTimer(); $('#btnIngestSitemap').disabled = false; printResult(res); smallRes($('#resSitemap'),res);
   });
 
+  // ------- Crawler -------
   $('#btnCrawl').addEventListener('click', async ()=>{
     const seed_url = $('#seed_url').value.trim(); if (!seed_url) return;
     const p = readCommon();
@@ -292,6 +311,7 @@
     stopTimer(); $('#btnCrawl').disabled = false; printResult(res); smallRes($('#resCrawl'),res);
   });
 
+  // ------- Ingestão de URL -------
   $('#btnIngestURL').addEventListener('click', async ()=>{
     let page_url = $('#single_url').value.trim(); if (!page_url) return;
     page_url = normalizeGoogleDriveLink(page_url); $('#single_url').value = page_url;
@@ -303,6 +323,7 @@
     stopTimer(); $('#btnIngestURL').disabled = false; printResult(res); smallRes($('#resURL'),res);
   });
 
+  // ------- Ingestão de Texto -------
   $('#btnIngestText').addEventListener('click', async ()=>{
     const title = $('#text_title').value.trim(); const text = $('#text_body').value.trim();
     if (!title || !text) return; const p = readCommon();
@@ -312,6 +333,7 @@
     stopTimer(); $('#btnIngestText').disabled = false; printResult(res); smallRes($('#resText'),res);
   });
 
+  // ------- Ingestão de PDF -------
   $('#btnIngestPDF').addEventListener('click', async ()=>{
     let pdf_url = $('#pdf_url').value.trim(); const title = $('#pdf_title').value.trim() || null;
     if (!pdf_url) return; pdf_url = normalizeGoogleDriveLink(pdf_url); $('#pdf_url').value = pdf_url;
@@ -322,6 +344,7 @@
     stopTimer(); $('#btnIngestPDF').disabled = false; printResult(res); smallRes($('#resPDF'),res);
   });
 
+  // ------- Pesquisa RAG -------
   $('#btnSearch').addEventListener('click', async ()=>{
     const query = $('#search_q').value.trim(); const top_k = parseInt($('#search_topk').value || '6',10);
     const p = readCommon(); if (!query) return;
@@ -331,6 +354,40 @@
     stopTimer(); $('#btnSearch').disabled = false; printResult(res); smallRes($('#resSearch'),res);
   });
 
+  // ------- Catálogo (build/list/export) -------
+  $('#btnCatalogBuild').addEventListener('click', async ()=>{
+    const sitemap_url = $('#catalog_sitemap').value.trim();
+    if (!sitemap_url) return;
+    setTask(`ação: catalog-build   sitemap: ${sitemap_url}`);
+    setBadges([`Sitemap: ${sitemap_url}`]);
+    startTimer(); $('#btnCatalogBuild').disabled = true;
+    const res = await postJSON('/catalog/build', { sitemap_url, lang:'pt', max_urls: 200000 });
+    stopTimer(); $('#btnCatalogBuild').disabled = false;
+    printResult(res); smallRes($('#resCatalog'), res);
+  });
+
+  $('#btnCatalogList').addEventListener('click', async ()=>{
+    const q = $('#catalog_q').value.trim();
+    setTask(`ação: catalog-list   q: ${q||'(todos)'}`);
+    setBadges([`q: ${q||'—'}`]);
+    startTimer(); $('#btnCatalogList').disabled = true;
+    const url = `/catalog/list?q=${encodeURIComponent(q)}&limit=200&offset=0`;
+    try{
+      const r = await fetch(url); const j = await r.json();
+      stopTimer(); $('#btnCatalogList').disabled = false;
+      printResult(j);
+      smallRes($('#resCatalog'), {total:j.total, returned:j.returned});
+      $('#catalogOutput').value = (j.items||[]).map(it=>{
+        const p = [it.title||'-', it.price_str?`€${it.price_str}`:'', it.url||''].filter(Boolean).join(' — ');
+        return p;
+      }).join('\n');
+    }catch(e){
+      stopTimer(); $('#btnCatalogList').disabled = false;
+      printResult({ok:false,error:String(e)});
+    }
+  });
+
+  // ------- Limpar resultado topo -------
   $('#clearLogsBtn').addEventListener('click', ()=>{ printResult('{}'); setBadges([]); setTask('—'); });
 
   // ------- Extrair URLs (servidor com fallback cliente) -------
@@ -344,7 +401,7 @@
     $('#btnExtractSitemap').disabled = true; $('#btnCopyExtract').disabled = true;
     outTA.value = ''; resBox.textContent = 'A extrair…';
 
-    // 1) tenta no servidor
+    // 1) servidor
     let usedServer = false;
     try{
       const srv = await postJSON('/rag/extract-urls', { url: sitemap_url, max_urls: 20000 });
@@ -357,11 +414,9 @@
         try{ await navigator.clipboard.writeText(outTA.value); }catch{}
         printResult({ ok:true, via:'server', count:srv.urls.length });
       }
-    }catch(e){
-      // ignora e tenta cliente
-    }
+    }catch(e){}
 
-    // 2) fallback cliente (CORS pode falhar)
+    // 2) cliente
     if (!usedServer){
       try{
         async function fetchXml(u){ const r=await fetch(u,{cache:'no-store'}); if(!r.ok) throw new Error(`HTTP ${r.status}`); const t=await r.text(); return new DOMParser().parseFromString(t,'application/xml'); }
@@ -404,7 +459,6 @@
     const deadline_s = parseInt($('#batchDeadline').value || '0',10) || undefined;
     const concurrency = Math.max(1, Math.min(10, parseInt($('#batchConcurrency').value || '3',10)));
 
-    // UI init
     state.stop = false;
     $('#btnBatchStart').disabled = true;
     $('#btnBatchStop').disabled = false;
@@ -445,7 +499,6 @@
       done++; update();
     }
 
-    // scheduler com concorrência limitada
     let idx = 0, active = 0;
     await new Promise(resolve=>{
       const tick = ()=>{
