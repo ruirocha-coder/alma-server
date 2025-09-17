@@ -1906,30 +1906,42 @@ async def catalog_build(request: Request):
             log.warning("[catalog] add fail url=%s err=%s", u, e)
     return {"ok": True, "added": ok, "failed": fail, "items": added}
 
+from rag_client import qdrant, QDRANT_COLLECTION
+from qdrant_client.http import models as qm
+
 @app.post("/catalog/build-from-rag")
 async def catalog_build_from_rag(request: Request):
     """
+    Varre diretamente o Qdrant por namespace e preenche catálogo.
     Body: { "namespace": "boasafra", "limit": 500 }
-    Varre o RAG (busca ampla) e preenche/atualiza o catálogo.
     """
-    if not RAG_READY:
-        return {"ok": False, "error": "RAG indisponível"}
     data = await request.json()
-    namespace = (data.get("namespace") or None) or DEFAULT_NAMESPACE
-    limit = int(data.get("limit") or 400)
+    namespace = (data.get("namespace") or DEFAULT_NAMESPACE).strip()
+    limit = int(data.get("limit") or 500)
     limit = max(10, min(5000, limit))
 
-    # Busca “ampla” — tenta apanhar páginas com URL nos metadados
-    # Dica: ajusta a query se o teu corpus for só produtos IG.
-    broad_queries = ["https", "http", "produto", "product", "interiorguider.com"]
-    seen = set(); rows = []
-    for q in broad_queries:
-        try:
-            hits = search_chunks(query=q, namespace=namespace, top_k=limit) or []
-        except Exception:
-            hits = []
-        for h in hits:
-            meta = h.get("metadata") or {}
+    seen = set()
+    rows = []
+    next_page = None
+
+    while len(rows) < limit:
+        points, next_page = qdrant.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=qm.Filter(
+                must=[qm.FieldCondition(
+                    key="namespace",
+                    match=qm.MatchValue(value=namespace)
+                )]
+            ),
+            limit=100,
+            offset=next_page
+        )
+
+        if not points:
+            break
+
+        for pt in points:
+            meta = pt.payload or {}
             url = _canon_ig_url(meta.get("url") or "")
             if not url or url in seen:
                 continue
@@ -1940,7 +1952,8 @@ async def catalog_build_from_rag(request: Request):
             rows.append({"url": url, "title": title})
             if len(rows) >= limit:
                 break
-        if len(rows) >= limit:
+
+        if not next_page:
             break
 
     return {"ok": True, "namespace": namespace, "count": len(rows), "items": rows[:50]}
