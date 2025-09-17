@@ -1,4 +1,4 @@
-# main.py — Alma Server (RAG + Memória; top-k dinâmico; mini-pesquisa; injeção de links; Consola RAG; utilitários)
+# main.py — Alma Server (RAG + Memória; top-k dinâmico; mini-pesquisa; injeção e fallback de links; Consola RAG; utilitários)
 # ---------------------------------------------------------------------------------------
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +36,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("alma")
 
-APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag+mem+console-merged-1")
+APP_VERSION = os.getenv("APP_VERSION", "alma-server/rag+mem+links-fallback-1")
 
 # ---------------------------------------------------------------------------------------
 # Prompt nuclear da Alma
@@ -455,7 +455,7 @@ NAME_PATTERNS = [
 ]
 CITY_PATTERNS = [
     r"\bmoro\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
-    r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]{2,60})",
+    r"\bestou\s+(?:em|no|na)\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇ]{2,60})",
     r"\bsou\s+de\s+([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\w\s\-\.'ÁÂÃÀÉÊÍÓÔÕÚÇ]{2,60})",
 ]
 PREF_PATTERNS = [
@@ -514,7 +514,7 @@ def facts_block_for_user(user_id: str) -> str:
     return facts_to_context_block(facts)
 
 # ---------------------------------------------------------------------------------------
-# Injetor de links a partir do RAG (pós-processamento do texto)
+# Injetor de links a partir do RAG (pós-processamento do texto) + Fallback
 # ---------------------------------------------------------------------------------------
 def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
     if not (RAG_READY and text):
@@ -602,6 +602,54 @@ def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], 
     step1 = _fix_product_links_markdown(answer or "")
     step2 = _inject_links_from_rag(step1, user_query, namespace, decided_top_k)
     return step2
+
+def _links_from_matches(matches: List[dict], max_links: int = 8) -> List[Tuple[str, str]]:
+    """Extrai (title, url) únicos dos matches, priorizando IG, depois externos."""
+    if not matches:
+        return []
+    pairs: List[Tuple[str, str]] = []
+    seen = set()
+    # 1) IG primeiro
+    for pref_ig in (True, False):
+        for h in matches:
+            meta = h.get("metadata", {}) or {}
+            title = (meta.get("title") or h.get("title") or "").strip()
+            url = (meta.get("url") or h.get("url") or "").strip()
+            if not url:
+                continue
+            cu = _canon_ig_url(url) or url
+            host = (urlparse(cu).netloc or "").lower()
+            is_ig = IG_HOST in host
+            if pref_ig and not is_ig:
+                continue
+            if (not pref_ig) and is_ig:
+                continue
+            key = (title.lower(), cu.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((title or "-", cu))
+            if len(pairs) >= max_links:
+                return pairs
+    return pairs[:max_links]
+
+def _force_links_block(answer: str, matches: List[dict], min_links: int = 3) -> str:
+    """Se a resposta não contiver links (ou não tiver IG), anexa bloco de links do RAG."""
+    text = answer or ""
+    has_md_link = bool(_MD_LINK_RE.search(text))
+    has_ig = IG_HOST in text.lower()
+    if has_md_link and has_ig:
+        return text  # já tem
+    # obter links a partir dos matches
+    links = _links_from_matches(matches, max_links=max(6, min_links))
+    if not links:
+        return text
+    # montar bloco
+    lines = ["", "Links úteis (do RAG):"]
+    for title, url in links:
+        safe_title = title if title else "—"
+        lines.append(f"- [{safe_title}]({url})")
+    return (text.rstrip() + "\n" + "\n".join(lines)).strip()
 
 # ---------------------------------------------------------------------------------------
 # Config Grok (x.ai)
@@ -697,15 +745,26 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     rag_block = ""
     rag_used = False
+    rag_hits: List[dict] = []
     if RAG_READY:
         try:
-            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT)
+            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
             rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
             rag_used = bool(rag_block)
         except Exception as e:
             log.warning(f"[rag] search falhou: {e}")
             rag_block = ""
             rag_used = False
+            rag_hits = []
+
+    # bloco de links candidatos (para o LLM usar tal como estão)
+    links_pairs = _links_from_matches(rag_hits, max_links=8)
+    links_block = ""
+    if links_pairs:
+        lines = ["Links candidatos (do RAG; usa estes URLs tal como estão):"]
+        for title, url in links_pairs:
+            lines.append(f"- {title or '-'} — {url}")
+        links_block = "\n".join(lines)
 
     products_block = build_rag_products_block(question)
 
@@ -714,12 +773,14 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     if fb: messages.append({"role": "system", "content": fb})
     if rag_block:
         messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
+    if links_block:
+        messages.append({"role": "system", "content": links_block})
     if products_block:
         messages.append({"role": "system", "content": products_block})
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
     messages.append({"role": "user", "content": question})
-    return messages, new_facts, rag_used
+    return messages, new_facts, rag_used, rag_hits
 
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS + páginas
@@ -769,8 +830,6 @@ def status_json():
             "rag_ingest_pdf_url": "POST /rag/ingest-pdf-url",
             "rag_extract_urls": "POST /rag/extract-urls",
             "budget_csv": "POST /budget/csv",
-            "say": "POST /say",
-            "heygen_token": "POST /heygen/token",
             "console": "/console",
         }
     }
@@ -802,7 +861,7 @@ def ping_grok():
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# Memória contextual (FACTs) e Mem0 debug (do main antigo)
+# Memória contextual (FACTs) e Mem0 debug
 # ---------------------------------------------------------------------------------------
 @app.get("/mem/facts")
 def mem_facts(user_id: str = "anon"):
@@ -830,7 +889,7 @@ def rag_search_get(q: str, namespace: str = None, top_k: int = None):
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST) — compat com console.html
+# RAG Endpoints (crawl, sitemap, url, text, pdf, search POST) — compat com consola
 # ---------------------------------------------------------------------------------------
 @app.post("/rag/crawl")
 async def rag_crawl(request: Request):
@@ -845,7 +904,7 @@ async def rag_crawl(request: Request):
         deadline_s = int(data.get("deadline_s") or os.getenv("RAG_DEADLINE_S", "55"))
         if not seed_url:
             return {"ok": False, "error": "Falta seed_url"}
-        # usa assinatura do rag_client antiga (seed_url, não root_url)
+        # assinatura do rag_client antiga (seed_url, não root_url)
         res = crawl_and_ingest(
             seed_url=seed_url, namespace=namespace,
             max_pages=max_pages, max_depth=max_depth, deadline_s=deadline_s
@@ -1067,7 +1126,7 @@ async def budget_csv(request: Request):
     return FileResponse(fpath, media_type="text/csv", filename=fname)
 
 # ---------------------------------------------------------------------------------------
-# ASK endpoints (com injeção de links e top-k dinâmico)
+# ASK endpoints (com injeção + fallback de links e top-k dinâmico)
 # ---------------------------------------------------------------------------------------
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
@@ -1075,19 +1134,25 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Op
         return {"answer": "Falta query param ?q="}
     decided_top_k = _decide_top_k(q, top_k)
     _ = build_rag_products_block(q)  # mantém sinal de produtos no contexto
-    messages, new_facts, rag_used = build_messages(user_id, q, namespace)
+    messages, new_facts, rag_used, rag_hits = build_messages(user_id, q, namespace)
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
     answer = _postprocess_answer(answer, q, namespace, decided_top_k)
+    answer = _force_links_block(answer, rag_hits, min_links=3)
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k_default": RAG_TOP_K_DEFAULT, "top_k_effective": decided_top_k, "namespace": namespace or DEFAULT_NAMESPACE}
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
+        }
     }
 
 @app.post("/ask")
@@ -1102,22 +1167,27 @@ async def ask(request: Request):
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
     _ = build_rag_products_block(question)
-    messages, new_facts, rag_used = build_messages(user_id, question, namespace)
+    messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, namespace)
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
     answer = _postprocess_answer(answer, question, namespace, decided_top_k)
+    answer = _force_links_block(answer, rag_hits, min_links=3)
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
-        "rag": {"used": rag_used, "top_k_default": RAG_TOP_K_DEFAULT, "top_k_effective": decided_top_k, "namespace": namespace or DEFAULT_NAMESPACE}
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
+        }
     }
-
 
 # ---------------------------------------------------------------------------------------
 # Local run
