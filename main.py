@@ -1508,49 +1508,69 @@ from rag_client import qdrant, QDRANT_COLLECTION
 
 CATALOG_DB_PATH = os.getenv("CATALOG_DB_PATH", "/tmp/catalog.db")
 
+# ---- DB helpers -----------------------------------------------------------------------
 def _catalog_conn():
     conn = sqlite3.connect(CATALOG_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+def _now():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _table_cols(c) -> set:
+    cols = set()
+    for r in c.execute("PRAGMA table_info(catalog_items)").fetchall():
+        cols.add(r[1])
+    return cols
+
+def _ensure_cols(c):
+    """Garante colunas base + extra, sem quebrar DB já existente."""
+    needed = {
+        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+        "namespace": "TEXT",
+        "name": "TEXT",
+        "summary": "TEXT",
+        "url": "TEXT UNIQUE",
+        "source": "TEXT",
+        "created_at": "TEXT",
+        "updated_at": "TEXT",
+        # extras (para orçamentos no futuro)
+        "ref": "TEXT",
+        "price": "REAL",
+        "currency": "TEXT",
+        "iva_pct": "REAL",
+        "brand": "TEXT",
+        "dimensions": "TEXT",
+        "material": "TEXT",
+        "image_url": "TEXT",
+    }
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS catalog_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      namespace TEXT,
+      name TEXT,
+      summary TEXT,
+      url TEXT UNIQUE,
+      source TEXT,
+      created_at TEXT,
+      updated_at TEXT
+    )""")
+    have = _table_cols(c)
+    for col, ddl in needed.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {ddl}")
+
 def _catalog_init():
     with _catalog_conn() as c:
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS catalog_items (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          namespace TEXT,
-          name TEXT,
-          summary TEXT,
-          url TEXT UNIQUE,
-          source TEXT,
-          created_at TEXT,
-          updated_at TEXT
-        )""")
+        _ensure_cols(c)
         c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ns ON catalog_items(namespace)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog_items(name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(url)")
     log.info("[catalog/sqlite] ready db=%s", CATALOG_DB_PATH)
 
 _catalog_init()
 
-def _now():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def _upsert_catalog_row(ns: Optional[str], name: str, summary: str, url: str, source: str = "rag"):
-    if not url:
-        return
-    with _catalog_conn() as c:
-        cur = c.execute("SELECT id FROM catalog_items WHERE url=?", (url,))
-        row = cur.fetchone()
-        if row:
-            c.execute("""UPDATE catalog_items
-                         SET namespace=?, name=?, summary=?, source=?, updated_at=?
-                         WHERE url=?""",
-                      (ns, name, summary, source, _now(), url))
-        else:
-            c.execute("""INSERT INTO catalog_items(namespace,name,summary,url,source,created_at,updated_at)
-                         VALUES (?,?,?,?,?,?,?)""",
-                      (ns, name, summary, url, source, _now(), _now()))
-
+# ---- Helpers para preenchimento a partir do RAG ---------------------------------------
 def _name_from_url(u: str) -> str:
     try:
         p = urlparse(u)
@@ -1593,6 +1613,49 @@ def _rag_lookup_by_url(u: str, namespace: Optional[str]) -> Tuple[str, str]:
                 break
     return (best_title or _name_from_url(u), best_summary or "")
 
+# ---- Upsert genérico -------------------------------------------------------------------
+def _upsert_catalog_row(ns: Optional[str],
+                        name: str,
+                        summary: str,
+                        url: str,
+                        source: str = "rag",
+                        ref: Optional[str] = None,
+                        price: Optional[float] = None,
+                        currency: Optional[str] = None,
+                        iva_pct: Optional[float] = None,
+                        brand: Optional[str] = None,
+                        dimensions: Optional[str] = None,
+                        material: Optional[str] = None,
+                        image_url: Optional[str] = None):
+    if not url:
+        return
+    with _catalog_conn() as c:
+        cur = c.execute("SELECT id FROM catalog_items WHERE url=?", (url,))
+        row = cur.fetchone()
+        if row:
+            c.execute("""UPDATE catalog_items
+                         SET namespace=?, name=?, summary=?, source=?, updated_at=?,
+                             ref=COALESCE(?, ref),
+                             price=COALESCE(?, price),
+                             currency=COALESCE(?, currency),
+                             iva_pct=COALESCE(?, iva_pct),
+                             brand=COALESCE(?, brand),
+                             dimensions=COALESCE(?, dimensions),
+                             material=COALESCE(?, material),
+                             image_url=COALESCE(?, image_url)
+                         WHERE url=?""",
+                      (ns, name, summary, source, _now(),
+                       ref, price, currency, iva_pct, brand, dimensions, material, image_url,
+                       url))
+        else:
+            c.execute("""INSERT INTO catalog_items(namespace,name,summary,url,source,created_at,updated_at,
+                                                  ref,price,currency,iva_pct,brand,dimensions,material,image_url)
+                         VALUES (?,?,?,?,?,?,?,
+                                 ?,?,?,?,?,?,?,?)""",
+                      (ns, name, summary, url, source, _now(), _now(),
+                       ref, price, currency, iva_pct, brand, dimensions, material, image_url))
+
+# ---- Endpoints -------------------------------------------------------------------------
 @app.post("/catalog/build")
 async def catalog_build(request: Request):
     """
@@ -1667,6 +1730,64 @@ async def catalog_build_from_rag(request: Request):
 
     return {"ok": True, "namespace": namespace, "count": len(rows), "items": rows[:50]}
 
+@app.post("/catalog/upsert")
+async def catalog_upsert(request: Request):
+    """
+    Upsert direto por URL (campos extra já prontos para futuro orçamento).
+    Body exemplo:
+    {
+      "namespace": "boasafra",
+      "url": "https://interiorguider.com/produto/mesa-x",
+      "name": "Mesa X 180",
+      "summary": "Mesa em carvalho maciço...",
+      "source": "manual",
+      "ref": "BS.MX.180",
+      "price": 1290.00,
+      "currency": "EUR",
+      "iva_pct": 23,
+      "brand": "Boa Safra",
+      "dimensions": "180x90xH75",
+      "material": "Carvalho / Óleo",
+      "image_url": "https://.../mesa-x.jpg"
+    }
+    """
+    data = await request.json()
+    url = _canon_ig_url((data.get("url") or "").strip()) or (data.get("url") or "").strip()
+    if not url:
+        return {"ok": False, "error": "Falta url"}
+    ns = (data.get("namespace") or DEFAULT_NAMESPACE)
+    name = (data.get("name") or "").strip() or _name_from_url(url)
+    summary = (data.get("summary") or "").strip()
+    source = (data.get("source") or "manual").strip()
+
+    _upsert_catalog_row(
+        ns, name, summary, url, source=source,
+        ref=(data.get("ref") or None),
+        price=(float(data["price"]) if data.get("price") not in (None, "") else None),
+        currency=(data.get("currency") or None),
+        iva_pct=(float(data["iva_pct"]) if data.get("iva_pct") not in (None, "") else None),
+        brand=(data.get("brand") or None),
+        dimensions=(data.get("dimensions") or None),
+        material=(data.get("material") or None),
+        image_url=(data.get("image_url") or None),
+    )
+    return {"ok": True, "url": url, "name": name}
+
+@app.get("/catalog/get")
+def catalog_get(url: str):
+    """Obtém 1 item por URL."""
+    url = _canon_ig_url((url or "").strip()) or (url or "").strip()
+    if not url:
+        return {"ok": False, "error": "Falta url"}
+    with _catalog_conn() as c:
+        cur = c.execute("""SELECT id, namespace, name, summary, url, source, updated_at,
+                                  ref, price, currency, iva_pct, brand, dimensions, material, image_url
+                           FROM catalog_items WHERE url=?""", (url,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "não encontrado"}
+        return {"ok": True, "item": dict(row)}
+
 @app.get("/catalog/list")
 def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
     """
@@ -1677,17 +1798,21 @@ def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
     like = f"%{q.strip()}%" if q else None
     with _catalog_conn() as c:
         if like:
-            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at
+            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
+                                      ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
-                               WHERE name LIKE ? OR summary LIKE ? OR url LIKE ?
+                               WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?
                                ORDER BY updated_at DESC
-                               LIMIT ? OFFSET ?""", (like, like, like, limit, offset))
+                               LIMIT ? OFFSET ?""",
+                            (like, like, like, like, like, limit, offset))
             items = [dict(r) for r in cur.fetchall()]
             cur2 = c.execute("""SELECT count(*) as n FROM catalog_items
-                                WHERE name LIKE ? OR summary LIKE ? OR url LIKE ?""", (like, like, like))
+                                WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?""",
+                             (like, like, like, like, like))
             total = int(cur2.fetchone()["n"])
         else:
-            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at
+            cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
+                                      ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
                                ORDER BY updated_at DESC
                                LIMIT ? OFFSET ?""", (limit, offset))
@@ -1704,6 +1829,14 @@ def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
             "url": r["url"],
             "source": r["source"],
             "updated_at": r["updated_at"],
+            "ref": r.get("ref"),
+            "price": r.get("price"),
+            "currency": r.get("currency"),
+            "iva_pct": r.get("iva_pct"),
+            "brand": r.get("brand"),
+            "dimensions": r.get("dimensions"),
+            "material": r.get("material"),
+            "image_url": r.get("image_url"),
         })
     return {"ok": True, "total": total, "items": out_items}
 
@@ -1732,11 +1865,12 @@ def _status_catalog_sqlite():
         "endpoints": {
             "build": "POST /catalog/build",
             "build_from_rag": "POST /catalog/build-from-rag",
+            "upsert": "POST /catalog/upsert",
+            "get": "GET /catalog/get?url=",
             "list": "GET /catalog/list?q=&limit=&offset=",
             "clear": "POST /catalog/clear",
         }
     }
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
