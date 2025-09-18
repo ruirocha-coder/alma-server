@@ -71,17 +71,21 @@
   .list{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
   .ok{color:var(--ok)} .err{color:var(--err)}
 
-  /* ---- Catálogo (viewer full-width) ---- */
-  #catalogViewer{margin-top:18px;background:linear-gradient(180deg,var(--panel),var(--panel-2));
+  /* ------- Catálogo (Editor grande) ------- */
+  .catalog-editor{margin-top:26px;background:linear-gradient(180deg,var(--panel),var(--panel-2));
     border:1px solid var(--chip-br);border-radius:14px;padding:16px;box-shadow:var(--shadow)}
-  #catalogControls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-  #catalogInfo{margin-left:auto;font-size:12px;color:var(--muted)}
-  table.catalog{width:100%;border-collapse:collapse;font-size:13px}
-  table.catalog th, table.catalog td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
-  table.catalog th{position:sticky;top:0;background:#111217;z-index:1}
-  table.catalog td a{color:#fff;text-decoration:underline}
-  table.catalog td[contenteditable="true"]{outline:none;background:#111219;border-radius:6px}
-  .pill{background:var(--chip);border:1px solid var(--chip-br);border-radius:999px;padding:6px 10px;font-size:12px;color:var(--muted)}
+  .catalog-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .catalog-toolbar .right{margin-left:auto}
+  .catalog-editor table{width:100%;border-collapse:collapse;font-size:13px;min-width:1200px}
+  .catalog-editor th,.catalog-editor td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
+  .catalog-editor thead th{position:sticky;top:0;background:#111217;z-index:1}
+  .catalog-editor td a{color:#fff;text-decoration:underline}
+  .catalog-editor input[type=text], .catalog-editor textarea, .catalog-editor input[type=number]{
+    background:#0f1014;border:1px solid #2a2a31;border-radius:8px; padding:8px;color:var(--text);width:100%}
+  .catalog-editor textarea{min-height:70px;resize:vertical}
+  .badge-changed{display:inline-block;background:#1f2531;border:1px solid #2d3a52;color:#9fc3ff;
+    padding:3px 8px;border-radius:999px;font-size:11px;margin-left:8px}
+  .thumb{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid #2a2a31;background:#0d0e12}
 </style>
 </head>
 <body>
@@ -170,6 +174,7 @@
         <input id="pdf_title" type="text" placeholder="Título (opcional)">
         <button id="btnIngestPDF" class="btn">Ingerir PDF</button>
         <div class="res" id="resPDF">{}</div>
+        <div class="tiny">Para Google Drive, podes colar o link “view” — fazemos a conversão para download direto.</div>
       </div>
 
       <!-- Pesquisar (RAG) -->
@@ -181,7 +186,7 @@
         <div class="res" id="resSearch">{}</div>
       </div>
 
-      <!-- Extrair URLs do Sitemap -->
+      <!-- Extrair URLs do Sitemap (com fallback) -->
       <div class="tile">
         <h3>Extrair URLs do Sitemap</h3>
         <div class="inline">
@@ -193,14 +198,15 @@
         <div class="row" style="justify-content:flex-end;gap:8px">
           <button id="btnCopyExtract" class="btn" disabled>Copiar tudo</button>
         </div>
+        <div class="tiny">Tenta primeiro no servidor. Se falhar, cai para extração no cliente (pode falhar por CORS).</div>
       </div>
 
       <!-- Ingerir em lote (lista de URLs) -->
       <div class="tile">
         <h3>Ingerir em lote (lista de URLs)</h3>
-        <textarea id="batchUrls" placeholder="Uma URL por linha…"></textarea>
+        <textarea id="batchUrls" placeholder="Uma URL por linha (também aceita separado por vírgulas ou espaços)…"></textarea>
         <div class="inline">
-          <input id="batchNamespace" type="text" placeholder="namespace (opcional)">
+          <input id="batchNamespace" type="text" placeholder="namespace (opcional, senão usa o da barra)">
           <input id="batchDeadline" type="number" value="900" min="10" placeholder="deadline_s">
           <input id="batchConcurrency" type="number" value="3" min="1" max="10" placeholder="concorrência">
         </div>
@@ -213,18 +219,17 @@
         </div>
       </div>
 
-      <!-- 🔶 Catálogo (ações) -->
+      <!-- 🔶 Catálogo (tile compacto; editor está em baixo) -->
       <div class="tile">
         <h3>Catálogo</h3>
         <div class="inline">
-          <input id="catLimit" type="number" value="200" min="10" step="10" placeholder="limite p/ gerar do RAG">
+          <input id="catLimit" type="number" value="200" min="10" step="10" placeholder="limite para gerar do RAG">
           <button id="btnCatalogFromRag" class="btn">Construir do RAG</button>
-          <button id="btnCatalogOpen" class="btn">Abrir Catálogo</button>
         </div>
-        <div class="tiny">“Construir do RAG” lê o índice existente e preenche/atualiza a tabela SQLite.</div>
+        <div class="tiny">“Construir do RAG” não reingere — lê o índice existente e preenche/atualiza a tabela.</div>
 
         <h4 style="margin:10px 0 4px 0;font-size:13px;color:var(--muted)">Adicionar URLs ao Catálogo (log linha a linha)</h4>
-        <textarea id="catUrls" placeholder="Uma URL por linha…" style="min-height:120px"></textarea>
+        <textarea id="catUrls" placeholder="Uma URL por linha (ou separadas por vírgulas/espaços)…" style="min-height:120px"></textarea>
         <div class="inline">
           <input id="catNs" type="text" placeholder="namespace (opcional)">
           <button id="btnCatalogAddUrls" class="btn">Adicionar ao Catálogo</button>
@@ -236,46 +241,53 @@
 
     </section>
 
-    <!-- 🔶 Viewer do Catálogo (full-width, abaixo dos tiles) -->
-    <section id="catalogViewer" style="display:none">
-      <div id="catalogControls">
-        <div class="inline" style="flex:1">
-          <input id="catSearch" type="text" placeholder="Pesquisar no catálogo (nome, resumo, URL)…">
-          <button id="btnCatSearch" class="btn">Pesquisar</button>
-        </div>
-        <span class="pill">Edição: <span id="editState">OFF</span></span>
-        <button id="btnToggleEdit" class="btn">Alternar Edição</button>
-        <button id="btnCopyJSON" class="btn">Copiar JSON</button>
-        <button id="btnCopyCSV" class="btn">Copiar CSV</button>
-        <div id="catalogInfo">—</div>
+    <!-- ====== SECÇÃO GRANDE: Catálogo (Editor) ====== -->
+    <section id="catalogEditor" class="catalog-editor">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <h2 style="margin:0;font-size:16px">Catálogo (Editor)</h2>
+        <span id="catChangedBadge" class="badge-changed" style="display:none">Alterações por gravar</span>
       </div>
 
-      <div style="max-height:52vh;overflow:auto;border:1px solid var(--chip-br);border-radius:10px">
-        <table class="catalog" id="catalogTable">
-          <thead><tr>
-            <th style="width:14%">Nome</th>
-            <th style="width:24%">Resumo</th>
-            <th style="width:20%">URL</th>
-            <th style="width:7%">Fonte</th>
-            <!-- novos campos -->
-            <th style="width:6%">REF</th>
-            <th style="width:6%">Preço</th>
-            <th style="width:5%">Moeda</th>
-            <th style="width:6%">IVA %</th>
-            <th style="width:8%">Marca</th>
-            <th style="width:10%">Dimensões</th>
-            <th style="width:12%">Material</th>
-            <th style="width:10%">Imagem</th>
-          </tr></thead>
+      <div class="catalog-toolbar">
+        <input id="catSearch" type="text" placeholder="filtrar por nome, resumo ou URL…" style="min-width:260px">
+        <input id="catPageSize" type="number" value="50" min="10" max="500" step="10" style="width:110px" title="itens por página">
+        <button id="catLoad" class="btn">Carregar</button>
+        <div class="right">
+          <button id="catSave" class="btn">Aplicar alterações</button>
+          <button id="catCopyPatch" class="btn">Copiar alterações (JSON)</button>
+        </div>
+      </div>
+
+      <div id="catTableWrap" style="max-height:540px;overflow:auto;border:1px solid var(--chip-br);border-radius:10px">
+        <table id="catTable">
+          <thead>
+            <tr>
+              <th style="width:3%">#</th>
+              <th style="width:7%">Thumb</th>
+              <th style="width:8%">Ref</th>
+              <th style="width:13%">Nome</th>
+              <th style="width:22%">Resumo</th>
+              <th style="width:9%">Preço</th>
+              <th style="width:6%">Moeda</th>
+              <th style="width:6%">IVA %</th>
+              <th style="width:10%">Marca</th>
+              <th style="width:12%">Dimensões</th>
+              <th style="width:12%">Material</th>
+              <th style="width:18%">URL</th>
+              <th style="width:8%">Fonte</th>
+              <th style="width:11%">Atualizado</th>
+              <th style="width:7%">Ações</th>
+            </tr>
+          </thead>
           <tbody></tbody>
         </table>
       </div>
 
-      <div class="row" style="align-items:center;margin-top:10px">
-        <div class="tiny" id="catInfo">—</div>
+      <div class="row" id="catPager2" style="margin-top:10px;align-items:center">
+        <div class="tiny" id="catInfo2">—</div>
         <div class="right">
-          <button id="catPrev" class="btn">◀</button>
-          <button id="catNext" class="btn">▶</button>
+          <button id="catPrev2" class="btn">◀</button>
+          <button id="catNext2" class="btn">▶</button>
         </div>
       </div>
     </section>
@@ -334,7 +346,7 @@
     return j;
   }
 
-  // ------- Tiles -------
+  // ------- Tiles existentes -------
   $('#btnIngestSitemap').addEventListener('click', async ()=>{
     const sitemap_url = $('#sitemap_url').value.trim(); if (!sitemap_url) return;
     const p = readCommon();
@@ -465,7 +477,6 @@
     const deadline_s = parseInt($('#batchDeadline').value || '0',10) || undefined;
     const concurrency = Math.max(1, Math.min(10, parseInt($('#batchConcurrency').value || '3',10)));
 
-    // UI init
     state.stop = false;
     $('#btnBatchStart').disabled = true;
     $('#btnBatchStop').disabled = false;
@@ -506,7 +517,6 @@
       done++; update();
     }
 
-    // scheduler com concorrência limitada
     let idx = 0, active = 0;
     await new Promise(resolve=>{
       const tick = ()=>{
@@ -531,7 +541,7 @@
     $('#btnBatchStop').disabled = true;
   });
 
-  // ------- Catálogo: construir do RAG, adicionar URLs -------
+  // ------- 🔶 Catálogo: construir do RAG, adicionar URLs com log -------
   async function buildCatalogFromRag(){
     const ns = $('#ns').value.trim() || undefined;
     const limit = Math.max(10, parseInt($('#catLimit').value || '200', 10));
@@ -540,6 +550,7 @@
     const res = await postJSON('/catalog/build-from-rag', { namespace: ns, limit });
     stopTimer(); $('#btnCatalogFromRag').disabled = false;
     printResult(res);
+    await loadCatalogEditor();
   }
   $('#btnCatalogFromRag').addEventListener('click', buildCatalogFromRag);
 
@@ -579,139 +590,193 @@
     }
 
     for (const u of urls) { // sequencial p/ ver o log ordenado
-      // eslint-disable-next-line no-await-in-loop
+      // eslint-disable-next-line no-await-pauses
       await addOne(u);
     }
 
     stopTimer();
     printResult({ ok:true, total: urls.length, ok, fail });
+    await loadCatalogEditor();
   });
 
-  // ------- Viewer do Catálogo (full-width) -------
-  let catOffset = 0, catLimit = 50, lastCount = 0, lastQuery = '';
-  let editMode = false;
+  // ====== Catálogo (Editor) grande, por baixo dos tiles ======
+  const Cat = {
+    offset: 0, limit: 50, query: '',
+    total: 0, items: [],
+    originalById: new Map(),
+    changes: new Map(), // id -> partial fields
+  };
 
-  function getTableJSON(){
-    const rows = [...document.querySelectorAll('#catalogTable tbody tr')];
-    return rows.map(tr=>{
-      const td = tr.querySelectorAll('td');
-      return {
-        name: td[0]?.textContent.trim() || '',
-        summary: td[1]?.textContent.trim() || '',
-        url: (td[2]?.querySelector('a')?.getAttribute('href')) || td[2]?.textContent.trim() || '',
-        source: td[3]?.textContent.trim() || '',
-        ref: td[4]?.textContent.trim() || '',
-        price: td[5]?.textContent.trim() || '',
-        currency: td[6]?.textContent.trim() || '',
-        iva_pct: td[7]?.textContent.trim() || '',
-        brand: td[8]?.textContent.trim() || '',
-        dimensions: td[9]?.textContent.trim() || '',
-        material: td[10]?.textContent.trim() || '',
-        image_url: td[11]?.textContent.trim() || '',
-      };
-    });
+  function markChanged(id, field, value){
+    const base = Cat.originalById.get(id) || {};
+    const current = Object.assign({}, base, Cat.changes.get(id)||{});
+    const baseVal = (current[field] ?? '');
+    const newVal = (value ?? '');
+    if (String(baseVal) === String(newVal)) {
+      const patch = Cat.changes.get(id) || {};
+      delete patch[field];
+      if (!Object.keys(patch).length) Cat.changes.delete(id);
+    } else {
+      const patch = Cat.changes.get(id)||{};
+      patch[field] = value;
+      Cat.changes.set(id, patch);
+    }
+    $('#catChangedBadge').style.display = Cat.changes.size ? 'inline-block' : 'none';
   }
 
-  function rowsToCSV(rows){
-    const header = ['name','summary','url','source','ref','price','currency','iva_pct','brand','dimensions','material','image_url'];
-    const esc = v => `"${String(v??'').replaceAll('"','""')}"`;
-    const lines = [header.map(esc).join(',')];
-    rows.forEach(r=> lines.push(header.map(k=>esc(r[k])).join(',')));
-    return lines.join('\n');
-  }
+  function escapeHtml(s){ return (s??'').toString().replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function val(v, d=''){ return (v===undefined || v===null) ? d : v; }
 
-  function applyEditMode(){
-    $('#editState').textContent = editMode ? 'ON' : 'OFF';
-    // editáveis: todas as colunas exceto a âncora URL clicável (mas deixamos editar texto fallback)
-    const tds = document.querySelectorAll('#catalogTable tbody td');
-    tds.forEach((cell, idx)=>{
-      // bloqueia a coluna 2 (URL) se tiver <a> (continua clicável)
-      if (idx % 12 === 2 && cell.querySelector('a')) {
-        cell.setAttribute('contenteditable', editMode ? 'false' : 'false');
-      } else {
-        cell.setAttribute('contenteditable', editMode ? 'true' : 'false');
-      }
-    });
-  }
-
-  async function loadCatalogPage(){
-    const q = lastQuery || '';
-    const limit = catLimit;
-    const offset = catOffset;
-    const url = `/catalog/list?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`;
+  async function loadCatalogEditor(){
+    Cat.limit = Math.max(10, Math.min(500, parseInt($('#catPageSize').value||'50',10)));
+    const url = `/catalog/list?q=${encodeURIComponent(Cat.query||'')}&limit=${Cat.limit}&offset=${Cat.offset}`;
     const r = await fetch(url);
-    const j = await r.json().catch(()=>({ ok:false }));
-    const table = $('#catalogTable tbody');
-    const info = $('#catInfo');
+    const j = await r.json().catch(()=>({ok:false}));
+    const tb = $('#catTable tbody'); const info = $('#catInfo2');
+    tb.innerHTML = '';
+    Cat.items = [];
+    Cat.originalById.clear();
+
     if (!j || j.ok === false || !Array.isArray(j.items)){
-      table.innerHTML = '';
+      tb.innerHTML = `<tr><td colspan="15">Falha a carregar catálogo.</td></tr>`;
       info.textContent = '—';
-      printResult(j || { ok:false, error:'catalog/list falhou' });
       return;
     }
-    table.innerHTML = '';
-    (j.items || []).forEach(row=>{
+
+    Cat.total = j.total || (j.items||[]).length + Cat.offset;
+
+    (j.items||[]).forEach((row, idx)=>{
+      const original = {
+        id: row.id,
+        image_url: val(row.image_url,''),
+        ref: val(row.ref,''),
+        name: val(row.name || row.title,''),
+        summary: val(row.summary || row.snippet,''),
+        price: val(row.price,''),
+        currency: val(row.currency,''),
+        iva_pct: val(row.iva_pct,''),
+        brand: val(row.brand,''),
+        dimensions: val(row.dimensions,''),
+        material: val(row.material,''),
+        url: val(row.url || row.link,''),
+        source: val(row.source || row.host,''),
+        updated_at: val(row.updated_at,'')
+      };
+      Cat.originalById.set(row.id, original);
+      Cat.items.push(original);
+
       const tr = document.createElement('tr');
-      const name = row.name || row.title || '-';
-      const url = row.url || row.link || '';
-      const src = row.source || row.host || '';
-      const summary = row.summary || row.snippet || '';
-      // campos extra: ainda não vêm do backend; mostramos vazios por omissão
+      const img = original.image_url
+        ? `<img class="thumb" src="${escapeHtml(original.image_url)}" onerror="this.src='';this.style.background='#0d0e12';">`
+        : `<div class="thumb"></div>`;
       tr.innerHTML = `
-        <td>${name}</td>
-        <td>${summary}</td>
-        <td>${ url ? `<a href="${url}" target="_blank" rel="noopener">${url}</a>` : '' }</td>
-        <td>${src||''}</td>
-        <td></td>   <!-- ref -->
-        <td></td>   <!-- price -->
-        <td>EUR</td><!-- currency default -->
-        <td>23</td> <!-- iva_pct default -->
-        <td></td>   <!-- brand -->
-        <td></td>   <!-- dimensions -->
-        <td></td>   <!-- material -->
-        <td></td>   <!-- image_url -->
+        <td>${Cat.offset + idx + 1}</td>
+        <td>${img}
+            <input type="text" placeholder="image_url…" value="${escapeHtml(original.image_url)}" data-id="${row.id}" data-field="image_url" style="margin-top:6px">
+        </td>
+        <td><input type="text" value="${escapeHtml(original.ref)}" data-id="${row.id}" data-field="ref"></td>
+        <td><input type="text" value="${escapeHtml(original.name)}" data-id="${row.id}" data-field="name"></td>
+        <td><textarea data-id="${row.id}" data-field="summary">${escapeHtml(original.summary)}</textarea></td>
+        <td><input type="number" step="0.01" placeholder="0.00" value="${escapeHtml(original.price)}" data-id="${row.id}" data-field="price"></td>
+        <td><input type="text" placeholder="EUR" value="${escapeHtml(original.currency)}" data-id="${row.id}" data-field="currency"></td>
+        <td><input type="number" step="0.01" placeholder="23" value="${escapeHtml(original.iva_pct)}" data-id="${row.id}" data-field="iva_pct"></td>
+        <td><input type="text" value="${escapeHtml(original.brand)}" data-id="${row.id}" data-field="brand"></td>
+        <td><input type="text" value="${escapeHtml(original.dimensions)}" data-id="${row.id}" data-field="dimensions"></td>
+        <td><input type="text" value="${escapeHtml(original.material)}" data-id="${row.id}" data-field="material"></td>
+        <td><input type="text" value="${escapeHtml(original.url)}" data-id="${row.id}" data-field="url"></td>
+        <td><input type="text" value="${escapeHtml(original.source)}" data-id="${row.id}" data-field="source"></td>
+        <td class="tiny">${escapeHtml(original.updated_at || '—')}</td>
+        <td><button class="btn" style="padding:6px 10px" data-act="reset" data-id="${row.id}">Repor</button></td>
       `;
-      table.appendChild(tr);
+      tb.appendChild(tr);
     });
-    $('#catalogViewer').style.display = 'block';
-    lastCount = (j.total||((j.items||[]).length+offset));
-    $('#catalogInfo').textContent = `offset ${offset} • mostrando ${(j.items||[]).length} de ${ lastCount }`;
-    applyEditMode();
+
+    // bind inputs
+    tb.querySelectorAll('input[type=text], textarea, input[type=number]').forEach(el=>{
+      el.addEventListener('input', (ev)=>{
+        const id = parseInt(ev.target.dataset.id,10);
+        const field = ev.target.dataset.field;
+        const valx = ev.target.value;
+        markChanged(id, field, valx);
+        if (field==='image_url'){
+          const row = ev.target.closest('tr');
+          const imgEl = row.querySelector('.thumb');
+          if (imgEl && imgEl.tagName==='IMG'){ imgEl.src = valx || ''; }
+        }
+      });
+    });
+    // botão repor
+    tb.querySelectorAll('button[data-act="reset"]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const id = parseInt(btn.dataset.id,10);
+        const orig = Cat.originalById.get(id);
+        if (!orig) return;
+        const row = btn.closest('tr');
+        row.querySelectorAll('[data-id]').forEach(el=>{
+          const f = el.dataset.field;
+          el.value = orig[f] ?? '';
+          if (f==='image_url'){
+            const imgEl = row.querySelector('.thumb');
+            if (imgEl && imgEl.tagName==='IMG'){ imgEl.src = orig[f] || ''; }
+          }
+        });
+        Cat.changes.delete(id);
+        $('#catChangedBadge').style.display = Cat.changes.size ? 'inline-block' : 'none';
+      });
+    });
+
+    const jItems = j.items || [];
+    document.getElementById('catInfo2').textContent =
+      `página: ${Math.floor(Cat.offset/Cat.limit)+1} • a mostrar ${ jItems.length } de ${Cat.total }${Cat.query?` • filtro: “${Cat.query}”`:''}`;
   }
 
-  $('#btnCatalogOpen').addEventListener('click', async ()=>{
-    catLimit = 50; catOffset = 0; lastQuery=''; await loadCatalogPage();
-  });
-  $('#catPrev').addEventListener('click', async ()=>{
-    catOffset = Math.max(0, catOffset - catLimit); await loadCatalogPage();
-  });
-  $('#catNext').addEventListener('click', async ()=>{
-    catOffset = catOffset + catLimit; await loadCatalogPage();
+  // Toolbar editor
+  $('#catLoad').addEventListener('click', ()=>{ Cat.query = $('#catSearch').value.trim(); Cat.offset=0; loadCatalogEditor(); });
+  $('#catPrev2').addEventListener('click', ()=>{ Cat.offset = Math.max(0, Cat.offset - Cat.limit); loadCatalogEditor(); });
+  $('#catNext2').addEventListener('click', ()=>{ Cat.offset = Cat.offset + Cat.limit; loadCatalogEditor(); });
+  $('#catPageSize').addEventListener('change', ()=>{ Cat.offset=0; loadCatalogEditor(); });
+
+  // Copiar patch (JSON)
+  $('#catCopyPatch').addEventListener('click', async ()=>{
+    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    const txt = JSON.stringify({ items: patch }, null, 2);
+    try{ await navigator.clipboard.writeText(txt); printResult({ ok:true, copied:true, count:patch.length }); }
+    catch{ printResult({ ok:true, copied:false, count:patch.length, payload:patch }); }
   });
 
-  $('#btnCatSearch').addEventListener('click', async ()=>{
-    lastQuery = ($('#catSearch').value || '').trim();
-    catOffset = 0;
-    await loadCatalogPage();
+  // Aplicar alterações (POST /catalog/update se existir)
+  $('#catSave').addEventListener('click', async ()=>{
+    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    if (!patch.length){ printResult({ ok:true, message:'Nada para gravar.'}); return; }
+    try{
+      const r = await fetch('/catalog/update', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ items: patch })
+      });
+      if (r.status === 404){
+        printResult({
+          ok:false,
+          error:"Endpoint /catalog/update não existe no backend.",
+          dica:"Usa “Copiar alterações (JSON)” e aplica no servidor, ou cria o endpoint /catalog/update."
+        });
+        return;
+      }
+      const j = await r.json().catch(()=>({ok:false}));
+      if (j && j.ok !== false){
+        Cat.changes.clear();
+        $('#catChangedBadge').style.display = 'none';
+        await loadCatalogEditor();
+        printResult({ ok:true, saved:true, server:j });
+      }else{
+        printResult({ ok:false, server:j||{} });
+      }
+    }catch(e){
+      printResult({ ok:false, error: String(e && e.message || e) });
+    }
   });
 
-  $('#btnToggleEdit').addEventListener('click', ()=>{
-    editMode = !editMode;
-    applyEditMode();
-  });
-
-  $('#btnCopyJSON').addEventListener('click', async ()=>{
-    const data = getTableJSON();
-    const txt = JSON.stringify(data, null, 2);
-    try{ await navigator.clipboard.writeText(txt); printResult({ok:true, copied:'json', items:data.length}); }catch{ printResult({ok:false, error:'Clipboard bloqueado'}); }
-  });
-
-  $('#btnCopyCSV').addEventListener('click', async ()=>{
-    const data = getTableJSON();
-    const csv = rowsToCSV(data);
-    try{ await navigator.clipboard.writeText(csv); printResult({ok:true, copied:'csv', lines:csv.split('\n').length}); }catch{ printResult({ok:false, error:'Clipboard bloqueado'}); }
-  });
-
+  // carregamento inicial do editor
+  document.addEventListener('DOMContentLoaded', ()=>{ loadCatalogEditor(); });
 })();
 </script>
 </body>
