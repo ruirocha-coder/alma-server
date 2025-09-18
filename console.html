@@ -71,10 +71,21 @@
   .list{background:var(--panel-2);border:1px solid var(--chip-br);border-radius:10px;padding:10px;max-height:220px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
   .ok{color:var(--ok)} .err{color:var(--err)}
 
-  table.catalog{width:100%;border-collapse:collapse;font-size:13px}
-  table.catalog th, table.catalog td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
-  table.catalog th{position:sticky;top:0;background:#111217;z-index:1}
-  table.catalog td a{color:#fff;text-decoration:underline}
+  /* ------- Catálogo (Editor grande) ------- */
+  .catalog-editor{margin-top:26px;background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--chip-br);border-radius:14px;padding:16px;box-shadow:var(--shadow)}
+  .catalog-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .catalog-toolbar .right{margin-left:auto}
+  .catalog-editor table{width:100%;border-collapse:collapse;font-size:13px}
+  .catalog-editor th,.catalog-editor td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
+  .catalog-editor thead th{position:sticky;top:0;background:#111217;z-index:1}
+  .catalog-editor td a{color:#fff;text-decoration:underline}
+  .catalog-editor input[type=text], .catalog-editor textarea{
+    background:#0f1014;border:1px solid #2a2a31;border-radius:8px; padding:8px;color:var(--text);width:100%}
+  .catalog-editor textarea{min-height:70px;resize:vertical}
+  .badge-changed{display:inline-block;background:#1f2531;border:1px solid #2d3a52;color:#9fc3ff;
+    padding:3px 8px;border-radius:999px;font-size:11px;margin-left:8px}
+  .thumb{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid #2a2a31}
 </style>
 </head>
 <body>
@@ -208,13 +219,12 @@
         </div>
       </div>
 
-      <!-- 🔶 Catálogo -->
+      <!-- 🔶 Catálogo (tile compacto; editor está em baixo) -->
       <div class="tile">
         <h3>Catálogo</h3>
         <div class="inline">
           <input id="catLimit" type="number" value="200" min="10" step="10" placeholder="limite para gerar do RAG">
           <button id="btnCatalogFromRag" class="btn">Construir do RAG</button>
-          <button id="btnCatalogOpen" class="btn">Abrir Catálogo</button>
         </div>
         <div class="tiny">“Construir do RAG” não reingere — lê o índice existente e preenche/atualiza a tabela.</div>
 
@@ -227,28 +237,53 @@
         <div class="progress"><div id="catBar"></div></div>
         <div class="tiny" id="catStats">0/0 • OK: 0 • Falhas: 0</div>
         <div class="list" id="catList"></div>
-
-        <div id="catalogTableWrap" style="margin-top:12px;max-height:280px;overflow:auto;border:1px solid var(--chip-br);border-radius:10px;display:none">
-          <table class="catalog" id="catalogTable">
-            <thead><tr>
-              <th style="width:20%">Nome</th>
-              <th style="width:45%">Resumo</th>
-              <th style="width:25%">URL</th>
-              <th style="width:10%">Fonte</th>
-            </tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <div class="row" id="catPager" style="display:none;align-items:center">
-          <div class="tiny" id="catInfo">—</div>
-          <div class="right">
-            <button id="catPrev" class="btn">◀</button>
-            <button id="catNext" class="btn">▶</button>
-          </div>
-        </div>
       </div>
 
     </section>
+
+    <!-- ====== SECÇÃO GRANDE: Catálogo (Editor) ====== -->
+    <section id="catalogEditor" class="catalog-editor">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <h2 style="margin:0;font-size:16px">Catálogo (Editor)</h2>
+        <span id="catChangedBadge" class="badge-changed" style="display:none">Alterações por gravar</span>
+      </div>
+
+      <div class="catalog-toolbar">
+        <input id="catSearch" type="text" placeholder="filtrar por nome, resumo ou URL…" style="min-width:260px">
+        <input id="catPageSize" type="number" value="50" min="10" max="500" step="10" style="width:110px" title="itens por página">
+        <button id="catLoad" class="btn">Carregar</button>
+        <div class="right">
+          <button id="catSave" class="btn">Aplicar alterações</button>
+          <button id="catCopyPatch" class="btn">Copiar alterações (JSON)</button>
+        </div>
+      </div>
+
+      <div id="catTableWrap" style="max-height:540px;overflow:auto;border:1px solid var(--chip-br);border-radius:10px">
+        <table id="catTable">
+          <thead>
+            <tr>
+              <th style="width:3%">#</th>
+              <th style="width:14%">Nome</th>
+              <th style="width:28%">Resumo</th>
+              <th style="width:26%">URL</th>
+              <th style="width:10%">Fonte</th>
+              <th style="width:12%">Atualizado</th>
+              <th style="width:7%">Ações</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="row" id="catPager2" style="margin-top:10px;align-items:center">
+        <div class="tiny" id="catInfo2">—</div>
+        <div class="right">
+          <button id="catPrev2" class="btn">◀</button>
+          <button id="catNext2" class="btn">▶</button>
+        </div>
+      </div>
+    </section>
+
   </div>
 
 <script>
@@ -389,9 +424,7 @@
         try{ await navigator.clipboard.writeText(outTA.value); }catch{}
         printResult({ ok:true, via:'server', count:srv.urls.length });
       }
-    }catch(e){
-      // ignora e tenta cliente
-    }
+    }catch(e){}
 
     // 2) fallback cliente (CORS pode falhar)
     if (!usedServer){
@@ -502,7 +535,7 @@
     $('#btnBatchStop').disabled = true;
   });
 
-  // ------- 🔶 Catálogo: construir do RAG, adicionar URLs com log, abrir tabela -------
+  // ------- 🔶 Catálogo: construir do RAG, adicionar URLs com log -------
   async function buildCatalogFromRag(){
     const ns = $('#ns').value.trim() || undefined;
     const limit = Math.max(10, parseInt($('#catLimit').value || '200', 10));
@@ -511,10 +544,11 @@
     const res = await postJSON('/catalog/build-from-rag', { namespace: ns, limit });
     stopTimer(); $('#btnCatalogFromRag').disabled = false;
     printResult(res);
+    // refrescar lista do editor após construir
+    await loadCatalogEditor();
   }
   $('#btnCatalogFromRag').addEventListener('click', buildCatalogFromRag);
 
-  // adicionar URLs ao catálogo (log linha a linha)
   $('#btnCatalogAddUrls').addEventListener('click', async ()=>{
     const raw = $('#catUrls').value.trim();
     const urls = raw.split(/[\s,]+/).map(s=>s.trim()).filter(Boolean);
@@ -550,59 +584,155 @@
       done++; update();
     }
 
-    for (const u of urls) { /* sequencial p/ ver o log ordenado; muda para paralelo se quiseres */
+    for (const u of urls) { /* sequencial p/ ver o log ordenado */
       // eslint-disable-next-line no-await-in-loop
       await addOne(u);
     }
 
     stopTimer();
     printResult({ ok:true, total: urls.length, ok, fail });
+    await loadCatalogEditor();
   });
 
-  // abrir tabela do catálogo
-  let catOffset = 0, catLimit = 50, lastCount = 0, lastQuery = '';
-  async function loadCatalogPage(){
-    const q = ''; // podes ligar a um input de pesquisa no futuro
-    const limit = catLimit;
-    const offset = catOffset;
-    const url = `/catalog/list?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`;
-    const r = await fetch(url);
-    const j = await r.json().catch(()=>({ ok:false }));
-    const wrap = $('#catalogTableWrap'); const tb = $('#catalogTable tbody'); const info = $('#catInfo'); const pager = $('#catPager');
-    if (!j || j.ok === false || !Array.isArray(j.items)){
-      wrap.style.display = 'none'; pager.style.display = 'none';
-      printResult(j || { ok:false, error:'catalog/list falhou' }); return;
+  // ====== Catálogo (Editor) grande, por baixo dos tiles ======
+  const Cat = {
+    offset: 0, limit: 50, query: '',
+    total: 0, items: [],
+    originalById: new Map(),
+    changes: new Map(), // id -> partial {name, summary, url, source}
+  };
+
+  function markChanged(id, field, value){
+    const base = Cat.originalById.get(id) || {};
+    const current = Object.assign({}, base, Cat.changes.get(id)||{});
+    if (current[field] === value) {
+      const patch = Cat.changes.get(id) || {};
+      delete patch[field];
+      if (!Object.keys(patch).length) Cat.changes.delete(id);
+    } else {
+      const patch = Cat.changes.get(id)||{};
+      patch[field] = value;
+      Cat.changes.set(id, patch);
     }
+    $('#catChangedBadge').style.display = Cat.changes.size ? 'inline-block' : 'none';
+  }
+
+  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  async function loadCatalogEditor(){
+    Cat.limit = Math.max(10, Math.min(500, parseInt($('#catPageSize').value||'50',10)));
+    const url = `/catalog/list?q=${encodeURIComponent(Cat.query||'')}&limit=${Cat.limit}&offset=${Cat.offset}`;
+    const r = await fetch(url);
+    const j = await r.json().catch(()=>({ok:false}));
+    const tb = $('#catTable tbody'); const info = $('#catInfo2');
     tb.innerHTML = '';
-    (j.items || []).forEach(row=>{
+    Cat.items = [];
+    Cat.originalById.clear();
+
+    if (!j || j.ok === false || !Array.isArray(j.items)){
+      tb.innerHTML = `<tr><td colspan="7">Falha a carregar catálogo.</td></tr>`;
+      info.textContent = '—';
+      return;
+    }
+
+    Cat.total = j.total || (j.items||[]).length + Cat.offset;
+
+    (j.items||[]).forEach((row, idx)=>{
+      const original = {
+        id: row.id, name: row.name || '', summary: row.summary || '',
+        url: row.url || '', source: row.source || '', updated_at: row.updated_at || ''
+      };
+      Cat.originalById.set(row.id, original);
+      Cat.items.push(original);
+
       const tr = document.createElement('tr');
-      const name = row.name || row.title || '-';
-      const url = row.url || row.link || '';
-      const src = row.source || row.host || '';
-      const summary = row.summary || row.snippet || '';
       tr.innerHTML = `
-        <td>${name}</td>
-        <td>${summary}</td>
-        <td>${ url ? `<a href="${url}" target="_blank" rel="noopener">${url}</a>` : '—' }</td>
-        <td>${src||'—'}</td>
+        <td>${Cat.offset + idx + 1}</td>
+        <td><input type="text" value="${escapeHtml(original.name)}" data-id="${row.id}" data-field="name"></td>
+        <td><textarea data-id="${row.id}" data-field="summary">${escapeHtml(original.summary)}</textarea></td>
+        <td><input type="text" value="${escapeHtml(original.url)}" data-id="${row.id}" data-field="url"></td>
+        <td><input type="text" value="${escapeHtml(original.source)}" data-id="${row.id}" data-field="source"></td>
+        <td class="tiny">${original.updated_at || '—'}</td>
+        <td><button class="btn" style="padding:6px 10px" data-act="reset" data-id="${row.id}">Repor</button></td>
       `;
       tb.appendChild(tr);
     });
-    wrap.style.display = 'block';
-    pager.style.display = 'flex';
-    lastCount = (j.total||((j.items||[]).length+offset));
-    info.textContent = `offset ${offset} • mostrando ${ (j.items||[]).length } de ${ lastCount }`;
+
+    // bind inputs
+    tb.querySelectorAll('input[type=text], textarea').forEach(el=>{
+      el.addEventListener('input', (ev)=>{
+        const id = parseInt(ev.target.dataset.id,10);
+        const field = ev.target.dataset.field;
+        const val = ev.target.value;
+        markChanged(id, field, val);
+      });
+    });
+    // botão repor
+    tb.querySelectorAll('button[data-act="reset"]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        const id = parseInt(btn.dataset.id,10);
+        const orig = Cat.originalById.get(id);
+        if (!orig) return;
+        const row = btn.closest('tr');
+        row.querySelectorAll('[data-id]').forEach(el=>{
+          const f = el.dataset.field;
+          el.value = orig[f] || '';
+        });
+        Cat.changes.delete(id);
+        $('#catChangedBadge').style.display = Cat.changes.size ? 'inline-block' : 'none';
+      });
+    });
+
+    info.textContent = `página: ${Math.floor(Cat.offset/Cat.limit)+1} • a mostrar ${ (j.items||[]).length } de ${Cat.total }${Cat.query?` • filtro: “${Cat.query}”`:''}`;
   }
-  $('#btnCatalogOpen').addEventListener('click', async ()=>{
-    catLimit = 50; catOffset = 0; await loadCatalogPage();
-  });
-  $('#catPrev').addEventListener('click', async ()=>{
-    catOffset = Math.max(0, catOffset - catLimit); await loadCatalogPage();
-  });
-  $('#catNext').addEventListener('click', async ()=>{
-    catOffset = catOffset + catLimit; await loadCatalogPage();
+
+  // Toolbar editor
+  $('#catLoad').addEventListener('click', ()=>{ Cat.query = $('#catSearch').value.trim(); Cat.offset=0; loadCatalogEditor(); });
+  $('#catPrev2').addEventListener('click', ()=>{ Cat.offset = Math.max(0, Cat.offset - Cat.limit); loadCatalogEditor(); });
+  $('#catNext2').addEventListener('click', ()=>{ Cat.offset = Cat.offset + Cat.limit; loadCatalogEditor(); });
+  $('#catPageSize').addEventListener('change', ()=>{ Cat.offset=0; loadCatalogEditor(); });
+
+  // Copiar patch (JSON)
+  $('#catCopyPatch').addEventListener('click', async ()=>{
+    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    const txt = JSON.stringify({ items: patch }, null, 2);
+    try{ await navigator.clipboard.writeText(txt); printResult({ ok:true, copied:true, count:patch.length }); }
+    catch{ printResult({ ok:true, copied:false, count:patch.length, payload:patch }); }
   });
 
+  // Aplicar alterações (POST /catalog/update se existir)
+  $('#catSave').addEventListener('click', async ()=>{
+    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    if (!patch.length){ printResult({ ok:true, message:'Nada para gravar.'}); return; }
+    try{
+      const r = await fetch('/catalog/update', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ items: patch })
+      });
+      if (r.status === 404){
+        printResult({
+          ok:false,
+          error:"Endpoint /catalog/update não existe no backend.",
+          dica:"Usa “Copiar alterações (JSON)” e aplica manualmente, ou cria o endpoint /catalog/update."
+        });
+        return;
+      }
+      const j = await r.json().catch(()=>({ok:false}));
+      if (j && j.ok !== false){
+        Cat.changes.clear();
+        $('#catChangedBadge').style.display = 'none';
+        await loadCatalogEditor();
+        printResult({ ok:true, saved:true, server:j });
+      }else{
+        printResult({ ok:false, server:j||{} });
+      }
+    }catch(e){
+      printResult({ ok:false, error: String(e && e.message || e) });
+    }
+  });
+
+  // carregamento inicial do editor
+  document.addEventListener('DOMContentLoaded', ()=>{ loadCatalogEditor(); });
 })();
 </script>
 </body>
