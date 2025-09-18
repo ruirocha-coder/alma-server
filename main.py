@@ -1514,8 +1514,353 @@ def _catalog_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+
+
 def _now():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+# =========================  BEGIN: CATALOGO — MIGRA, LISTA, ENRICH  =========================
+# (cola este bloco tal-qual no teu main.py; não duplica endpoints se substituíres o /catalog/list)
+
+import os, re, json
+from typing import Any, Dict, Optional, List
+
+# --- Fallbacks suaves (caso não existam definidos acima no ficheiro) ---
+try:
+    DEFAULT_NAMESPACE  # type: ignore # definido noutro sítio?
+except NameError:
+    DEFAULT_NAMESPACE = os.getenv("DEFAULT_NAMESPACE", "default")
+
+try:
+    log  # type: ignore
+except NameError:  # logger mínimo
+    import logging
+    log = logging.getLogger("alma")
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO)
+
+try:
+    from fastapi import Request
+except Exception:
+    # FastAPI já deve existir no projeto; este fallback só evita NameError no import.
+    Request = Any  # type: ignore
+
+# search_chunks vem do teu RAG; se não existir aqui, criamos stub (não falha arranque)
+if "search_chunks" not in globals():
+    def search_chunks(query: str, namespace: str, top_k: int = 6) -> List[Dict[str, Any]]:
+        return []  # stub
+
+# _catalog_conn / _now devem existir no teu main; se não existirem, avisa no log.
+if "_catalog_conn" not in globals():
+    raise RuntimeError("Falta a função _catalog_conn() no main.py")
+if "_now" not in globals():
+    raise RuntimeError("Falta a função _now() no main.py")
+
+# ====== PATCH A: migração de colunas e helpers de extração ======
+def _ensure_column(col: str, decl: str):
+    with _catalog_conn() as c:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(catalog_items)")}
+        if col not in cols:
+            c.execute(f"ALTER TABLE catalog_items ADD COLUMN {decl}")
+            log.info("[catalog/sqlite] coluna adicionada: %s", col)
+
+def _catalog_migrate():
+    _ensure_column("ref", "TEXT")
+    _ensure_column("price", "REAL")
+    _ensure_column("currency", "TEXT")
+    _ensure_column("iva_pct", "REAL")
+    _ensure_column("brand", "TEXT")
+    _ensure_column("dimensions", "TEXT")
+    _ensure_column("material", "TEXT")
+    _ensure_column("image_url", "TEXT")
+
+_catalog_migrate()
+
+# --- regex e parsers ---
+_PRICE_RX = re.compile(r"(?:€|eur)\s*([0-9]+(?:[.\s][0-9]{3})*(?:,[0-9]{2})?)", re.I)
+_DIM_RX   = re.compile(r"(\b\d{2,3}\s?[x×]\s?\d{2,3}(?:\s?[x×]\s?\d{2,3})?\b)", re.I)
+_REF_RX   = re.compile(r"\b(?:ref(?:\.|:)?\s*|sku[:\s]*)?([A-Z0-9][A-Z0-9\.\-_/]{2,})\b", re.I)
+_BRAND_RX = re.compile(r"\b(?:marca|brand)[:\s\-]*([A-Za-z0-9ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç &/\-]{2,40})", re.I)
+_MAT_RX   = re.compile(r"\b(?:material|acabamento)[:\s\-]*([A-Za-z0-9ÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç ,/\-]{3,120})", re.I)
+
+def _parse_money_eu(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    t = str(s).strip()
+    # Ex.: "1 299,00" | "1.299,00" | "1299,00" | "1299"
+    t = t.replace("\u00A0", " ").replace(".", "").replace(" ", "")
+    if "," in t:
+        t = t.replace(".", "")
+        t = t.replace(",", ".")
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+def _from_meta(meta: Dict[str, Any], *keys, default=""):
+    for k in keys:
+        v = meta.get(k)
+        if v not in (None, "", []):
+            return v
+    return default
+
+def _extract_enrich_fields(meta: Dict[str, Any]) -> Dict[str, Any]:
+    text = _from_meta(meta, "text", "content", "body", "snippet", default="") or ""
+    title = (meta.get("title") or "").strip()
+
+    price = meta.get("price")
+    currency = (meta.get("currency") or "EUR").upper()
+
+    if price in (None, "", 0):
+        m = _PRICE_RX.search(text) or _PRICE_RX.search(title)
+        if m:
+            price = _parse_money_eu(m.group(1))
+
+    iva_pct = meta.get("iva_pct") or 23
+
+    ref = _from_meta(meta, "ref", "sku", "reference", default="")
+    if not ref:
+        m = _REF_RX.search(text)
+        if m:
+            ref = m.group(1).strip()
+
+    brand = _from_meta(meta, "brand", "marca", default="")
+    if not brand:
+        m = _BRAND_RX.search(text)
+        if m:
+            brand = m.group(1).strip()
+
+    dimensions = _from_meta(meta, "dimensions", "dim", "size", default="")
+    if not dimensions:
+        m = _DIM_RX.search(text)
+        if m:
+            dimensions = m.group(1).replace("×", "x").strip()
+
+    material = _from_meta(meta, "material", "acabamento", default="")
+    if not material:
+        m = _MAT_RX.search(text)
+        if m:
+            material = m.group(1).strip()
+
+    image_url = _from_meta(meta, "image_url", "image", "thumbnail", default="")
+
+    return {
+        "ref": (ref or "")[:80],
+        "price": float(price) if isinstance(price, (int, float)) else (price if price is None else None),
+        "currency": (currency or "EUR")[:6],
+        "iva_pct": float(iva_pct) if str(iva_pct).strip() else None,
+        "brand": (brand or "")[:80],
+        "dimensions": (dimensions or "")[:160],
+        "material": (material or "")[:240],
+        "image_url": (image_url or "")[:512],
+    }
+
+
+
+# ====== PATCH D: enrich via LLM (endpoint + helpers) ======
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI()
+except Exception:
+    _openai_client = None
+
+_ENRICH_SYSTEM = (
+    "És um extrator de dados para catálogo de produto. "
+    "Devolve JSON estrito com os campos pedidos; se o dado não existir, usa null ou ''. "
+    "Não inventes preços ou dimensões — apenas extrai do texto."
+)
+
+def _rag_text_for_url(url: str, namespace: Optional[str]) -> str:
+    try:
+        hits = search_chunks(query=url, namespace=namespace or DEFAULT_NAMESPACE, top_k=8) or []
+        texts = []
+        # prioriza chunks da própria URL
+        for h in hits:
+            md = h.get("metadata") or {}
+            if md.get("url") == url:
+                texts.append(md.get("text") or h.get("text") or "")
+        if not texts:
+            for h in hits:
+                md = h.get("metadata") or {}
+                t = md.get("text") or h.get("text") or ""
+                if t:
+                    texts.append(t)
+        return ("\n\n".join(texts)).strip()[:20000]
+    except Exception as e:
+        log.warning("[catalog/enrich] falha a obter texto do RAG para %s: %s", url, e)
+        return ""
+
+def _llm_extract_struct(text: str) -> Dict[str, Any]:
+    if not _openai_client:
+        raise RuntimeError("OPENAI client indisponível (OPENAI_API_KEY?)")
+    prompt = (
+        "Extrai do texto seguinte os campos:\n"
+        "- ref (string curta)\n- price (número com ponto decimal; se vier com vírgula, converte)\n"
+        "- currency (ex.: EUR, USD)\n- iva_pct (número, ex.: 23)\n"
+        "- brand (string)\n- dimensions (string, ex.: 200x90x45 cm)\n"
+        "- material (string)\n- image_url (URL)\n\n"
+        "Texto:\n" + text[:16000]
+    )
+    resp = _openai_client.responses.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        response_format={"type": "json_object"},
+        input=[{"role": "system", "content": _ENRICH_SYSTEM},
+               {"role": "user", "content": prompt}]
+    )
+    data = json.loads(resp.output_text or "{}")
+    price_raw = data.get("price")
+    if isinstance(price_raw, str):
+        price_raw = _parse_money_eu(price_raw)
+    out = {
+        "ref": (data.get("ref") or "")[:80],
+        "price": float(price_raw) if price_raw not in (None, "", "null") else None,
+        "currency": (data.get("currency") or "EUR")[:6],
+        "iva_pct": float(data["iva_pct"]) if str(data.get("iva_pct","")).strip() not in ("", "null") else None,
+        "brand": (data.get("brand") or "")[:80],
+        "dimensions": (data.get("dimensions") or "")[:160],
+        "material": (data.get("material") or "")[:240],
+        "image_url": (data.get("image_url") or "")[:512],
+    }
+    return out
+
+@app.post("/catalog/enrich-llm")
+async def catalog_enrich_llm(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    ids: List[int] = data.get("ids") or []
+    limit = int(data.get("limit") or 30)
+    namespace = data.get("namespace") or None
+    force = bool(data.get("force") or False)
+
+    if not _openai_client:
+        return {"ok": False, "error": "OPENAI_API_KEY em falta ou cliente indisponível"}
+
+    # buscar itens alvo
+    with _catalog_conn() as c:
+        if ids:
+            qmarks = ",".join("?" for _ in ids)
+            cur = c.execute(
+                f"""SELECT id,url,name,summary,namespace,ref,price,currency,iva_pct,brand,dimensions,material,image_url
+                    FROM catalog_items WHERE id IN ({qmarks})""",
+                ids
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        else:
+            where = []
+            args: List[Any] = []
+            if namespace:
+                where.append("namespace=?")
+                args.append(namespace)
+            where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            cur = c.execute(
+                f"""SELECT id,url,name,summary,namespace,ref,price,currency,iva_pct,brand,dimensions,material,image_url
+                    FROM catalog_items
+                    {where_sql}
+                    ORDER BY updated_at DESC
+                    LIMIT ?""",
+                (*args, limit)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+
+    processed, patched = 0, 0
+    details = []
+
+    for r in rows:
+        need = force or any([
+            not r.get("price"),
+            not r.get("brand"),
+            not r.get("ref"),
+            not r.get("dimensions"),
+            not r.get("material"),
+            not r.get("image_url"),
+        ])
+        if not need:
+            continue
+
+        processed += 1
+        txt = _rag_text_for_url(r["url"], r.get("namespace"))
+        if not txt:
+            txt = f"{r.get('name') or ''}\n\n{r.get('summary') or ''}"
+
+        try:
+            llm_fields = _llm_extract_struct(txt)
+        except Exception as e:
+            details.append({"id": r["id"], "url": r["url"], "ok": False, "error": str(e)})
+            continue
+
+        patch = {k: v for k, v in llm_fields.items() if v not in (None, "", [])}
+        if not patch:
+            details.append({"id": r["id"], "url": r["url"], "ok": True, "changed": 0})
+            continue
+
+        with _catalog_conn() as c:
+            sets = []
+            vals = []
+            for k, v in patch.items():
+                sets.append(f"{k}=?")
+                vals.append(v)
+            vals.extend([_now(), r["id"]])
+            c.execute(f"UPDATE catalog_items SET {', '.join(sets)}, updated_at=? WHERE id=?", vals)
+
+        patched += 1
+        details.append({"id": r["id"], "url": r["url"], "ok": True, "changed": len(patch)})
+        if not ids and patched >= limit:
+            break
+
+    return {"ok": True, "processed": processed, "patched": patched, "items": details}
+
+# ====== PATCH C/E: helpers para usares dentro do teu build ======
+def catalog_apply_row_from_meta(namespace: Optional[str], *, title: str, summary: str,
+                                url: str, source: str = "rag", meta: Optional[Dict[str, Any]] = None):
+    """
+    Usa heurísticas para preencher campos e faz upsert numa só chamada.
+    Chama isto dentro do loop do teu /catalog/build-from-rag (ou /catalog/build).
+    """
+    meta = meta or {}
+    if not meta:
+        meta = {"title": title or "", "text": summary or ""}
+    extra = _extract_enrich_fields(meta)
+
+    _upsert_catalog_row(
+        namespace,
+        name=title,
+        summary=summary,
+        url=url,
+        source=source,
+        ref=extra.get("ref"),
+        price=extra.get("price"),
+        currency=extra.get("currency"),
+        iva_pct=extra.get("iva_pct"),
+        brand=extra.get("brand"),
+        dimensions=extra.get("dimensions"),
+        material=extra.get("material"),
+        image_url=extra.get("image_url"),
+    )
+
+async def catalog_auto_enrich_after_build(namespace: Optional[str], limit: int):
+    """
+    Para ser chamado no fim do /catalog/build-from-rag:
+      await catalog_auto_enrich_after_build(ns, limit)
+    Executa o enrich LLM apenas para campos vazios.
+    """
+    if not _openai_client:
+        log.info("[catalog/enrich] OPENAI client indisponível — a saltar enrich LLM")
+        return
+    try:
+        payload = {"limit": int(limit or 30), "namespace": namespace or None}
+        # chama o próprio endpoint internamente (para manter o mesmo caminho de código)
+        # mas sem HTTP roundtrip — chamamos a função directamente:
+        class _FakeReq:
+            async def json(self): return payload
+        res = await catalog_enrich_llm(_FakeReq())  # type: ignore
+        log.info("[catalog/enrich] auto após build: %s", res)
+    except Exception as e:
+        log.warning("[catalog/enrich] falha no enrich automático: %s", e)
+
+# ==========================  END: CATALOGO — MIGRA, LISTA, ENRICH  ==========================
 
 def _table_cols(c) -> set:
     cols = set()
@@ -1656,79 +2001,124 @@ def _upsert_catalog_row(ns: Optional[str],
                        ref, price, currency, iva_pct, brand, dimensions, material, image_url))
 
 # ---- Endpoints -------------------------------------------------------------------------
+# =====================  BEGIN PATCH I: /catalog/build (URLs)  =====================
+from fastapi import Request
+
 @app.post("/catalog/build")
 async def catalog_build(request: Request):
     """
-    Body: { "urls": ["https://...","..."], "namespace": "boasafra" }
-    Adiciona/atualiza URLs no catálogo, buscando título/sumário no RAG.
+    Adiciona/atualiza itens de catálogo a partir de uma lista de URLs.
+    Se vier meta por URL, usa; caso contrário grava com título/url e deixa enrich automático para depois.
     """
-    data = await request.json()
-    urls = data.get("urls") or []
-    namespace = (data.get("namespace") or None) or DEFAULT_NAMESPACE
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    ns     = (data.get("namespace") or DEFAULT_NAMESPACE) or None
+    urls   = data.get("urls") or []
+    metas  = data.get("metas") or {}  # opcional: dict {url: {...meta...}}
+    source = data.get("source") or "manual"
+    limit_for_enrich = min(max(len(urls), 1), 300)
+
     if not isinstance(urls, list) or not urls:
-        return {"ok": False, "error": "fornece 'urls': lista"}
+        return {"ok": False, "error": "Missing 'urls' list"}
+
     ok, fail = 0, 0
-    added = []
+    details = []
+
     for u in urls:
-        u = _canon_ig_url(str(u).strip()) or str(u).strip()
-        if not u:
-            continue
         try:
-            title, summary = _rag_lookup_by_url(u, namespace)
-            _upsert_catalog_row(namespace, title, summary, u, source="manual")
-            ok += 1; added.append({"url": u, "title": title})
+            m = metas.get(u) if isinstance(metas, dict) else None
+            title = (m or {}).get("title") or u
+            summary = (m or {}).get("summary") or (m or {}).get("text") or ""
+            catalog_apply_row_from_meta(
+                ns,
+                title   = title,
+                summary = summary,
+                url     = u,
+                source  = source,
+                meta    = m or {}
+            )
+            ok += 1
+            details.append({"url": u, "ok": True})
         except Exception as e:
             fail += 1
-            log.warning("[catalog] add fail url=%s err=%s", u, e)
-    return {"ok": True, "added": ok, "failed": fail, "items": added}
+            details.append({"url": u, "ok": False, "error": str(e)})
+
+    # enrich automático para preencher campos vazios das URLs recém-inseridas
+    await catalog_auto_enrich_after_build(ns, limit_for_enrich)
+
+    return {"ok": True, "namespace": ns or DEFAULT_NAMESPACE, "ok_count": ok, "fail_count": fail, "items": details}
+# ======================  END PATCH I: /catalog/build (URLs)  ======================
+
+# ======================  BEGIN PATCH H: /catalog/build-from-rag  ======================
+from fastapi import Request
 
 @app.post("/catalog/build-from-rag")
 async def catalog_build_from_rag(request: Request):
     """
-    Varre diretamente o Qdrant por namespace e preenche catálogo.
-    Body: { "namespace": "boasafra", "limit": 500 }
+    Lê do índice RAG existente e (re)preenche a tabela de catálogo.
+    No fim, corre enrich automático só para campos vazios (sem botões extra).
     """
-    data = await request.json()
-    namespace = (data.get("namespace") or DEFAULT_NAMESPACE).strip()
-    limit = int(data.get("limit") or 500)
-    limit = max(10, min(5000, limit))
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
 
-    seen = set()
-    rows = []
-    next_page = None
+    ns     = (data.get("namespace") or DEFAULT_NAMESPACE) or None
+    limit  = int(data.get("limit") or 200)
+    top_k  = int(data.get("top_k") or 50)
+    query  = data.get("query") or ""   # manter comportamento anterior se tinhas
+    source = "rag"
 
-    while len(rows) < limit:
-        points, next_page = qdrant.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=qm.Filter(
-                must=[qm.FieldCondition(
-                    key="namespace",
-                    match=qm.MatchValue(value=namespace)
-                )]
-            ),
-            limit=100,
-            offset=next_page
-        )
-        if not points:
-            break
-
-        for pt in points:
-            meta = pt.payload or {}
-            url = _canon_ig_url(meta.get("url") or "")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            title = (meta.get("title") or _name_from_url(url))[:160]
-            summary = _summary_from_match(meta) or ""
-            _upsert_catalog_row(namespace, title, summary, url, source="rag")
-            rows.append({"url": url, "title": title})
-            if len(rows) >= limit:
+    # 1) Buscar itens ao RAG — mantém a tua lógica antiga aqui.
+    #    Exemplo genérico: pesquisa ampla por namespace.
+    hits = []
+    try:
+        # Se já tinhas uma função própria de “listar documentos” do RAG, usa-a aqui.
+        # Este fallback usa search_chunks várias vezes para cobrir mais conteúdo.
+        q_list = [query] if query else ["*", "site", "produto", "catalogo"]
+        seen_urls = set()
+        for q in q_list:
+            for h in (search_chunks(q, namespace=ns or DEFAULT_NAMESPACE, top_k=top_k) or []):
+                md = h.get("metadata") or {}
+                url = md.get("url") or h.get("url") or ""
+                title = md.get("title") or md.get("name") or ""
+                text = md.get("text") or h.get("text") or ""
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                hits.append({"title": title, "summary": (md.get("summary") or md.get("snippet") or text[:600]), "url": url, "meta": md})
+                if len(hits) >= limit:
+                    break
+            if len(hits) >= limit:
                 break
+    except Exception as e:
+        log.warning("[catalog/build-from-rag] falha a ler RAG: %s", e)
+        hits = []
 
-        if not next_page:
-            break
+    # 2) Aplicar/atualizar linhas no catálogo (com heurísticas de extração do bloco G)
+    applied = 0
+    for it in hits:
+        try:
+            catalog_apply_row_from_meta(
+                ns,
+                title   = it.get("title") or it.get("meta", {}).get("title") or it.get("url"),
+                summary = it.get("summary") or it.get("meta", {}).get("text") or "",
+                url     = it.get("url"),
+                source  = source,
+                meta    = it.get("meta") or {}
+            )
+            applied += 1
+        except Exception as e:
+            log.warning("[catalog/build-from-rag] erro a aplicar item %s: %s", it.get("url"), e)
 
-    return {"ok": True, "namespace": namespace, "count": len(rows), "items": rows[:50]}
+    # 3) Enrich automático por LLM apenas para campos vazios
+    await catalog_auto_enrich_after_build(ns, limit)
+
+    return {"ok": True, "namespace": ns or DEFAULT_NAMESPACE, "applied": applied, "total_hits": len(hits)}
+# =======================  END PATCH H: /catalog/build-from-rag  =======================
 
 @app.post("/catalog/upsert")
 async def catalog_upsert(request: Request):
