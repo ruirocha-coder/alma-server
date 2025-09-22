@@ -219,24 +219,18 @@
         </div>
       </div>
 
-      <!-- 🔶 Catálogo (tile compacto; editor está em baixo) -->
+      <!-- 🔶 Catálogo (CSV Upload) -->
       <div class="tile">
-        <h3>Catálogo</h3>
+        <h3>Catálogo (Upload CSV)</h3>
         <div class="inline">
-          <input id="catLimit" type="number" value="200" min="10" step="10" placeholder="limite para gerar do RAG">
-          <button id="btnCatalogFromRag" class="btn">Construir do RAG</button>
+          <input id="catFile" type="file" accept=".csv">
+          <input id="catNsCsv" type="text" placeholder="namespace (opcional)">
+          <button id="btnCatalogUpload" class="btn">Importar CSV</button>
         </div>
-        <div class="tiny">“Construir do RAG” não reingere — lê o índice existente e preenche/atualiza a tabela.</div>
-
-        <h4 style="margin:10px 0 4px 0;font-size:13px;color:var(--muted)">Adicionar URLs ao Catálogo (log linha a linha)</h4>
-        <textarea id="catUrls" placeholder="Uma URL por linha (ou separadas por vírgulas/espaços)…" style="min-height:120px"></textarea>
-        <div class="inline">
-          <input id="catNs" type="text" placeholder="namespace (opcional)">
-          <button id="btnCatalogAddUrls" class="btn">Adicionar ao Catálogo</button>
-        </div>
-        <div class="progress"><div id="catBar"></div></div>
-        <div class="tiny" id="catStats">0/0 • OK: 0 • Falhas: 0</div>
-        <div class="list" id="catList"></div>
+        <div class="progress"><div id="catCsvBar"></div></div>
+        <div class="tiny" id="catCsvStats">—</div>
+        <div class="list" id="catCsvList"></div>
+        <div class="tiny">Formato flexível: deteta cabeçalhos comuns (name/title, summary/description, ref/sku, price, currency, iva_pct, brand, dimensions, material, image_url, url/link).</div>
       </div>
 
     </section>
@@ -541,62 +535,56 @@
     $('#btnBatchStop').disabled = true;
   });
 
-  // ------- 🔶 Catálogo: construir do RAG, adicionar URLs com log -------
-  async function buildCatalogFromRag(){
-    const ns = $('#ns').value.trim() || undefined;
-    const limit = Math.max(10, parseInt($('#catLimit').value || '200', 10));
-    setTask(`ação: catalog-from-rag`); setBadges([`namespace: ${ns||'default'}`, `limit: ${limit}`]);
-    startTimer(); $('#btnCatalogFromRag').disabled = true;
-    const res = await postJSON('/catalog/build-from-rag', { namespace: ns, limit });
-    stopTimer(); $('#btnCatalogFromRag').disabled = false;
-    printResult(res);
-    await loadCatalogEditor();
-  }
-  $('#btnCatalogFromRag').addEventListener('click', buildCatalogFromRag);
+  // ------- 🔶 Catálogo: Upload CSV -------
+  $('#btnCatalogUpload').addEventListener('click', async ()=>{
+    const fileInput = $('#catFile');
+    if (!fileInput.files.length) return;
+    const file = fileInput.files[0];
+    const ns = $('#catNsCsv').value.trim() || ($('#ns').value.trim() || undefined);
 
-  $('#btnCatalogAddUrls').addEventListener('click', async ()=>{
-    const raw = $('#catUrls').value.trim();
-    const urls = raw.split(/[\s,]+/).map(s=>s.trim()).filter(Boolean);
-    if (!urls.length) return;
+    setTask(`ação: catalog-upload-csv`);
+    setBadges([`ficheiro: ${file.name}`, `namespace: ${ns||'default'}`]);
+    startTimer(); $('#btnCatalogUpload').disabled = true;
 
-    const nsField = $('#catNs').value.trim();
-    const ns = nsField || ($('#ns').value.trim() || undefined);
-    const list = $('#catList'); list.innerHTML = '';
-    const bar = $('#catBar'); bar.style.width = '0%';
-    const statsEl = $('#catStats'); let done=0, ok=0, fail=0;
+    const list = $('#catCsvList'); list.innerHTML = '';
+    const bar = $('#catCsvBar'); bar.style.width = '0%';
+    const statsEl = $('#catCsvStats'); statsEl.textContent = 'a enviar…';
 
-    setTask(`ação: catalog-add-urls   urls: ${urls.length}`);
-    setBadges([`namespace: ${ns||'default'}`]);
-    startTimer();
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      if (ns) form.append('namespace', ns);
+      const r = await fetch('/catalog/import-csv',{ method:'POST', body: form });
+      const j = await r.json().catch(()=>({ok:false}));
+      stopTimer(); $('#btnCatalogUpload').disabled = false;
 
-    function update(){
-      const pct = Math.round((done/urls.length)*100);
-      bar.style.width = pct + '%';
-      statsEl.textContent = `${done}/${urls.length} • OK: ${ok} • Falhas: ${fail}`;
+      if (j && j.ok){
+        bar.style.width = '100%';
+        const imported = (typeof j.imported==='number') ? j.imported : (j.count||0);
+        const failed = (typeof j.failed==='number') ? j.failed : (j.errors||0);
+        statsEl.textContent = `Importados: ${imported} • Falhas: ${failed}`;
+        addLine(`✔ Importação concluída (OK: ${imported} • Falhas: ${failed})`, 'ok');
+        printResult(j);
+        await loadCatalogEditor();
+      } else {
+        statsEl.textContent = 'Falha no upload';
+        addLine(`✖ Erro: ${JSON.stringify(j).slice(0,200)}`, 'err');
+        printResult({ok:false,server:j});
+      }
+    } catch(e){
+      stopTimer(); $('#btnCatalogUpload').disabled = false;
+      statsEl.textContent = 'Falha geral';
+      addLine(`✖ Exceção: ${String(e)}`, 'err');
+      printResult({ok:false,error:String(e)});
     }
+
     function addLine(text, cls){
-      const div = document.createElement('div');
-      if (cls) div.className = cls;
-      div.textContent = text;
+      const div=document.createElement('div');
+      if (cls) div.className=cls;
+      div.textContent=text;
       list.appendChild(div);
-      list.scrollTop = list.scrollHeight;
+      list.scrollTop=list.scrollHeight;
     }
-    async function addOne(u){
-      addLine(`→ catalog/build ${u}`);
-      const res = await postJSON('/catalog/build', { urls:[u], namespace: ns });
-      if (res && res.ok !== false) { ok++; addLine(`✔ OK ${u}`, 'ok'); }
-      else { fail++; addLine(`✖ Falha ${u} :: ${JSON.stringify(res).slice(0,200)}`, 'err'); }
-      done++; update();
-    }
-
-    for (const u of urls) { // sequencial p/ ver o log ordenado
-      // eslint-disable-next-line no-await-pauses
-      await addOne(u);
-    }
-
-    stopTimer();
-    printResult({ ok:true, total: urls.length, ok, fail });
-    await loadCatalogEditor();
   });
 
   // ====== Catálogo (Editor) grande, por baixo dos tiles ======
