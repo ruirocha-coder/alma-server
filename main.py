@@ -1532,18 +1532,9 @@ def _table_cols(c) -> set:
     return cols
 
 def _ensure_cols(c):
-    """Garante colunas base + extra, sem quebrar DB já existente."""
     needed = {
-        "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
-        "namespace": "TEXT",
-        "name": "TEXT",
-        "summary": "TEXT",
-        "url": "TEXT UNIQUE",
-        "source": "TEXT",
-        "created_at": "TEXT",
-        "updated_at": "TEXT",
-        # extras (para orçamentos)
         "ref": "TEXT",
+        "summary": "TEXT",
         "price": "REAL",
         "currency": "TEXT",
         "iva_pct": "REAL",
@@ -1551,7 +1542,13 @@ def _ensure_cols(c):
         "dimensions": "TEXT",
         "material": "TEXT",
         "image_url": "TEXT",
+        "variant_attrs": "TEXT"  # 🔹 NOVA COLUNA
     }
+    c.execute("PRAGMA table_info(catalog)")
+    cols = {row[1] for row in c.fetchall()}
+    for k, t in needed.items():
+        if k not in cols:
+            c.execute(f"ALTER TABLE catalog ADD COLUMN {k} {t}")
     c.execute("""
     CREATE TABLE IF NOT EXISTS catalog_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1629,7 +1626,8 @@ def _upsert_catalog_row(ns: Optional[str],
                         brand: Optional[str] = None,
                         dimensions: Optional[str] = None,
                         material: Optional[str] = None,
-                        image_url: Optional[str] = None):
+                        image_url: Optional[str] = None,
+                        variant_attrs: Optional[str] = None):
     if not url:
         return
     with _catalog_conn() as c:
@@ -1645,18 +1643,20 @@ def _upsert_catalog_row(ns: Optional[str],
                              brand=COALESCE(?, brand),
                              dimensions=COALESCE(?, dimensions),
                              material=COALESCE(?, material),
-                             image_url=COALESCE(?, image_url)
+                             image_url=COALESCE(?, image_url),
+                             variant_attrs=COALESCE(?, variant_attrs)
                          WHERE url=?""",
                       (ns, name, summary, source, _now(),
                        ref, price, currency, iva_pct, brand, dimensions, material, image_url,
+                       variant_attrs,
                        url))
         else:
             c.execute("""INSERT INTO catalog_items(namespace,name,summary,url,source,created_at,updated_at,
-                                                  ref,price,currency,iva_pct,brand,dimensions,material,image_url)
+                                                  ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs)
                          VALUES (?,?,?,?,?,?,?,
-                                 ?,?,?,?,?,?,?,?)""",
+                                 ?,?,?,?,?,?,?,?,?)""",
                       (ns, name, summary, url, source, _now(), _now(),
-                       ref, price, currency, iva_pct, brand, dimensions, material, image_url))
+                       ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs))
 
 # ---- helpers extra (cola estes dois logo acima do endpoint /catalog/import-csv) --------
 import unicodedata
@@ -1700,26 +1700,73 @@ from fastapi import UploadFile, File, Form
 import csv
 
 # ---- Importação CSV --------------------------------------------------------------------
-# Aceita multipart (file=...) ou JSON {"csv_text": "..."}
+
+from fastapi import UploadFile, File, Form, Request
+from io import StringIO
+import csv, json
+
+def _build_variant_attrs(row: dict, header_norm: dict) -> dict:
+    """Extrai atributos de variante de forma genérica (Option*, Variant*, Size, Color…)."""
+    attrs = {}
+
+    def get(col_norm: str) -> str:
+        real = header_norm.get(col_norm)
+        if real is None: return ""
+        val = row.get(real, "")
+        return (val or "").strip()
+
+    # Guardar o URL base do produto, se existir
+    for key in ("product url", "url", "link", "product_url"):
+        if key in header_norm:
+            attrs["product_url"] = get(key)
+            break
+
+    # Shopify style
+    for i in (1, 2, 3):
+        n = get(f"option{i} name")
+        v = get(f"option{i} value")
+        if n and v:
+            attrs[n] = v
+
+    # BigCommerce style (algumas exports trazem colunas com "Option Set" / "Option ...")
+    # mapeamento laxo: qualquer coluna que contenha "option" entra
+    for norm_col, real_col in header_norm.items():
+        if "option" in norm_col and norm_col not in {
+            "option1 name","option1 value","option2 name","option2 value","option3 name","option3 value"
+        }:
+            val = (row.get(real_col) or "").strip()
+            if val:
+                attrs[real_col] = val
+
+    # Campos frequentes de variantes
+    for cand in ("color","cor","size","tamanho","finish","acabamento","material acabamento"):
+        if cand in header_norm:
+            v = get(cand)
+            if v:
+                attrs[cand] = v
+
+    return attrs
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(
+    request: Request,                   
     file: UploadFile = File(None),
     namespace: str = Form(None),
-    delimiter: str = Form(None),   # deixamos Sniffer decidir; este é só override
+    delimiter: str = Form(None),
     encoding: str = Form("utf-8")
 ):
+
     try:
-        # 1) ler CSV (file ou json.csv_text)
+        # 1) ler CSV
         csv_text = None
         if file is not None:
             raw = await file.read()
-            # tenta detectar encoding se vier “estranho”
             try:
                 csv_text = raw.decode(encoding or "utf-8", errors="replace")
             except Exception:
                 csv_text = raw.decode("utf-8", errors="replace")
         else:
-            # fallback: JSON body
+            # também aceita body JSON {"csv_text": "..."}
             try:
                 body = await request.json()
                 csv_text = (body.get("csv_text") or "").strip()
@@ -1732,7 +1779,7 @@ async def catalog_import_csv(
         if not csv_text:
             return {"ok": False, "error": "Falta CSV (file ou json.csv_text)"}
 
-        # 2) detetar delimiter (',' ou ';') se não vier especificado
+        # 2) delimiter
         if not delimiter:
             try:
                 sample = csv_text[:10000]
@@ -1741,38 +1788,36 @@ async def catalog_import_csv(
             except Exception:
                 delimiter = ","
 
-        # 3) preparar DictReader robusto
         f = StringIO(csv_text)
         reader = csv.DictReader(f, delimiter=delimiter)
         if not reader.fieldnames:
             return {"ok": False, "error": "CSV sem cabeçalhos"}
 
-        # 4) mapa de aliases (cobre BigCommerce)
-        alias = {
-            "url":       ["url", "link", "product url", "product_url"],
-            "name":      ["name", "title", "product name", "product_name"],
-            "summary":   ["summary", "descricao", "description", "product description", "body html", "body_html"],
-            "ref":       ["ref", "sku", "reference", "variant sku", "product code sku", "product code/sku"],
-            "price":     ["price", "price min", "variant price", "preco"],
-            "currency":  ["currency", "moeda"],
-            "iva_pct":   ["iva pct", "iva", "tax rate", "tax_rate", "vat"],
-            "brand":     ["brand", "brand name", "marca", "vendor"],
-            "dimensions":["dimensions", "dim", "size", "product dimensions"],
-            "material":  ["material", "materials", "acabamento", "material acabamento"],
-            "image_url": ["image url", "product image url - 1", "product image file - 1",
-                          "image", "thumbnail", "featured image", "image 1", "image1"],
-            "item_type": ["item type"],
-        }
-        # normalizar cabeçalhos existentes
+        # 3) normalização de headers
         header_norm = { _norm_header(h): h for h in reader.fieldnames if h is not None }
 
+        # aliases
+        alias = {
+            "item_type": ["item type","type","linha"],
+            "url":       ["product url","url","link","product_url"],
+            "name":      ["product name","name","title"],
+            "summary":   ["product description","description","body html","body_html","summary","descricao"],
+            "ref":       ["variant sku","sku","product code sku","product code/sku","reference","ref"],
+            "price":     ["variant price","price","price min","preco"],
+            "currency":  ["currency","moeda"],
+            "iva_pct":   ["iva pct","iva","tax rate","tax_rate","vat"],
+            "brand":     ["brand","brand name","marca","vendor"],
+            "dimensions":["dimensions","dim","size","product dimensions"],
+            "material":  ["material","materials","acabamento","material acabamento"],
+            "image_url": ["product image url - 1","product image file - 1","image url","image","thumbnail","featured image","image 1","image1"],
+        }
         def pick(row: dict, key: str) -> str:
             for k in alias.get(key, []):
-                col = header_norm.get(k)
-                if col:
-                    val = row.get(col, "")
-                    if val is not None and str(val).strip() != "":
-                        return str(val).strip()
+                real = header_norm.get(k)
+                if real:
+                    v = row.get(real, "")
+                    if v is not None and str(v).strip() != "":
+                        return str(v).strip()
             return ""
 
         ns = namespace or DEFAULT_NAMESPACE
@@ -1781,20 +1826,9 @@ async def catalog_import_csv(
 
         for row in reader:
             try:
-                item_type = pick(row, "item_type").lower()
-                raw_url   = pick(row, "url")
-                # ignorar variantes/linhas sem URL — BigCommerce exporta SKUs/opções
-                if not raw_url and item_type and item_type != "product":
-                    skipped += 1
-                    continue
-
-                url = _to_abs_ig_url(raw_url) if raw_url else ""
-                if not url:
-                    fail += 1
-                    details.append({"ok": False, "error": "linha sem URL válida", "name": pick(row,"name"), "url": ""})
-                    continue
-
-                name      = pick(row, "name") or pick(row, "ref") or url
+                item_type = (pick(row, "item_type") or "").lower().strip()
+                base_url  = pick(row, "url")  # pode estar vazio nas variantes em alguns exports
+                name      = pick(row, "name")
                 summary   = pick(row, "summary")
                 ref       = pick(row, "ref") or None
                 price     = _safe_float(pick(row, "price"), default=None)
@@ -1804,15 +1838,49 @@ async def catalog_import_csv(
                 dim       = pick(row, "dimensions") or None
                 material  = pick(row, "material") or None
                 image_url = pick(row, "image_url") or None
-                # nota: Product Image File - 1 costuma ser um caminho relativo do BC; guardamos “as is”
+
+                # construir attrs de variante (genérico)
+                vattrs = _build_variant_attrs(row, header_norm)
+                if base_url and "product_url" not in vattrs:
+                    vattrs["product_url"] = base_url
+
+                # ——— URL efetivo para garantir unicidade por variante ———
+                #   1) tenta usar o base_url tal como vem do CSV (pode ser //host/… ou /slug)
+                #   2) se for uma variante (item_type == 'variant' OU tem ref), anexar #sku=<ref>
+                #   3) normalizar para IG (https://interiorguider.com/…)
+                effective_url = ""
+                if base_url:
+                    effective_url = _to_abs_ig_url(base_url)
+                # se for variante, garantir unicidade por REF (#sku=REF)
+                is_variant = (item_type == "variant") or (ref is not None and ref != "")
+                if is_variant and ref:
+                    # guardar também a info no JSON de attrs
+                    vattrs["sku"] = ref
+                    if effective_url:
+                        effective_url = effective_url + f"#sku={ref}"
+
+                # Se apesar de tudo não houver URL, última tentativa:
+                if not effective_url and base_url:
+                    effective_url = _to_abs_ig_url(base_url)
+
+                # sem URL mesmo assim → falha (não vale a pena criar URLs fictícios)
+                if not effective_url:
+                    fail += 1
+                    details.append({"ok": False, "error": "linha sem URL válida", "name": name, "url": ""})
+                    continue
+
+                # nome de fallback
+                if not name:
+                    name = (ref or effective_url)
 
                 _upsert_catalog_row(
-                    ns, name=name, summary=summary, url=url, source="csv",
+                    ns, name=name, summary=summary, url=effective_url, source="csv",
                     ref=ref, price=price, currency=currency, iva_pct=iva,
-                    brand=brand, dimensions=dim, material=material, image_url=image_url
+                    brand=brand, dimensions=dim, material=material, image_url=image_url,
+                    variant_attrs=(json.dumps(vattrs, ensure_ascii=False) if vattrs else None)
                 )
                 ok += 1
-                details.append({"ok": True, "name": name, "url": url})
+                details.append({"ok": True, "name": name, "url": effective_url})
             except Exception as e:
                 fail += 1
                 details.append({"ok": False, "error": str(e)})
@@ -1822,13 +1890,12 @@ async def catalog_import_csv(
             "namespace": ns,
             "imported": ok,
             "failed": fail,
-            "skipped": skipped,   # linhas não-produto/sem URL (o console ignora se não quiseres mostrar)
+            "skipped": skipped,
             "items": details[:50]
         }
     except Exception as e:
         log.exception("catalog_import_csv_failed")
         return {"ok": False, "error": str(e)}
-
 # ---- CRUD leve -------------------------------------------------------------------------
 @app.post("/catalog/upsert")
 async def catalog_upsert(request: Request):
