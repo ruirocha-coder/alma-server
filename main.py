@@ -1658,6 +1658,37 @@ def _upsert_catalog_row(ns: Optional[str],
                       (ns, name, summary, url, source, _now(), _now(),
                        ref, price, currency, iva_pct, brand, dimensions, material, image_url))
 
+# ---- helpers extra (cola estes dois logo acima do endpoint /catalog/import-csv) --------
+import unicodedata
+from urllib.parse import urljoin
+
+def _norm_header(s: str) -> str:
+    s = (s or "").strip().lower().replace("\ufeff", "")
+    # trocar separadores por espaço
+    s = s.replace("/", " ").replace("_", " ").replace("-", " ")
+    # remover acentos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # compactar espaços
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _to_abs_ig_url(u: str) -> str:
+    """Converte /slug ou //host/path para https://interiorguider.com/slug e aplica canon IG."""
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = "https:" + u
+    if u.startswith("http://") or u.startswith("https://"):
+        return _canon_ig_url(u) or u
+    # relativo → juntar à raiz do IG
+    if not u.startswith("/"):
+        u = "/" + u
+    absu = f"https://{IG_HOST}{u}"
+    return _canon_ig_url(absu) or absu
+
+
 # ---- Importação CSV --------------------------------------------------------------------
 # Aceita:
 # - multipart/form-data com file=... (UploadFile) OU
@@ -1668,110 +1699,132 @@ def _upsert_catalog_row(ns: Optional[str],
 from fastapi import UploadFile, File, Form
 import csv
 
+# ---- Importação CSV --------------------------------------------------------------------
+# Aceita multipart (file=...) ou JSON {"csv_text": "..."}
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(
     file: UploadFile = File(None),
     namespace: str = Form(None),
-    delimiter: str = Form(None),         # deixa opcional (usamos Sniffer)
-    encoding: str = Form("utf-8"),
+    delimiter: str = Form(None),   # deixamos Sniffer decidir; este é só override
+    encoding: str = Form("utf-8")
 ):
-    """
-    Aceita multipart/form-data com 'file' (preferido).
-    Deteta delimitador (Sniffer). Cabeçalhos 'case-insensitive'.
-    Exige URL com http(s); linhas sem URL são ignoradas (failed += 1).
-    """
     try:
-        # 1) obter texto
-        if file is None:
-            return {"ok": False, "error": "Falta CSV (envia como multipart/form-data com 'file')"}
-        raw = await file.read()
-        text = raw.decode(encoding or "utf-8", errors="replace")
-        # normalizar quebras de linha
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-        # 2) detetar delimitador
-        delim = delimiter
-        if not delim:
+        # 1) ler CSV (file ou json.csv_text)
+        csv_text = None
+        if file is not None:
+            raw = await file.read()
+            # tenta detectar encoding se vier “estranho”
             try:
-                sniff = csv.Sniffer().sniff("\n".join(text.splitlines()[:20]), delimiters=";,|\t,")
-                delim = sniff.delimiter
+                csv_text = raw.decode(encoding or "utf-8", errors="replace")
             except Exception:
-                # fallback europeu primeiro
-                delim = ";" if text.split("\n",1)[0].count(";") >= text.split("\n",1)[0].count(",") else ","
+                csv_text = raw.decode("utf-8", errors="replace")
+        else:
+            # fallback: JSON body
+            try:
+                body = await request.json()
+                csv_text = (body.get("csv_text") or "").strip()
+                namespace = body.get("namespace") or namespace
+                delimiter = body.get("delimiter") or delimiter
+                encoding  = body.get("encoding")  or encoding
+            except Exception:
+                pass
 
-        # 3) ler CSV com DictReader + cabeçalhos normalizados
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return {"ok": False, "error": "CSV vazio"}
+        if not csv_text:
+            return {"ok": False, "error": "Falta CSV (file ou json.csv_text)"}
 
-        # DictReader já trata de aspas/escapes corretamente
-        reader = csv.DictReader(lines, delimiter=delim)
-        # normalizar nomes de coluna para minúsculas
-        fieldmap = {f: (f or "").strip().lower() for f in (reader.fieldnames or [])}
-        norm_fields = list(fieldmap.values())
+        # 2) detetar delimiter (',' ou ';') se não vier especificado
+        if not delimiter:
+            try:
+                sample = csv_text[:10000]
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+                delimiter = dialect.delimiter
+            except Exception:
+                delimiter = ","
 
-        def get(row, *names):
-            for n in names:
-                # procurar pelo nome normalizado
-                if n in norm_fields:
-                    # descobrir a chave original que mapeia para este normalizado
-                    for orig, norm in fieldmap.items():
-                        if norm == n:
-                            return (row.get(orig) or "").strip()
+        # 3) preparar DictReader robusto
+        f = StringIO(csv_text)
+        reader = csv.DictReader(f, delimiter=delimiter)
+        if not reader.fieldnames:
+            return {"ok": False, "error": "CSV sem cabeçalhos"}
+
+        # 4) mapa de aliases (cobre BigCommerce)
+        alias = {
+            "url":       ["url", "link", "product url", "product_url"],
+            "name":      ["name", "title", "product name", "product_name"],
+            "summary":   ["summary", "descricao", "description", "product description", "body html", "body_html"],
+            "ref":       ["ref", "sku", "reference", "variant sku", "product code sku", "product code/sku"],
+            "price":     ["price", "price min", "variant price", "preco"],
+            "currency":  ["currency", "moeda"],
+            "iva_pct":   ["iva pct", "iva", "tax rate", "tax_rate", "vat"],
+            "brand":     ["brand", "brand name", "marca", "vendor"],
+            "dimensions":["dimensions", "dim", "size", "product dimensions"],
+            "material":  ["material", "materials", "acabamento", "material acabamento"],
+            "image_url": ["image url", "product image url - 1", "product image file - 1",
+                          "image", "thumbnail", "featured image", "image 1", "image1"],
+            "item_type": ["item type"],
+        }
+        # normalizar cabeçalhos existentes
+        header_norm = { _norm_header(h): h for h in reader.fieldnames if h is not None }
+
+        def pick(row: dict, key: str) -> str:
+            for k in alias.get(key, []):
+                col = header_norm.get(k)
+                if col:
+                    val = row.get(col, "")
+                    if val is not None and str(val).strip() != "":
+                        return str(val).strip()
             return ""
 
-        ok, fail = 0, 0
+        ns = namespace or DEFAULT_NAMESPACE
+        ok, fail, skipped = 0, 0, 0
         details = []
 
         for row in reader:
             try:
-                url_raw = get(row, "url", "link", "product_url")
-                url = _canon_ig_url(url_raw) if url_raw else ""
-                name = _coalesce(
-                    get(row, "name", "title", "product_name"),
-                    get(row, "ref", "sku", "reference", "variant_sku"),
-                    url
-                ).strip()
-                summary   = get(row, "summary", "descricao", "description", "body_html")
-                ref       = get(row, "ref", "sku", "reference", "variant_sku") or None
-                price     = _safe_float(get(row, "price","price_min","variant_price","preco"), default=None)
-                currency  = (get(row, "currency","moeda") or "EUR").upper()
-                iva_pct   = _safe_float(get(row, "iva_pct","iva","tax_rate"), default=None)
-                brand     = get(row, "brand","marca","vendor") or None
-                dimensions= get(row, "dimensions","dim","size") or None
-                material  = get(row, "material","acabamento","materials") or None
-                image_url = get(row, "image_url","image","thumbnail","featured_image") or None
-
-                # 4) validar URL minimamente
-                if not url or not re.match(r"^https?://", url):
-                    fail += 1
-                    details.append({"ok": False, "error": "linha sem URL válida", "name": name, "url": url_raw})
+                item_type = pick(row, "item_type").lower()
+                raw_url   = pick(row, "url")
+                # ignorar variantes/linhas sem URL — BigCommerce exporta SKUs/opções
+                if not raw_url and item_type and item_type != "product":
+                    skipped += 1
                     continue
 
+                url = _to_abs_ig_url(raw_url) if raw_url else ""
+                if not url:
+                    fail += 1
+                    details.append({"ok": False, "error": "linha sem URL válida", "name": pick(row,"name"), "url": ""})
+                    continue
+
+                name      = pick(row, "name") or pick(row, "ref") or url
+                summary   = pick(row, "summary")
+                ref       = pick(row, "ref") or None
+                price     = _safe_float(pick(row, "price"), default=None)
+                currency  = (pick(row, "currency") or "EUR").upper()
+                iva       = _safe_float(pick(row, "iva_pct"), default=None)
+                brand     = pick(row, "brand") or None
+                dim       = pick(row, "dimensions") or None
+                material  = pick(row, "material") or None
+                image_url = pick(row, "image_url") or None
+                # nota: Product Image File - 1 costuma ser um caminho relativo do BC; guardamos “as is”
+
                 _upsert_catalog_row(
-                    namespace or DEFAULT_NAMESPACE,
-                    name=name or (ref or url),
-                    summary=summary or "",
-                    url=url,
-                    source="csv",
-                    ref=ref,
-                    price=price,
-                    currency=currency,
-                    iva_pct=iva_pct,
-                    brand=brand,
-                    dimensions=dimensions,
-                    material=material,
-                    image_url=image_url
+                    ns, name=name, summary=summary, url=url, source="csv",
+                    ref=ref, price=price, currency=currency, iva_pct=iva,
+                    brand=brand, dimensions=dim, material=material, image_url=image_url
                 )
                 ok += 1
-                if len(details) < 50:
-                    details.append({"ok": True, "name": name, "url": url})
+                details.append({"ok": True, "name": name, "url": url})
             except Exception as e:
                 fail += 1
-                if len(details) < 50:
-                    details.append({"ok": False, "error": str(e)})
+                details.append({"ok": False, "error": str(e)})
 
-        return {"ok": True, "namespace": namespace or DEFAULT_NAMESPACE, "imported": ok, "failed": fail, "items": details}
+        return {
+            "ok": True,
+            "namespace": ns,
+            "imported": ok,
+            "failed": fail,
+            "skipped": skipped,   # linhas não-produto/sem URL (o console ignora se não quiseres mostrar)
+            "items": details[:50]
+        }
     except Exception as e:
         log.exception("catalog_import_csv_failed")
         return {"ok": False, "error": str(e)}
