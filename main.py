@@ -1532,55 +1532,87 @@ def _table_cols(c) -> set:
         cols.add(r[1])
     return cols
 
-# ⚠️ SUBSTITUI a tua função _ensure_cols por esta
-def _ensure_cols(c):
-    # tabela base
-    c.execute("""
+# --- PATCH: catálogo (init + ensure cols) ------------------------------------
+
+def _ensure_cols(conn):
+    """
+    Garante que a tabela catalog_items existe e tem todas as colunas necessárias.
+    Usa cursor (não a connection) para fetchall() e é idempotente.
+    """
+    cur = conn.cursor()
+
+    # 1) cria tabela “mínima” se não existir
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS catalog_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            namespace TEXT,
-            name TEXT,
-            summary TEXT,
-            url TEXT UNIQUE,
-            source TEXT,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now')),
-            ref TEXT,
-            price REAL,
-            currency TEXT,
-            iva_pct REAL,
-            brand TEXT,
-            dimensions TEXT,
-            material TEXT,
-            image_url TEXT,
-            variant_attrs TEXT,   -- JSON com attrs da variante
-            variant_key TEXT      -- chave canónica para match de variantes
+            id INTEGER PRIMARY KEY AUTOINCREMENT
         )
     """)
 
-    # adicionar colunas em falta (idempotente)
-    c.execute("PRAGMA table_info(catalog_items)")
-    cols = {row[1] for row in c.fetchall()}
-    for col, typ in [
-        ("variant_attrs", "TEXT"),
-        ("variant_key", "TEXT"),
-    ]:
-        if col not in cols:
-            c.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {typ}")
+    # 2) ler colunas atuais
+    cur.execute("PRAGMA table_info(catalog_items)")
+    cols = {row[1] for row in cur.fetchall()}  # row[1] = nome da coluna
 
-    # índices úteis (idempotentes)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_namespace ON catalog_items(namespace)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ref ON catalog_items(ref)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_variant_key_ns ON catalog_items(namespace, variant_key)")
+    # 3) colunas necessárias (ordem apenas informativa)
+    needed = [
+        ("namespace",      "TEXT"),
+        ("name",           "TEXT"),
+        ("summary",        "TEXT"),
+        ("url",            "TEXT"),       # UNIQUE tratado mais abaixo
+        ("source",         "TEXT"),
+        ("created_at",     "TEXT"),
+        ("updated_at",     "TEXT"),
+        ("ref",            "TEXT"),
+        ("price",          "REAL"),
+        ("currency",       "TEXT"),
+        ("iva_pct",        "REAL"),
+        ("brand",          "TEXT"),
+        ("dimensions",     "TEXT"),
+        ("material",       "TEXT"),
+        ("image_url",      "TEXT"),
+        ("variant_attrs",  "TEXT")
+    ]
+
+    # 4) adicionar colunas em falta
+    for col, coltype in needed:
+        if col not in cols:
+            try:
+                cur.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {coltype}")
+            except Exception as e:
+                # tolera deploys em que a coluna foi criada noutra corrida
+                if "duplicate column name" in str(e).lower():
+                    pass
+                else:
+                    raise
+
+    # 5) garantir UNIQUE(url) via índice único (idempotente)
+    #    Nota: se já existir uma UNIQUE constraint antiga, isto não cria outra.
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(url)")
+    except Exception:
+        pass
+
+    # 6) índices úteis
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_namespace ON catalog_items(namespace)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ref ON catalog_items(ref)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_updated ON catalog_items(updated_at)")
+    except Exception:
+        pass
+
+    conn.commit()
+
 
 def _catalog_init():
-    with _catalog_conn() as c:
-        _ensure_cols(c)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ns ON catalog_items(namespace)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog_items(name)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(url)")
-    log.info("[catalog/sqlite] ready db=%s", CATALOG_DB_PATH)
-
+    """
+    Abre a conexão e chama _ensure_cols uma única vez no arranque.
+    """
+    try:
+        with _catalog_conn() as conn:
+            _ensure_cols(conn)
+        log.info(f"[catalog/sqlite] ready db={CATALOG_DB_PATH}")
+    except Exception:
+        log.exception("[catalog/sqlite] init failed")
+        raise
 _catalog_init()
 
 # ---- Utils -----------------------------------------------------------------------------
