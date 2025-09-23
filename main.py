@@ -1,6 +1,7 @@
 # main.py — Alma Server (RAG + Memória; top-k dinâmico; mini-pesquisa; injeção e fallback de links; Consola RAG; utilitários)
 # ---------------------------------------------------------------------------------------
-from fastapi import FastAPI, Request
+
+from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
