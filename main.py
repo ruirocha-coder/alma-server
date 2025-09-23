@@ -1663,89 +1663,96 @@ def _upsert_catalog_row(ns: Optional[str],
 # - multipart/form-data com file=... (UploadFile) OU
 # - JSON com {"csv_text":"...","namespace":"...","delimiter":",","encoding":"utf-8"}
 # Mapeamento de colunas flexível (detecta variações comuns).
+# --- Substitui integralmente a função /catalog/import-csv no main.py ---
+
+from fastapi import UploadFile, File, Form
+import csv
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(
     file: UploadFile = File(None),
     namespace: str = Form(None),
-    delimiter: str = Form(","),
+    delimiter: str = Form(None),         # deixa opcional (usamos Sniffer)
     encoding: str = Form("utf-8"),
-    json_req: Dict[str, Any] = None
 ):
+    """
+    Aceita multipart/form-data com 'file' (preferido).
+    Deteta delimitador (Sniffer). Cabeçalhos 'case-insensitive'.
+    Exige URL com http(s); linhas sem URL são ignoradas (failed += 1).
+    """
     try:
-        if (file is None) and (json_req is None):
-            # tentar ler JSON do body se não veio form-data
+        # 1) obter texto
+        if file is None:
+            return {"ok": False, "error": "Falta CSV (envia como multipart/form-data com 'file')"}
+        raw = await file.read()
+        text = raw.decode(encoding or "utf-8", errors="replace")
+        # normalizar quebras de linha
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 2) detetar delimitador
+        delim = delimiter
+        if not delim:
             try:
-                json_req = await Request.json  # type: ignore
+                sniff = csv.Sniffer().sniff("\n".join(text.splitlines()[:20]), delimiters=";,|\t,")
+                delim = sniff.delimiter
             except Exception:
-                pass
+                # fallback europeu primeiro
+                delim = ";" if text.split("\n",1)[0].count(";") >= text.split("\n",1)[0].count(",") else ","
 
-        csv_text = None
-        if file is not None:
-            raw = await file.read()
-            csv_text = raw.decode(encoding or "utf-8", errors="replace")
-        elif json_req and isinstance(json_req, dict):
-            csv_text = (json_req.get("csv_text") or "").strip()
-            namespace = json_req.get("namespace") or namespace
-            delimiter = json_req.get("delimiter") or delimiter
-            encoding  = json_req.get("encoding")  or encoding
-
-        if not csv_text:
-            return {"ok": False, "error": "Falta CSV (file ou json.csv_text)"}
-
-        # normalização básica de linhas
-        lines = [ln for ln in csv_text.splitlines() if ln.strip()]
+        # 3) ler CSV com DictReader + cabeçalhos normalizados
+        lines = [ln for ln in text.splitlines() if ln.strip()]
         if not lines:
             return {"ok": False, "error": "CSV vazio"}
-        header = [h.strip() for h in lines[0].split(delimiter)]
-        rows = [ [c.strip() for c in ln.split(delimiter)] for ln in lines[1:] ]
 
-        # índice por nome de coluna (flexível)
-        def col_idx(*names):
+        # DictReader já trata de aspas/escapes corretamente
+        reader = csv.DictReader(lines, delimiter=delim)
+        # normalizar nomes de coluna para minúsculas
+        fieldmap = {f: (f or "").strip().lower() for f in (reader.fieldnames or [])}
+        norm_fields = list(fieldmap.values())
+
+        def get(row, *names):
             for n in names:
-                if n in header:
-                    return header.index(n)
-            return -1
-
-        idx_url  = col_idx("url","link","product_url")
-        idx_name = col_idx("name","title","product_name")
-        idx_sum  = col_idx("summary","descricao","description","body_html")
-        idx_ref  = col_idx("ref","sku","reference","variant_sku")
-        idx_price= col_idx("price","price_min","variant_price","preco")
-        idx_curr = col_idx("currency","moeda")
-        idx_iva  = col_idx("iva_pct","iva","tax_rate")
-        idx_brand= col_idx("brand","marca","vendor")
-        idx_dim  = col_idx("dimensions","dim","size")
-        idx_mat  = col_idx("material","acabamento","materials")
-        idx_img  = col_idx("image_url","image","thumbnail","featured_image")
+                # procurar pelo nome normalizado
+                if n in norm_fields:
+                    # descobrir a chave original que mapeia para este normalizado
+                    for orig, norm in fieldmap.items():
+                        if norm == n:
+                            return (row.get(orig) or "").strip()
+            return ""
 
         ok, fail = 0, 0
-        details: List[Dict[str, Any]] = []
+        details = []
 
-        for r in rows:
+        for row in reader:
             try:
-                def val(idx): 
-                    return r[idx] if 0 <= idx < len(r) else ""
-                url = _canon_ig_url(val(idx_url)) if idx_url != -1 else ""
-                name = _coalesce(val(idx_name), val(idx_ref), url)
-                summary = val(idx_sum)
-                ref = val(idx_ref) or None
-                price = _safe_float(val(idx_price), default=None) if idx_price != -1 else None
-                currency = (val(idx_curr) or "EUR").upper() if idx_curr != -1 else "EUR"
-                iva_pct = _safe_float(val(idx_iva), default=None) if idx_iva != -1 else None
-                brand = val(idx_brand) or None
-                dimensions = val(idx_dim) or None
-                material = val(idx_mat) or None
-                image_url = val(idx_img) or None
+                url_raw = get(row, "url", "link", "product_url")
+                url = _canon_ig_url(url_raw) if url_raw else ""
+                name = _coalesce(
+                    get(row, "name", "title", "product_name"),
+                    get(row, "ref", "sku", "reference", "variant_sku"),
+                    url
+                ).strip()
+                summary   = get(row, "summary", "descricao", "description", "body_html")
+                ref       = get(row, "ref", "sku", "reference", "variant_sku") or None
+                price     = _safe_float(get(row, "price","price_min","variant_price","preco"), default=None)
+                currency  = (get(row, "currency","moeda") or "EUR").upper()
+                iva_pct   = _safe_float(get(row, "iva_pct","iva","tax_rate"), default=None)
+                brand     = get(row, "brand","marca","vendor") or None
+                dimensions= get(row, "dimensions","dim","size") or None
+                material  = get(row, "material","acabamento","materials") or None
+                image_url = get(row, "image_url","image","thumbnail","featured_image") or None
 
-                if not url:
-                    # se não há URL, tenta construir a partir do nome (não obrigatório)
-                    if name:
-                        url = ""
+                # 4) validar URL minimamente
+                if not url or not re.match(r"^https?://", url):
+                    fail += 1
+                    details.append({"ok": False, "error": "linha sem URL válida", "name": name, "url": url_raw})
+                    continue
+
                 _upsert_catalog_row(
                     namespace or DEFAULT_NAMESPACE,
-                    name=name or (ref or url or "Produto"),
+                    name=name or (ref or url),
                     summary=summary or "",
-                    url=url or (ref or name or ""),
+                    url=url,
                     source="csv",
                     ref=ref,
                     price=price,
@@ -1757,12 +1764,14 @@ async def catalog_import_csv(
                     image_url=image_url
                 )
                 ok += 1
-                details.append({"ok": True, "name": name, "url": url})
+                if len(details) < 50:
+                    details.append({"ok": True, "name": name, "url": url})
             except Exception as e:
                 fail += 1
-                details.append({"ok": False, "error": str(e)})
+                if len(details) < 50:
+                    details.append({"ok": False, "error": str(e)})
 
-        return {"ok": True, "namespace": namespace or DEFAULT_NAMESPACE, "imported": ok, "failed": fail, "items": details[:50]}
+        return {"ok": True, "namespace": namespace or DEFAULT_NAMESPACE, "imported": ok, "failed": fail, "items": details}
     except Exception as e:
         log.exception("catalog_import_csv_failed")
         return {"ok": False, "error": str(e)}
