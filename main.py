@@ -1532,39 +1532,52 @@ def _table_cols(c) -> set:
         cols.add(r[1])
     return cols
 
+# ⚠️ SUBSTITUI a tua função _ensure_cols por esta
 def _ensure_cols(c):
-    needed = {
-        "ref": "TEXT",
-        "summary": "TEXT",
-        "price": "REAL",
-        "currency": "TEXT",
-        "iva_pct": "REAL",
-        "brand": "TEXT",
-        "dimensions": "TEXT",
-        "material": "TEXT",
-        "image_url": "TEXT",
-        "variant_attrs": "TEXT"  # 🔹 NOVA COLUNA
-    }
-    c.execute("PRAGMA table_info(catalog)")
-    cols = {row[1] for row in c.fetchall()}
-    for k, t in needed.items():
-        if k not in cols:
-            c.execute(f"ALTER TABLE catalog ADD COLUMN {k} {t}")
+    # c é uma sqlite3.Connection
+    # 1) obter colunas existentes
+    cur = c.execute("PRAGMA table_info(catalog_items)")
+    cols = {row[1] for row in cur.fetchall()}  # ← antes estavas a fazer c.fetchall()
+
+    # 2) criar tabela se não existir
     c.execute("""
-    CREATE TABLE IF NOT EXISTS catalog_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      namespace TEXT,
-      name TEXT,
-      summary TEXT,
-      url TEXT UNIQUE,
-      source TEXT,
-      created_at TEXT,
-      updated_at TEXT
-    )""")
-    have = _table_cols(c)
-    for col, ddl in needed.items():
-        if col not in have:
-            c.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {ddl}")
+        CREATE TABLE IF NOT EXISTS catalog_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace TEXT,
+            name TEXT,
+            summary TEXT,
+            url TEXT UNIQUE,
+            source TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            ref TEXT,
+            price REAL,
+            currency TEXT,
+            iva_pct REAL,
+            brand TEXT,
+            dimensions TEXT,
+            material TEXT,
+            image_url TEXT,
+            variant_attrs TEXT   -- JSON com atributos de variante (Option*, Size, Color, sku, product_url…)
+        )
+    """)
+
+    # 3) adicionar colunas que faltem (inclui variant_attrs)
+    want_cols = {
+        "namespace","name","summary","url","source","created_at","updated_at",
+        "ref","price","currency","iva_pct","brand","dimensions","material","image_url",
+        "variant_attrs"
+    }
+    missing = want_cols - cols
+    for col in missing:
+        if col == "price":
+            c.execute("ALTER TABLE catalog_items ADD COLUMN price REAL")
+        elif col == "iva_pct":
+            c.execute("ALTER TABLE catalog_items ADD COLUMN iva_pct REAL")
+        elif col == "variant_attrs":
+            c.execute("ALTER TABLE catalog_items ADD COLUMN variant_attrs TEXT")
+        else:
+            c.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} TEXT")
 
 def _catalog_init():
     with _catalog_conn() as c:
