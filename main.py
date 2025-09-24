@@ -1776,141 +1776,246 @@ def build_variant_key(attrs: dict) -> str:
 
 
 # ---- Importação CSV ) -----------------------------
+# -------------------------------------------
+# /catalog/import-csv  (NORMALIZADOR BigCommerce)
+# -------------------------------------------
+from fastapi import UploadFile, File, Form
+from fastapi.responses import JSONResponse
+import csv
+import io
+import json
+import re
+from typing import Dict, Any, Optional
+
+def _norm_key(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '_', (s or '').strip().lower()).strip('_')
+
+def _pick(d: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ''):
+            return v
+    return default
+
+def _parse_price(v: Optional[str]) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == '':
+        return None
+    # aceita “1 234,56”, “1234.56”, “1.234,56”, etc.
+    s = s.replace(' ', '')
+    # se tem vírgula e não tem ponto como separador decimal
+    if ',' in s and s.count(',') == 1 and s.rfind(',') > s.rfind('.'):
+        s = s.replace('.', '').replace(',', '.')
+    try:
+        f = float(s)
+        # trata 0.00 como “não definido” para herdar do produto base
+        return None if abs(f) < 1e-9 else f
+    except:
+        return None
+
+def _clean_html_short(s: str) -> str:
+    if not s:
+        return ''
+    # remove tags simples (não precisamos de HTML no resumo)
+    return re.sub(r'<[^>]+>', '', s).strip()
+
+def _parse_variant_attrs(name: str) -> Optional[str]:
+    """
+    Ex.: "[S]Conjunto Elétrico=Sem Conjunto Elétrico"
+         -> {"Conjunto Elétrico":"Sem Conjunto Elétrico"}
+    Devolve JSON (str) ou None.
+    """
+    if not name:
+        return None
+    m = re.match(r'^\s*\[[^\]]+\]\s*([^=]+?)\s*=\s*(.+?)\s*$', name)
+    if not m:
+        return None
+    k = m.group(1).strip()
+    v = m.group(2).strip()
+    try:
+        return json.dumps({k: v}, ensure_ascii=False)
+    except:
+        return None
+
+def _variant_label_from_name(name: str) -> str:
+    # retira o prefixo "[...]" se existir; fica só a parte direita
+    if not name:
+        return ''
+    m = re.match(r'^\s*\[[^\]]+\]\s*(.+?)\s*$', name)
+    return (m.group(1).strip() if m else name.strip())
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(
     file: UploadFile = File(...),
-    namespace: str = Form(None),
-    delimiter: str = Form(None),
-    encoding: str = Form("utf-8")
+    namespace: Optional[str] = Form(None)
 ):
     """
-    Importador normalizador BigCommerce:
-      1) Ignora Item Type == Rule
-      2) Product define contexto/base (preço, brand, summary, url)
-      3) SKU herda preço se vier 0/blank e é gravado como variante do Product
-         - nome = Product Name — etiqueta limpa do SKU
-         - summary = Product Description + ' Opção: etiqueta'
-         - url = base_url#sku={SKU}
-         - variant_attrs = {"is_variant": true, "parent_url": base_url}
+    Importador normalizado para export BigCommerce:
+    - Usa contexto de 'Product' como base.
+    - Ignora linhas 'Rule'.
+    - Linhas 'SKU' herdam URL/brand/description/price se em falta/0.
+    - URL das variantes = URL do produto base.
+    - summary das variantes = summary_base + " | Variante: <label>".
+    - variant_attrs a partir do padrão "[X]Chave=Valor".
     """
-    raw = await file.read()
-    try:
-        csv_text = raw.decode(encoding or "utf-8", errors="replace")
-    except Exception:
-        csv_text = raw.decode("utf-8", errors="replace")
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    raw_bytes = await file.read()
+    text = raw_bytes.decode("utf-8-sig", errors="ignore")
+    reader = csv.DictReader(io.StringIO(text))
 
-    if not csv_text.strip():
-        return {"ok": False, "error": "CSV vazio"}
+    # normaliza cabeçalhos
+    fieldmap = {_norm_key(h): h for h in reader.fieldnames or []}
+    def col(*names):
+        # devolve o valor, procurando por várias opções normalizadas
+        def _get(row):
+            for nm in names:
+                key = fieldmap.get(_norm_key(nm))
+                if key and key in row:
+                    return row[key]
+            return None
+        return _get
 
-    # deteta delimitador
-    if not delimiter:
-        try:
-            sample = csv_text[:10000]
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;")
-            delimiter = dialect.delimiter
-        except Exception:
-            delimiter = ","
+    # Mapeamentos “tolerantes” de colunas
+    get_item_type   = col("Item Type", "item_type", "type")
+    get_product_id  = col("Product ID", "product_id")
+    get_name        = col("Product Name", "product_name", "name", "title")
+    get_sku         = col("Product Code/SKU", "product_code/sku", "product_code", "sku", "ref")
+    get_brand       = col("Brand Name", "brand_name", "brand")
+    get_desc        = col("Product Description", "product_description", "description", "summary")
+    get_price_raw   = col("Price", "Sale Price", "Retail Price", "price", "sale_price", "retail_price", "calculated_price")
+    get_currency    = col("Currency", "Moeda", "currency")
+    get_url         = col("URL", "Link", "url", "link", "Product URL")
 
-    f = StringIO(csv_text)
-    reader = csv.DictReader(f, delimiter=delimiter)
-    if not reader.fieldnames:
-        return {"ok": False, "error": "CSV sem cabeçalhos"}
+    imported, failed, skipped = 0, 0, 0
+    items_report = []
 
-    header_norm = { _hdrnorm(h): h for h in reader.fieldnames if h is not None }
-    ns = (namespace or DEFAULT_NAMESPACE)
+    # contexto de produto base em “memória”
+    base: Dict[str, Any] = {
+        "name": None, "summary": None, "url": None, "brand": None,
+        "price": None, "currency": None, "iva_pct": None, "product_id": None
+    }
 
-    ok, fail, skipped = 0, 0, 0
-    details = []
+    for raw in reader:
+        # tira espaços em branco gerais
+        row = {k: (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
 
-    # contexto do Product atual
-    ctx = {}
-
-    for row in reader:
-        item_type = _pick(row, header_norm, "Item Type")
-        sku = _pick(row, header_norm, "Product Code/SKU", "SKU", "Code")
-        name = _pick(row, header_norm, "Product Name", "Name")
-        brand = _pick(row, header_norm, "Brand Name", "Brand")
-        desc = _pick(row, header_norm, "Product Description", "Description")
-
-        # ignora linhas Rule
+        item_type = (get_item_type(row) or "").strip()
         if item_type.lower() == "rule":
+            skipped += 1
             continue
 
-        # linha Product → atualiza contexto base
+        name = (get_name(row) or "").strip()
+        sku  = (get_sku(row) or "").strip() or None
+        brand = (get_brand(row) or "").strip() or None
+        price = _parse_price(get_price_raw(row))
+        currency = (get_currency(row) or "").strip() or None
+        url = (get_url(row) or "").strip() or None
+        desc_html = get_desc(row) or ""
+        summary_clean = _clean_html_short(desc_html)
+
         if item_type.lower() == "product":
-            ctx = {
-                "name": name,
-                "url": f"https://{IG_HOST}/{sku.lower()}" if sku else None,
-                "price": _as_float(_pick(row, header_norm, "Price"), None),
-                "currency": "EUR",
-                "brand": brand,
-                "summary": desc,
-                "image_url": None,
-                "iva_pct": 23,
-                "dimensions": None,
-                "material": None,
+            # novo produto base
+            base = {
+                "name": name or url or "—",
+                "summary": summary_clean,
+                "url": _canon_ig_url(url) if url else None,
+                "brand": brand or None,
+                "price": price,  # pode ser None
+                "currency": currency or None,
+                "iva_pct": 23.0,  # se tiveres coluna de IVA, mapeia-a aqui
+                "product_id": (get_product_id(row) or "").strip() or None,
             }
-            _upsert_catalog_row(
-                ns,
-                ctx["name"],
-                ctx["summary"],
-                ctx["url"],
-                source="csv",
-                ref=sku,
-                price=ctx["price"],
-                currency=ctx["currency"],
-                iva_pct=ctx["iva_pct"],
-                brand=ctx["brand"],
-                dimensions=ctx["dimensions"],
-                material=ctx["material"],
-                image_url=ctx["image_url"],
-            )
-            ok += 1
-            details.append({"ok": True, "name": ctx["name"], "url": ctx["url"]})
-            continue
 
-        # linha SKU (variante)
-        if item_type.lower() == "sku":
-            if not ctx:
-                fail += 1
-                details.append({"ok": False, "error": "SKU sem Product base", "name": name, "url": ""})
+            if not base["url"]:
+                failed += 1
+                items_report.append({"ok": False, "error": "linha Product sem URL válida", "name": base["name"], "url": ""})
                 continue
 
-            opt_label = _clean_option_label(name)
-            variant_name = f"{ctx['name']} — {opt_label}" if opt_label else f"{ctx['name']} (variante)"
-            variant_summary = (ctx["summary"] or "") + (f" Opção: {opt_label}" if opt_label else "")
-
-            price = _as_float(_pick(row, header_norm, "Price"), None)
-            if price in (None, 0.0):
-                price = ctx.get("price")
-
-            variant_url = (ctx["url"] or "") + (f"#sku={sku}" if sku else "")
-
-            _upsert_catalog_row(
-                ns,
-                variant_name,
-                variant_summary,
-                variant_url,
-                source="csv",
-                ref=sku,
-                price=price,
-                currency=ctx["currency"],
-                iva_pct=ctx["iva_pct"],
-                brand=ctx["brand"],
-                dimensions=ctx["dimensions"],
-                material=ctx["material"],
-                image_url=ctx["image_url"],
-                variant_attrs=json.dumps({"is_variant": True, "parent_url": ctx["url"]})
-            )
-            ok += 1
-            details.append({"ok": True, "name": variant_name, "url": variant_url})
+            # upsert do produto base
+            try:
+                _upsert_catalog_row(
+                    ns=ns,
+                    name=base["name"],
+                    summary=base["summary"],
+                    url=base["url"],
+                    source="csv",
+                    ref=sku,  # alguns exports trazem "code" já no Product
+                    price=base["price"],
+                    currency=base["currency"],
+                    iva_pct=base["iva_pct"],
+                    brand=base["brand"],
+                    dimensions=None,
+                    material=None,
+                    image_url=None,
+                    variant_attrs=None
+                )
+                imported += 1
+                items_report.append({"ok": True, "name": base["name"], "url": base["url"]})
+            except Exception as e:
+                failed += 1
+                items_report.append({"ok": False, "error": f"upsert base: {e}", "name": base["name"], "url": base["url"]})
             continue
 
-        # senão, ignora
-        skipped += 1
-        details.append({"ok": False, "error": "linha ignorada", "name": name, "url": ""})
+        # a partir daqui: SKU (variante) ou linhas sem tipo
+        # precisa de um produto base válido antes
+        if not base.get("url"):
+            failed += 1
+            items_report.append({"ok": False, "error": "SKU sem produto base anterior com URL", "name": name, "url": ""})
+            continue
 
-    return {"ok": True, "namespace": ns, "imported": ok, "failed": fail, "skipped": skipped, "items": details}
+        # heranças
+        v_url = base["url"]                              # mesma URL do produto
+        v_brand = brand or base["brand"]
+        v_price = price if price is not None else base["price"]
+        v_currency = currency or base["currency"]
+
+        # resumo da variante = resumo_base + etiqueta de variante
+        variant_label = _variant_label_from_name(name)
+        if variant_label:
+            v_summary = (base["summary"] or "")
+            v_summary = (v_summary + (" | Variante: " + variant_label)).strip()
+        else:
+            v_summary = summary_clean or base["summary"] or ""
+
+        # attrs estruturados (JSON string) se seguirem o padrão "[X]A=B"
+        variant_attrs = _parse_variant_attrs(name)
+
+        # nome da variante: usa nome do SKU se existir, senão cai para nome base
+        v_name = name or base["name"]
+
+        try:
+            _upsert_catalog_row(
+                ns=ns,
+                name=v_name,
+                summary=v_summary,
+                url=v_url,
+                source="csv",
+                ref=sku,
+                price=v_price,
+                currency=v_currency,
+                iva_pct=base["iva_pct"],
+                brand=v_brand,
+                dimensions=None,
+                material=None,
+                image_url=None,
+                variant_attrs=variant_attrs
+            )
+            imported += 1
+            items_report.append({"ok": True, "name": v_name, "url": v_url})
+        except Exception as e:
+            failed += 1
+            items_report.append({"ok": False, "error": f"upsert sku: {e}", "name": v_name, "url": v_url})
+
+    return JSONResponse({
+        "ok": True,
+        "namespace": ns,
+        "imported": imported,
+        "failed": failed,
+        "skipped": skipped,
+        "items": items_report[:200]  # corta o relatório para não rebentar o payload
+    })
 # ---- CRUD leve -------------------------------------------------------------------------
 from fastapi import Request
 
