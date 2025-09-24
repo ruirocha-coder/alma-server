@@ -1821,6 +1821,12 @@ async def catalog_import_csv(file: UploadFile = File(...),
     for row in reader:
         try:
             row_type = (row.get("Item Type") or "").strip()
+ # PATCH → se for rule, ignora logo
+        if row_type.lower() == "rule":
+            skipped += 1
+            items_out.append({"ok": True, "type": "rule", "skipped": True})
+            continue
+            
             name = (row.get("Product Name") or "").strip()
             ref = (row.get("Product Code/SKU") or "").strip()
             price_str = (row.get("Price") or "").strip()
@@ -1859,6 +1865,8 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
                 imported += 1
 
+ 
+            
             elif row_type == "SKU" and current_product:
                 # nome e descrição herdados + variante
                 var_name = name
