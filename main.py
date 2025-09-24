@@ -1939,7 +1939,7 @@ async def catalog_import_csv(
                 imported += 1
                 items_log.append({"ok": True, "type": "product", "name": cur_prod_name, "url": cur_prod_url})
 
-            elif item_type.lower() == "variant":
+            elif item_type.lower() in ("variant", "sku", "variation", "option", "child"):
                 # 3) variante — partilha URL do produto + usa ref e preço próprio
                 if not cur_prod_url:
                     # variante sem produto corrente com URL → não conseguimos normalizar URL
