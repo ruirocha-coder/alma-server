@@ -1774,25 +1774,27 @@ def build_variant_key(attrs: dict) -> str:
 
 
 
-# ---- Importação CSV (corrigido) --------------------------------------------------------
-# Aceita upload multipart (file=...) e herda automaticamente a URL do produto-base
-# para linhas de variante que venham com a coluna URL vazia.
+
+# ---- Importação CSV (com captura de opções [S]Grupo=Valor) -----------------------------
 from fastapi import UploadFile, File, Form, Request
-import csv, json
+from fastapi.responses import HTMLResponse
+import csv, json, re
 from io import StringIO
 
+_S_OPTION_RE = re.compile(r'^\s*\[S\]\s*([^=]+?)\s*=\s*(.+?)\s*$')
+
 def _build_variant_attrs(row: dict, header_norm: dict) -> dict:
-    """Extrai atributos de variante de forma genérica (Option*, Color/Cor, Size/Tamanho, etc.)."""
+    """Extrai atributos de variante de forma genérica (Option*, Size, Color…)."""
     attrs = {}
 
     def get(col_norm: str) -> str:
         real = header_norm.get(col_norm)
-        if real is None:
+        if real is None: 
             return ""
         val = row.get(real, "")
         return (val or "").strip()
 
-    # Guardar URL base do produto, se existir (útil para debugging)
+    # Guardar o URL base do produto, se existir
     for key in ("product url", "url", "link", "product_url"):
         if key in header_norm:
             v = get(key)
@@ -1800,31 +1802,74 @@ def _build_variant_attrs(row: dict, header_norm: dict) -> dict:
                 attrs["product_url"] = v
             break
 
-    # Shopify style (Option1/2/3 Name/Value)
+    # Shopify style
     for i in (1, 2, 3):
         n = get(f"option{i} name")
         v = get(f"option{i} value")
         if n and v:
             attrs[n] = v
 
-    # Campos frequentes de variantes (várias línguas)
-    for cand in ("color", "cor", "size", "tamanho", "finish", "acabamento", "material acabamento"):
+    # Colunas que contenham "option" (BigCommerce/afins)
+    for norm_col, real_col in header_norm.items():
+        if "option" in norm_col and norm_col not in {
+            "option1 name","option1 value","option2 name","option2 value","option3 name","option3 value"
+        }:
+            val = (row.get(real_col) or "").strip()
+            if val:
+                attrs[real_col] = val
+
+    # Campos frequentes
+    for cand in ("color","cor","size","tamanho","finish","acabamento","material acabamento"):
         if cand in header_norm:
             v = get(cand)
             if v:
                 attrs[cand] = v
 
-    # Captura laxa: qq coluna que contenha "option" e não seja as clássicas acima
-    for norm_col, real_col in header_norm.items():
-        if "option" in norm_col and norm_col not in {
-            "option1 name","option1 value","option2 name","option2 value","option3 name","option3 value"
-        }:
-            v = (row.get(real_col) or "").strip()
-            if v:
-                attrs[real_col] = v
-
     return attrs
 
+def _merge_options_into_base(base_abs_url: str, ns: str, options_dict: dict):
+    """
+    Faz merge de `options` em variant_attrs do produto base (URL sem #sku=…).
+    Preserva attrs existentes.
+    """
+    if not base_abs_url:
+        return
+    # ler estado atual
+    current = {}
+    name = None
+    summary = None
+    with _catalog_conn() as c:
+        cur = c.execute("""SELECT name, summary, COALESCE(variant_attrs,'') as vattrs
+                           FROM catalog_items WHERE url=? LIMIT 1""", (base_abs_url,))
+        row = cur.fetchone()
+        if row:
+            name = row["name"]
+            summary = row["summary"]
+            vtxt = row["vattrs"] or ""
+            try:
+                current = json.loads(vtxt) if vtxt.strip() else {}
+            except Exception:
+                current = {}
+    # merge
+    current = current or {}
+    cur_opts = current.get("options") or {}
+    for grp, values in (options_dict or {}).items():
+        vals = sorted({v for v in values if v and str(v).strip()})
+        if not vals:
+            continue
+        existing = set(cur_opts.get(grp, []))
+        cur_opts[grp] = sorted(existing.union(vals))
+    if cur_opts:
+        current["options"] = cur_opts
+    # upsert suave (mantém restantes campos)
+    _upsert_catalog_row(
+        ns,
+        name=(name or base_abs_url),
+        summary=(summary or ""),
+        url=base_abs_url,
+        source="csv",
+        variant_attrs=json.dumps(current, ensure_ascii=False)
+    )
 
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(
@@ -1834,14 +1879,8 @@ async def catalog_import_csv(
     delimiter: str = Form(None),
     encoding: str = Form("utf-8")
 ):
-    """
-    Importa um CSV de catálogo.
-    - Se a linha for de variante e a coluna URL vier vazia, herda a última URL válida do produto-base.
-    - Para variantes com REF/SKU, adiciona `#sku=<REF>` ao URL para garantir unicidade por variante.
-    - Guarda atributos de variante num JSON (variant_attrs).
-    """
     try:
-        # 1) ler CSV (multipart ou JSON body com {"csv_text": ...})
+        # 1) ler CSV (upload ou json.csv_text)
         csv_text = None
         if file is not None:
             raw = await file.read()
@@ -1850,22 +1889,19 @@ async def catalog_import_csv(
             except Exception:
                 csv_text = raw.decode("utf-8", errors="replace")
         else:
-            # opcional: aceitar body JSON
             try:
                 body = await request.json()
                 csv_text = (body.get("csv_text") or "").strip()
                 namespace = body.get("namespace") or namespace
                 delimiter = body.get("delimiter") or delimiter
-                enc = body.get("encoding")
-                if enc:
-                    encoding = enc
+                encoding  = body.get("encoding")  or encoding
             except Exception:
                 pass
 
         if not csv_text:
             return {"ok": False, "error": "Falta CSV (file ou json.csv_text)"}
 
-        # 2) detetar delimiter se não vier
+        # 2) delimiter
         if not delimiter:
             try:
                 sample = csv_text[:10000]
@@ -1882,20 +1918,20 @@ async def catalog_import_csv(
         # 3) normalização de headers
         header_norm = { _norm_header(h): h for h in reader.fieldnames if h is not None }
 
-        # aliases de colunas comuns
+        # aliases (flexível)
         alias = {
             "item_type": ["item type","type","linha"],
             "url":       ["product url","url","link","product_url"],
-            "name":      ["product name","name","title","titulo"],
-            "summary":   ["product description","description","body html","body_html","summary","descricao","descrição"],
-            "ref":       ["variant sku","sku","product code sku","product code/sku","reference","ref","codigo","código"],
-            "price":     ["variant price","price","price min","preco","preço"],
+            "name":      ["product name","name","title"],
+            "summary":   ["product description","description","body html","body_html","summary","descricao"],
+            "ref":       ["variant sku","sku","product code sku","product code/sku","reference","ref"],
+            "price":     ["variant price","price","price min","preco"],
             "currency":  ["currency","moeda"],
             "iva_pct":   ["iva pct","iva","tax rate","tax_rate","vat"],
             "brand":     ["brand","brand name","marca","vendor"],
-            "dimensions":["dimensions","dim","size","product dimensions","dimensoes","dimensões"],
+            "dimensions":["dimensions","dim","size","product dimensions"],
             "material":  ["material","materials","acabamento","material acabamento"],
-            "image_url": ["product image url - 1","product image file - 1","image url","image","thumbnail","featured image","image 1","image1","imagem"],
+            "image_url": ["product image url - 1","product image file - 1","image url","image","thumbnail","featured image","image 1","image1"],
         }
         def pick(row: dict, key: str) -> str:
             for k in alias.get(key, []):
@@ -1910,19 +1946,14 @@ async def catalog_import_csv(
         ok, fail, skipped = 0, 0, 0
         details = []
 
-        # manter última URL base para herdar nas variantes sem URL
-        last_base_url: Optional[str] = None
+        # Acumular opções por produto base
+        options_by_url: dict[str, dict[str, set[str]]] = {}
+        last_base_url_abs: str | None = None
 
         for row in reader:
             try:
-                # tipo de linha (produto-base/variant)
                 item_type = (pick(row, "item_type") or "").lower().strip()
-
-                # URL base (pode vir vazia em variantes)
-                base_url = pick(row, "url")
-                if not base_url:
-                    base_url = None  # <—— normaliza vazio para None (importante!)
-
+                base_url  = pick(row, "url")                  # pode vir vazio nas linhas de opção
                 name      = pick(row, "name")
                 summary   = pick(row, "summary")
                 ref       = pick(row, "ref") or None
@@ -1934,63 +1965,74 @@ async def catalog_import_csv(
                 material  = pick(row, "material") or None
                 image_url = pick(row, "image_url") or None
 
-                # atributos de variante
+                # construir attrs de variante (genérico)
                 vattrs = _build_variant_attrs(row, header_norm)
+                if base_url and "product_url" not in vattrs:
+                    vattrs["product_url"] = base_url
 
-                # decidir se é variante
-                is_variant = (item_type == "variant") or (ref is not None and ref != "")
-
-                # herdar URL do produto-base se for variante e a coluna vier vazia
-                if is_variant and (not base_url) and last_base_url:
-                    base_url = last_base_url
-
-                # normalizar para URL absoluta do teu domínio (se aplicável)
+                # Resolver URL absoluto
                 effective_url = ""
-                if base_url:
-                    effective_url = _to_abs_ig_url(base_url)
+                base_abs_url = _to_abs_ig_url(base_url) if base_url else ""
 
-                # para variantes com ref/sku, garantir unicidade via #sku=
-                if is_variant and ref:
+                # ——— Caso 1: linha é claramente uma “opção” -> [S]Grupo=Valor ———
+                # Sucede quando não há URL/ref, mas o nome tem este padrão.
+                m_opt = _S_OPTION_RE.match(name or "")
+                if (not base_abs_url) and (not ref) and m_opt:
+                    # associar ao último produto base visto
+                    if last_base_url_abs:
+                        grp = m_opt.group(1).strip()
+                        val = m_opt.group(2).strip()
+                        opts = options_by_url.setdefault(last_base_url_abs, {})
+                        bag = opts.setdefault(grp, set())
+                        bag.add(val)
+                        skipped += 1
+                        details.append({"ok": True, "note": "option captured", "group": grp, "value": val, "base": last_base_url_abs})
+                        continue
+                    else:
+                        # sem contexto -> ignoramos para não falhar a importação
+                        skipped += 1
+                        details.append({"ok": True, "note": "option ignored (no base_url context)", "raw": name})
+                        continue
+
+                # ——— Caso 2: temos um produto/variante “normal” ———
+                is_variant = (item_type == "variant") or (ref is not None and ref != "")
+                if base_abs_url:
+                    last_base_url_abs = base_abs_url  # atualizar contexto
+                    effective_url = base_abs_url
+                if is_variant and ref and effective_url:
                     vattrs["sku"] = ref
-                    if effective_url:
-                        effective_url = f"{effective_url}#sku={ref}"
+                    effective_url = effective_url + f"#sku={ref}"
 
-                # se mesmo assim não tivermos URL → falha controlada
+                # Nome de fallback
+                if not name:
+                    name = (ref or effective_url or base_abs_url or "unnamed")
+
+                # Se ainda não houver URL (e não foi linha de opção), falhamos esta linha
                 if not effective_url:
                     fail += 1
-                    details.append({"ok": False, "error": "linha sem URL válida", "name": name or (ref or ""), "url": ""})
+                    details.append({"ok": False, "error": "linha sem URL válida", "name": name, "url": ""})
                     continue
 
-                # se esta linha é produto-base com URL, guardar para herdar nas próximas variantes
-                if not is_variant and base_url:
-                    last_base_url = base_url
-
-                # nome de fallback
-                if not name:
-                    name = ref or effective_url
-
-                # guardar no SQLite
+                # Upsert desta linha (produto ou variante)
                 _upsert_catalog_row(
-                    ns,
-                    name=name,
-                    summary=summary,
-                    url=effective_url,
-                    source="csv",
-                    ref=ref,
-                    price=price,
-                    currency=currency,
-                    iva_pct=iva,
-                    brand=brand,
-                    dimensions=dim,
-                    material=material,
-                    image_url=image_url,
+                    ns, name=name, summary=summary, url=effective_url, source="csv",
+                    ref=ref, price=price, currency=currency, iva_pct=iva,
+                    brand=brand, dimensions=dim, material=material, image_url=image_url,
                     variant_attrs=(json.dumps(vattrs, ensure_ascii=False) if vattrs else None)
                 )
                 ok += 1
                 details.append({"ok": True, "name": name, "url": effective_url})
+
             except Exception as e:
                 fail += 1
                 details.append({"ok": False, "error": str(e)})
+
+        # 4) No fim: gravar opções agregadas em cada produto base
+        for base_abs_url, grp_map in options_by_url.items():
+            # converter sets -> listas ordenadas
+            clean = {grp: sorted(list(vals)) for grp, vals in grp_map.items() if vals}
+            if clean:
+                _merge_options_into_base(base_abs_url, ns, clean)
 
         return {
             "ok": True,
@@ -1998,7 +2040,7 @@ async def catalog_import_csv(
             "imported": ok,
             "failed": fail,
             "skipped": skipped,
-            "items": details[:50]  # limita o eco para não rebentar a resposta
+            "items": details[:50]  # preview
         }
     except Exception as e:
         log.exception("catalog_import_csv_failed")
