@@ -1799,16 +1799,29 @@ def build_variant_key(attrs: dict) -> str:
 
 # ---- Importação CSV ) -----------------------------
 
+from fastapi import UploadFile, File, Form
+from io import StringIO
+import csv
+
+def _parse_price(s: str):
+    if not s:
+        return None
+    s = s.strip().replace("[FIXED]", "").strip().replace(",", ".")
+    try:
+        v = float(s)
+        return v if v != 0.0 else None
+    except Exception:
+        return None
 
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
                              namespace: str = Form("boasafra")):
     """
-    Importa um CSV exportado do BigCommerce (produtos + SKUs).
-    Regras:
-      - Ignora 'Rule'
-      - 'Product' -> produto principal
-      - 'SKU' -> variante, herdando dados do produto + nome próprio
+    Importa CSV do BigCommerce.
+      - Ignora linhas 'Rule'
+      - 'Product' = produto base
+      - 'SKU' = variante (herda do produto; url = base + #sku=ref)
+      - Descrição da variante = descrição do produto + "Variante: <Product Name da SKU>"
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -1816,26 +1829,28 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
     imported, failed, skipped = 0, 0, 0
     items_out = []
-    current_product = None
+    current_product = None  # último produto visto
 
     for row in reader:
         try:
             row_type = (row.get("Item Type") or "").strip()
- # PATCH → se for rule, ignora logo
-        if row_type.lower() == "rule":
-            skipped += 1
-            items_out.append({"ok": True, "type": "rule", "skipped": True})
-            continue
-            
+
+            # 1) ignora regras logo
+            if row_type.lower() == "rule":
+                skipped += 1
+                items_out.append({"ok": True, "type": "rule", "skipped": True})
+                continue
+
+            # 2) campos comuns
             name = (row.get("Product Name") or "").strip()
             ref = (row.get("Product Code/SKU") or "").strip()
-            price_str = (row.get("Price") or "").strip()
-            price = float(price_str) if price_str not in ("", "0", "0.0", "0.00") else None
+            price = _parse_price(row.get("Price") or "")
             brand = (row.get("Brand Name") or "").strip() or None
             summary = (row.get("Product Description") or "").strip()
             image_url = (row.get("Product Image URL") or "").strip() or None
             base_url = (row.get("Product URL") or "").strip()
 
+            # 3) produto base
             if row_type == "Product":
                 current_product = {
                     "name": name,
@@ -1844,7 +1859,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     "price": price,
                     "brand": brand,
                     "image_url": image_url,
-                    "url": base_url
+                    "url": base_url,
                 }
                 _upsert_catalog_row(
                     ns=namespace,
@@ -1860,20 +1875,24 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     dimensions=None,
                     material=None,
                     image_url=current_product["image_url"],
-                    variant_attrs=None
+                    variant_attrs=None,
                 )
                 items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
                 imported += 1
+                continue
 
- 
-            
+            # 4) variante (SKU)
             elif row_type == "SKU" and current_product:
-                # nome e descrição herdados + variante
-                var_name = name
+                var_name = name  # “Product Name” da SKU
+                # descrição = desc do produto + linha de variante
                 summary_v = current_product["summary"]
                 if var_name:
-                    summary_v += f"\nVariante: {var_name}"
+                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {var_name}").strip()
+
+                # preço: usa o da SKU se houver; senão herda do produto
                 price_v = price if price is not None else current_product["price"]
+
+                # URL estável por variante
                 url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
                 _upsert_catalog_row(
@@ -1890,14 +1909,23 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     dimensions=None,
                     material=None,
                     image_url=current_product["image_url"],
-                    variant_attrs=var_name or None
+                    variant_attrs=var_name or None,
                 )
-                items_out.append({"ok": True, "type": "variant", "name": var_name, "ref": ref, "url": url_variant, "price": price_v})
+                items_out.append({
+                    "ok": True,
+                    "type": "variant",
+                    "name": var_name,
+                    "ref": ref,
+                    "url": url_variant,
+                    "price": price_v,
+                })
                 imported += 1
+                continue
 
+            # 5) qualquer outra coisa: ignorar
             else:
                 skipped += 1
-                items_out.append({"ok": True, "type": row_type.lower() or "unknown", "skipped": True})
+                items_out.append({"ok": True, "type": (row_type or "unknown").lower(), "skipped": True})
 
         except Exception as e:
             failed += 1
@@ -1909,9 +1937,8 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "imported": imported,
         "failed": failed,
         "skipped": skipped,
-        "items": items_out
+        "items": items_out,
     }
-
 # ---- CRUD leve -------------------------------------------------------------------------
 from fastapi import Request
 
