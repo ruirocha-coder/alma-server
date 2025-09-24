@@ -1823,7 +1823,9 @@ async def catalog_import_csv(file: UploadFile = File(...),
     except Exception:
         text = raw.decode("latin-1")
 
-    sio = io.StringIO(text, newline="")
+
+                                 
+    sio = StringIO(text, newline="")
     reader = csv.DictReader(sio)
 
     # utilitários
