@@ -1798,198 +1798,110 @@ def build_variant_key(attrs: dict) -> str:
 
 
 # ---- Importação CSV ) -----------------------------
-from fastapi import UploadFile, File, Form
-from io import StringIO
-import csv
 
-def _csv_parse_price(v: str) -> float | None:
-    s = (v or "").strip()
-    if not s:
-        return None
-    s = s.replace("€", "").replace("EUR", "").strip()
-    # aceitar vírgula decimal
-    s = s.replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
 
 @app.post("/catalog/import-csv")
-async def catalog_import_csv(file: UploadFile = File(...), namespace: str = Form(None)):
+async def catalog_import_csv(file: UploadFile = File(...),
+                             namespace: str = Form("boasafra")):
     """
-    Importa CSV do BigCommerce com colunas:
-      - Type ∈ {Product, SKU, Rule}
-      - Product Code/SKU (sempre presente nas variantes)
-      - Product Name (produto e/ou variante)
-      - Product URL (ou URL)
-      - Price
-      - Brand Name (no produto)
-      - Description (no produto)
-      - Image URL (no produto)
+    Importa um CSV exportado do BigCommerce (produtos + SKUs).
     Regras:
-      - Ignora Type=Rule
-      - Para SKU:
-         * ref = row["Product Code/SKU"]
-         * url = url_do_produto + "#sku=" + ref
-         * name = "<nome produto> — <Product Name(da variante)>"
-         * summary = "<descrição do produto>\nVariante: <Product Name da variante>"
-         * price = Price da variante (se vier), senão None
+      - Ignora 'Rule'
+      - 'Product' -> produto principal
+      - 'SKU' -> variante, herdando dados do produto + nome próprio
     """
-    ns = (namespace or DEFAULT_NAMESPACE)
-
-    # 1) ler conteúdo (UTF-8 com BOM)
-    raw = await file.read()
-    text = raw.decode("utf-8-sig", errors="replace")
+    text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
-
     reader = csv.DictReader(sio)
+
     imported, failed, skipped = 0, 0, 0
     items_out = []
-
-    # contexto do produto atual (para agrupar SKUs subsequentes)
-    ctx = {
-        "url": None,
-        "name": None,
-        "summary": "",
-        "brand": None,
-        "image_url": None,
-        "currency": "EUR",
-    }
-
-    def _get(row: dict, key: str) -> str:
-        # pega a chave EXATA; se não existir, devolve ""
-        return (row.get(key) or "").strip()
+    current_product = None
 
     for row in reader:
-        typ = _get(row, "Type")
+        try:
+            row_type = (row.get("Item Type") or "").strip()
+            name = (row.get("Product Name") or "").strip()
+            ref = (row.get("Product Code/SKU") or "").strip()
+            price_str = (row.get("Price") or "").strip()
+            price = float(price_str) if price_str not in ("", "0", "0.0", "0.00") else None
+            brand = (row.get("Brand Name") or "").strip() or None
+            summary = (row.get("Product Description") or "").strip()
+            image_url = (row.get("Product Image URL") or "").strip() or None
+            base_url = (row.get("Product URL") or "").strip()
 
-        # -- ignorar regras --
-        if typ.lower() == "rule":
-            skipped += 1
-            items_out.append({"ok": True, "type": "rule", "skipped": True})
-            continue
+            if row_type == "Product":
+                current_product = {
+                    "name": name,
+                    "summary": summary,
+                    "ref": ref or None,
+                    "price": price,
+                    "brand": brand,
+                    "image_url": image_url,
+                    "url": base_url
+                }
+                _upsert_catalog_row(
+                    ns=namespace,
+                    name=current_product["name"],
+                    summary=current_product["summary"],
+                    url=current_product["url"],
+                    source="csv",
+                    ref=current_product["ref"],
+                    price=current_product["price"],
+                    currency="EUR",
+                    iva_pct=23.0,
+                    brand=current_product["brand"],
+                    dimensions=None,
+                    material=None,
+                    image_url=current_product["image_url"],
+                    variant_attrs=None
+                )
+                items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
+                imported += 1
 
-        # -- produto base --
-        if typ.lower() == "product":
-            prod_name = _get(row, "Product Name") or _get(row, "Name")
-            prod_url  = _get(row, "Product URL") or _get(row, "URL")
-            prod_url  = _canon_ig_url(prod_url) or prod_url
-            if not prod_url:
-                failed += 1
-                items_out.append({"ok": False, "type": "product", "error": "produto sem URL", "name": prod_name})
-                # limpa contexto (produto sem URL não pode ser base para variantes)
-                ctx = {"url": None, "name": None, "summary": "", "brand": None, "image_url": None, "currency": "EUR"}
-                continue
+            elif row_type == "SKU" and current_product:
+                # nome e descrição herdados + variante
+                var_name = name
+                summary_v = current_product["summary"]
+                if var_name:
+                    summary_v += f"\nVariante: {var_name}"
+                price_v = price if price is not None else current_product["price"]
+                url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
-            # descrição / marca / imagem (do produto)
-            prod_summary = _get(row, "Description") or _get(row, "Meta Description")
-            brand = _get(row, "Brand Name") or None
-            image_url = _get(row, "Image URL") or None
+                _upsert_catalog_row(
+                    ns=namespace,
+                    name=f"{current_product['name']} — {var_name}" if var_name else current_product["name"],
+                    summary=summary_v,
+                    url=url_variant,
+                    source="csv",
+                    ref=ref or None,
+                    price=price_v,
+                    currency="EUR",
+                    iva_pct=23.0,
+                    brand=current_product["brand"],
+                    dimensions=None,
+                    material=None,
+                    image_url=current_product["image_url"],
+                    variant_attrs=var_name or None
+                )
+                items_out.append({"ok": True, "type": "variant", "name": var_name, "ref": ref, "url": url_variant, "price": price_v})
+                imported += 1
 
-            # preço do produto (não essencial p/ variantes)
-            prod_price = _csv_parse_price(_get(row, "Price"))
-            currency = _get(row, "Currency") or "EUR"
+            else:
+                skipped += 1
+                items_out.append({"ok": True, "type": row_type.lower() or "unknown", "skipped": True})
 
-            # upsert do produto base
-            _upsert_catalog_row(
-                ns=ns,
-                name=prod_name or prod_url,
-                summary=prod_summary,
-                url=prod_url,
-                source="csv",
-                ref=_get(row, "Product Code/SKU") or None,   # pode vir vazio no produto
-                price=prod_price,
-                currency=currency,
-                iva_pct=None,
-                brand=brand,
-                dimensions=None,
-                material=None,
-                image_url=image_url,
-                variant_attrs=None
-            )
-            imported += 1
-            items_out.append({"ok": True, "type": "product", "name": prod_name, "url": prod_url})
-
-            # atualizar contexto
-            ctx = {
-                "url": prod_url,
-                "name": prod_name or prod_url,
-                "summary": prod_summary or "",
-                "brand": brand,
-                "image_url": image_url,
-                "currency": currency or "EUR",
-            }
-            continue
-
-        # -- variante (SKU) --
-        if typ.lower() == "sku":
-            if not ctx["url"]:
-                failed += 1
-                items_out.append({"ok": False, "type": "variant", "error": "variante antes de Product", "name": _get(row, "Product Name")})
-                continue
-
-            ref = _get(row, "Product Code/SKU")  # <- EXACTO como no teu ficheiro
-            if not ref:
-                failed += 1
-                items_out.append({
-                    "ok": False, "type": "variant",
-                    "error": "variante sem Product Code (ref)",
-                    "url": ctx["url"]
-                })
-                continue
-
-            var_name_txt = _get(row, "Product Name")  # nome específico da variante (texto exibido)
-            v_price = _csv_parse_price(_get(row, "Price"))
-            # construir URL única por variante (mantém a do produto para navegação)
-            url_variant = f"{ctx['url']}#sku={ref}"
-
-            # construir summary: descrição do produto + linha “Variante: …”
-            summary = ctx["summary"] or ""
-            if var_name_txt:
-                summary = (summary + ("\n" if summary else "")) + f"Variante: {var_name_txt}"
-
-            # nome final visível: "Produto — Variante"
-            name_final = f"{ctx['name']} — {var_name_txt}" if var_name_txt else ctx["name"]
-
-            _upsert_catalog_row(
-                ns=ns,
-                name=name_final,
-                summary=summary,
-                url=url_variant,
-                source="csv",
-                ref=ref,
-                price=v_price,
-                currency=ctx["currency"] or "EUR",
-                iva_pct=None,
-                brand=ctx["brand"],
-                dimensions=None,
-                material=None,
-                image_url=ctx["image_url"],
-                variant_attrs=var_name_txt or None
-            )
-
-            imported += 1
-            items_out.append({
-                "ok": True,
-                "type": "variant",
-                "name": name_final,
-                "ref": ref,
-                "url": url_variant,
-                "price": v_price
-            })
-            continue
-
-        # -- tipo desconhecido --
-        skipped += 1
-        items_out.append({"ok": True, "type": typ or "unknown", "skipped": True})
+        except Exception as e:
+            failed += 1
+            items_out.append({"ok": False, "error": str(e)})
 
     return {
         "ok": True,
-        "namespace": ns,
+        "namespace": namespace,
         "imported": imported,
         "failed": failed,
         "skipped": skipped,
-        "items": items_out[:120]  # corta para resposta não explodir
+        "items": items_out
     }
 
 # ---- CRUD leve -------------------------------------------------------------------------
