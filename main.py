@@ -1939,6 +1939,51 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "skipped": skipped,
         "items": items_out,
     }
+
+# ---------------------------------------------------------------------------------------
+# Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
+# ---------------------------------------------------------------------------------------
+from fastapi import Form
+
+@app.post("/catalog/clear")
+async def catalog_clear(namespace: str = Form(None),
+                        brand: str = Form(None),
+                        url_prefix: str = Form(None)):
+    """
+    Apaga items do catálogo de forma seletiva:
+      - Se só vier 'namespace': apaga tudo desse namespace.
+      - Se vier 'namespace' + 'brand': apaga apenas itens dessa marca no namespace.
+      - Se vier 'namespace' + 'url_prefix': apaga apenas itens cuja URL começa por esse prefixo.
+    NOTA: Pelo menos 'namespace' é obrigatório.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    if not ns:
+        return {"ok": False, "error": "Falta 'namespace'."}
+
+    b = (brand or "").strip() or None
+    p = (url_prefix or "").strip() or None
+
+    where = ["namespace=?"]
+    params = [ns]
+
+    if b:
+        where.append("brand=?")
+        params.append(b)
+
+    if p:
+        where.append("url LIKE ?")
+        params.append(f"{p}%")
+
+    where_clause = " AND ".join(where)
+    try:
+        with _catalog_conn() as c:
+            before = c.execute(f"SELECT COUNT(*) FROM catalog_items WHERE {where_clause}", tuple(params)).fetchone()[0]
+            c.execute(f"DELETE FROM catalog_items WHERE {where_clause}", tuple(params))
+            c.commit()
+        return {"ok": True, "namespace": ns, "brand": b, "url_prefix": p, "deleted": before}
+    except Exception as e:
+        log.exception("[catalog/clear] falhou")
+        return {"ok": False, "namespace": ns, "brand": b, "url_prefix": p, "error": str(e)}
 # ---- CRUD leve -------------------------------------------------------------------------
 from fastapi import Request
 
