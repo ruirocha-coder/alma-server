@@ -1875,6 +1875,8 @@ def build_variant_key(attrs: dict) -> str:
 
 # ---- Importação CSV ) -----------------------------
 
+# ---- Importação CSV (9 campos essenciais) ----------------------------------
+
 from fastapi import UploadFile, File, Form
 from io import StringIO
 import csv
@@ -1894,10 +1896,14 @@ async def catalog_import_csv(file: UploadFile = File(...),
                              namespace: str = Form("boasafra")):
     """
     Importa CSV do BigCommerce.
+    Regras:
       - Ignora linhas 'Rule'
       - 'Product' = produto base
       - 'SKU' = variante (herda do produto; url = base + #sku=ref)
       - Descrição da variante = descrição do produto + "Variante: <Product Name da SKU>"
+      - Disponibilidade (Product Availability) é injectada no summary (sem alterar schema)
+    Guarda apenas a informação essencial nos campos:
+      item_type (implícito), name, ref, price, brand, summary(+availability), url, variant_attrs (texto), availability(embebida no summary)
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -1905,36 +1911,42 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
     imported, failed, skipped = 0, 0, 0
     items_out = []
-    current_product = None  # último produto visto
+    current_product = None  # último produto base visto
 
     for row in reader:
         try:
             row_type = (row.get("Item Type") or "").strip()
 
-            # 1) ignora regras logo
+            # 1) ignora regras
             if row_type.lower() == "rule":
                 skipped += 1
                 items_out.append({"ok": True, "type": "rule", "skipped": True})
                 continue
 
-            # 2) campos comuns
-            name = (row.get("Product Name") or "").strip()
-            ref = (row.get("Product Code/SKU") or "").strip()
-            price = _parse_price(row.get("Price") or "")
-            brand = (row.get("Brand Name") or "").strip() or None
-            summary = (row.get("Product Description") or "").strip()
-            image_url = (row.get("Product Image URL") or "").strip() or None
-            base_url = (row.get("Product URL") or "").strip()
+            # 2) campos do CSV (essenciais)
+            name         = (row.get("Product Name") or "").strip()
+            ref          = (row.get("Product Code/SKU") or "").strip()
+            price        = _parse_price(row.get("Price") or "")
+            brand        = (row.get("Brand Name") or "").strip() or None
+            summary_raw  = (row.get("Product Description") or "").strip()
+            base_url     = (row.get("Product URL") or "").strip()
+            availability = (row.get("Product Availability") or "").strip()  # será embebido no summary
+
+            # helper: summary + disponibilidade (se existir)
+            def _with_availability(s: str) -> str:
+                s = (s or "").strip()
+                if availability:
+                    s = (s + ("\n" if s else "") + f"Disponibilidade: {availability}").strip()
+                return s
 
             # 3) produto base
             if row_type == "Product":
                 current_product = {
                     "name": name,
-                    "summary": summary,
+                    "summary": _with_availability(summary_raw),
                     "ref": ref or None,
                     "price": price,
                     "brand": brand,
-                    "image_url": image_url,
                     "url": base_url,
                 }
                 _upsert_catalog_row(
@@ -1945,30 +1957,29 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     source="csv",
                     ref=current_product["ref"],
                     price=current_product["price"],
-                    currency="EUR",
-                    iva_pct=23.0,
+                    currency=None,        # não guardamos moeda (assume EUR)
+                    iva_pct=None,         # preços já incluem IVA; não guardamos
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=current_product["image_url"],
-                    variant_attrs=None,
+                    image_url=None,       # não usamos imagem nesta fase
+                    variant_attrs=None,   # produto base não tem attrs de variante
                 )
                 items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
                 imported += 1
                 continue
 
-            # 4) variante (SKU)
+            # 4) variante (SKU): herda do produto base
             elif row_type == "SKU" and current_product:
-                var_name = name  # “Product Name” da SKU
-                # descrição = desc do produto + linha de variante
-                summary_v = current_product["summary"]
+                var_name   = name  # “Product Name” da SKU (texto humano da variante)
+                summary_v  = _with_availability(current_product["summary"])
                 if var_name:
                     summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {var_name}").strip()
 
                 # preço: usa o da SKU se houver; senão herda do produto
                 price_v = price if price is not None else current_product["price"]
 
-                # URL estável por variante
+                # URL única por variante (sem mexer no schema)
                 url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
                 _upsert_catalog_row(
@@ -1979,13 +1990,13 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     source="csv",
                     ref=ref or None,
                     price=price_v,
-                    currency="EUR",
-                    iva_pct=23.0,
+                    currency=None,        # não guardamos moeda (assume EUR)
+                    iva_pct=None,         # preços com IVA incluído
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=current_product["image_url"],
-                    variant_attrs=var_name or None,
+                    image_url=None,
+                    variant_attrs=var_name or None,  # guardamos o texto da variante
                 )
                 items_out.append({
                     "ok": True,
@@ -2015,7 +2026,6 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "skipped": skipped,
         "items": items_out,
     }
-
 # ---------------------------------------------------------------------------------------
 # Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
 # ---------------------------------------------------------------------------------------
