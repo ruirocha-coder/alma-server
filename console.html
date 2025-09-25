@@ -76,7 +76,7 @@
     border:1px solid var(--chip-br);border-radius:14px;padding:16px;box-shadow:var(--shadow)}
   .catalog-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
   .catalog-toolbar .right{margin-left:auto}
-  .catalog-editor table{width:100%;border-collapse:collapse;font-size:13px;min-width:1200px}
+  .catalog-editor table{width:100%;border-collapse:collapse;font-size:13px;min-width:1100px}
   .catalog-editor th,.catalog-editor td{border-bottom:1px solid #2a2a31;padding:8px 6px;vertical-align:top}
   .catalog-editor thead th{position:sticky;top:0;background:#111217;z-index:1}
   .catalog-editor td a{color:#fff;text-decoration:underline}
@@ -85,7 +85,6 @@
   .catalog-editor textarea{min-height:70px;resize:vertical}
   .badge-changed{display:inline-block;background:#1f2531;border:1px solid #2d3a52;color:#9fc3ff;
     padding:3px 8px;border-radius:999px;font-size:11px;margin-left:8px}
-  .thumb{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid #2a2a31;background:#0d0e12}
 </style>
 </head>
 <body>
@@ -255,18 +254,16 @@
       <div id="catTableWrap" style="max-height:540px;overflow:auto;border:1px solid var(--chip-br);border-radius:10px">
         <table id="catTable">
           <thead>
+            <!-- CABEÇALHO AJUSTADO -->
             <tr>
-              <th style="width:3%">#</th>
-              <th style="width:7%">Thumb</th>
-              <th style="width:8%">Ref</th>
-              <th style="width:13%">Nome</th>
+              <th style="width:4%">#</th>
+              <th style="width:10%">Ref</th>
+              <th style="width:16%">Nome</th>
               <th style="width:22%">Resumo</th>
+              <th style="width:14%">Variante</th>
+              <th style="width:10%">Disponibilidade</th>
               <th style="width:9%">Preço</th>
-              <th style="width:6%">Moeda</th>
-              <th style="width:6%">IVA %</th>
               <th style="width:10%">Marca</th>
-              <th style="width:12%">Dimensões</th>
-              <th style="width:12%">Material</th>
               <th style="width:18%">URL</th>
               <th style="width:8%">Fonte</th>
               <th style="width:11%">Atualizado</th>
@@ -459,7 +456,7 @@
     try{ await navigator.clipboard.writeText(txt); printResult({ok:true,copied:true,lines:txt.split('\n').filter(Boolean).length}); }catch{ printResult({ok:false,error:'Clipboard bloqueado'}); }
   });
 
-  // ------- Ingestão em lote -------
+  // ------- Ingerir em lote -------
   const state = { stop:false };
   $('#btnBatchStart').addEventListener('click', async ()=>{
     const raw = $('#batchUrls').value.trim();
@@ -587,7 +584,7 @@
     }
   });
 
-  // ====== Catálogo (Editor) grande, por baixo dos tiles ======
+  // ====== Catálogo (Editor) grande ======
   const Cat = {
     offset: 0, limit: 50, query: '',
     total: 0, items: [],
@@ -615,6 +612,20 @@
   function escapeHtml(s){ return (s??'').toString().replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function val(v, d=''){ return (v===undefined || v===null) ? d : v; }
 
+  // NEW: helpers para extrair campos visíveis da variante e disponibilidade
+  function extractVariant(summary){
+    if (!summary) return '';
+    const m = /(?:^|\n)\s*Variante:\s*(.+)/i.exec(summary);
+    return m ? m[1].trim() : '';
+  }
+  function extractAvailability(summary){
+    if (!summary) return '';
+    const m1 = /(?:^|\n)\s*Prazo\s*de\s*entrega:\s*(.+)/i.exec(summary);
+    if (m1) return m1[1].trim();
+    const m2 = /(?:^|\n)\s*Disponibilidade:\s*(.+)/i.exec(summary);
+    return m2 ? m2[1].trim() : '';
+  }
+
   async function loadCatalogEditor(){
     Cat.limit = Math.max(10, Math.min(500, parseInt($('#catPageSize').value||'50',10)));
     const url = `/catalog/list?q=${encodeURIComponent(Cat.query||'')}&limit=${Cat.limit}&offset=${Cat.offset}`;
@@ -626,7 +637,7 @@
     Cat.originalById.clear();
 
     if (!j || j.ok === false || !Array.isArray(j.items)){
-      tb.innerHTML = `<tr><td colspan="15">Falha a carregar catálogo.</td></tr>`;
+      tb.innerHTML = `<tr><td colspan="12">Falha a carregar catálogo.</td></tr>`;
       info.textContent = '—';
       return;
     }
@@ -634,18 +645,14 @@
     Cat.total = j.total || (j.items||[]).length + Cat.offset;
 
     (j.items||[]).forEach((row, idx)=>{
+      // Mapeamento enxuto: sem imagem, moeda, IVA, dimensões, material
       const original = {
         id: row.id,
-        image_url: val(row.image_url,''),
         ref: val(row.ref,''),
         name: val(row.name || row.title,''),
         summary: val(row.summary || row.snippet,''),
         price: val(row.price,''),
-        currency: val(row.currency,''),
-        iva_pct: val(row.iva_pct,''),
         brand: val(row.brand,''),
-        dimensions: val(row.dimensions,''),
-        material: val(row.material,''),
         url: val(row.url || row.link,''),
         source: val(row.source || row.host,''),
         updated_at: val(row.updated_at,'')
@@ -654,23 +661,15 @@
       Cat.items.push(original);
 
       const tr = document.createElement('tr');
-      const img = original.image_url
-        ? `<img class="thumb" src="${escapeHtml(original.image_url)}" onerror="this.src='';this.style.background='#0d0e12';">`
-        : `<div class="thumb"></div>`;
       tr.innerHTML = `
         <td>${Cat.offset + idx + 1}</td>
-        <td>${img}
-            <input type="text" placeholder="image_url…" value="${escapeHtml(original.image_url)}" data-id="${row.id}" data-field="image_url" style="margin-top:6px">
-        </td>
         <td><input type="text" value="${escapeHtml(original.ref)}" data-id="${row.id}" data-field="ref"></td>
         <td><input type="text" value="${escapeHtml(original.name)}" data-id="${row.id}" data-field="name"></td>
         <td><textarea data-id="${row.id}" data-field="summary">${escapeHtml(original.summary)}</textarea></td>
+        <td><input type="text" value="${escapeHtml(extractVariant(original.summary))}" readonly></td>
+        <td><input type="text" value="${escapeHtml(extractAvailability(original.summary))}" readonly></td>
         <td><input type="number" step="0.01" placeholder="0.00" value="${escapeHtml(original.price)}" data-id="${row.id}" data-field="price"></td>
-        <td><input type="text" placeholder="EUR" value="${escapeHtml(original.currency)}" data-id="${row.id}" data-field="currency"></td>
-        <td><input type="number" step="0.01" placeholder="23" value="${escapeHtml(original.iva_pct)}" data-id="${row.id}" data-field="iva_pct"></td>
         <td><input type="text" value="${escapeHtml(original.brand)}" data-id="${row.id}" data-field="brand"></td>
-        <td><input type="text" value="${escapeHtml(original.dimensions)}" data-id="${row.id}" data-field="dimensions"></td>
-        <td><input type="text" value="${escapeHtml(original.material)}" data-id="${row.id}" data-field="material"></td>
         <td><input type="text" value="${escapeHtml(original.url)}" data-id="${row.id}" data-field="url"></td>
         <td><input type="text" value="${escapeHtml(original.source)}" data-id="${row.id}" data-field="source"></td>
         <td class="tiny">${escapeHtml(original.updated_at || '—')}</td>
@@ -679,18 +678,13 @@
       tb.appendChild(tr);
     });
 
-    // bind inputs
-    tb.querySelectorAll('input[type=text], textarea, input[type=number]').forEach(el=>{
+    // bind inputs editáveis
+    tb.querySelectorAll('input[type=text][data-id], textarea[data-id], input[type=number][data-id]').forEach(el=>{
       el.addEventListener('input', (ev)=>{
         const id = parseInt(ev.target.dataset.id,10);
         const field = ev.target.dataset.field;
         const valx = ev.target.value;
         markChanged(id, field, valx);
-        if (field==='image_url'){
-          const row = ev.target.closest('tr');
-          const imgEl = row.querySelector('.thumb');
-          if (imgEl && imgEl.tagName==='IMG'){ imgEl.src = valx || ''; }
-        }
       });
     });
     // botão repor
@@ -703,11 +697,18 @@
         row.querySelectorAll('[data-id]').forEach(el=>{
           const f = el.dataset.field;
           el.value = orig[f] ?? '';
-          if (f==='image_url'){
-            const imgEl = row.querySelector('.thumb');
-            if (imgEl && imgEl.tagName==='IMG'){ imgEl.src = orig[f] || ''; }
-          }
         });
+        // recalcular campos derivados (Variante/Disponibilidade)
+        const s = orig.summary || '';
+        row.querySelectorAll('input[readonly]').forEach(el=>{
+          const hdr = el.closest('td').previousElementSibling?.textContent || '';
+        });
+        const cells = row.querySelectorAll('td');
+        // Variante = coluna 5 (index 4)
+        cells[4].querySelector('input').value = extractVariant(s);
+        // Disponibilidade = coluna 6 (index 5)
+        cells[5].querySelector('input').value = extractAvailability(s);
+
         Cat.changes.delete(id);
         $('#catChangedBadge').style.display = Cat.changes.size ? 'inline-block' : 'none';
       });
@@ -719,47 +720,71 @@
   }
 
   // Toolbar editor
-  $('#catLoad').addEventListener('click', ()=>{ Cat.query = $('#catSearch').value.trim(); Cat.offset=0; loadCatalogEditor(); });
-  $('#catPrev2').addEventListener('click', ()=>{ Cat.offset = Math.max(0, Cat.offset - Cat.limit); loadCatalogEditor(); });
-  $('#catNext2').addEventListener('click', ()=>{ Cat.offset = Cat.offset + Cat.limit; loadCatalogEditor(); });
-  $('#catPageSize').addEventListener('change', ()=>{ Cat.offset=0; loadCatalogEditor(); });
+  $('#catLoad').addEventListener('click', ()=>{
+    Cat.query = $('#catSearch').value.trim();
+    Cat.offset = 0;
+    loadCatalogEditor();
+  });
+
+  $('#catPrev2').addEventListener('click', ()=>{
+    Cat.offset = Math.max(0, Cat.offset - Cat.limit);
+    loadCatalogEditor();
+  });
+
+  $('#catNext2').addEventListener('click', ()=>{
+    Cat.offset = Cat.offset + Cat.limit;
+    loadCatalogEditor();
+  });
+
+  $('#catPageSize').addEventListener('change', ()=>{
+    Cat.offset = 0;
+    loadCatalogEditor();
+  });
 
   // Copiar patch (JSON)
   $('#catCopyPatch').addEventListener('click', async ()=>{
-    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    const patch = Array.from(Cat.changes.entries()).map(([id, fields]) => ({ id, ...fields }));
     const txt = JSON.stringify({ items: patch }, null, 2);
-    try{ await navigator.clipboard.writeText(txt); printResult({ ok:true, copied:true, count:patch.length }); }
-    catch{ printResult({ ok:true, copied:false, count:patch.length, payload:patch }); }
+    try {
+      await navigator.clipboard.writeText(txt);
+      printResult({ ok: true, copied: true, count: patch.length });
+    } catch {
+      printResult({ ok: true, copied: false, count: patch.length, payload: patch });
+    }
   });
 
   // Aplicar alterações (POST /catalog/update se existir)
   $('#catSave').addEventListener('click', async ()=>{
-    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
-    if (!patch.length){ printResult({ ok:true, message:'Nada para gravar.'}); return; }
-    try{
+    const patch = Array.from(Cat.changes.entries()).map(([id, fields]) => ({ id, ...fields }));
+    if (!patch.length){
+      printResult({ ok: true, message: 'Nada para gravar.' });
+      return;
+    }
+    try {
       const r = await fetch('/catalog/update', {
-        method:'POST', headers:{'Content-Type':'application/json'},
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ items: patch })
       });
       if (r.status === 404){
         printResult({
-          ok:false,
-          error:"Endpoint /catalog/update não existe no backend.",
-          dica:"Usa “Copiar alterações (JSON)” e aplica no servidor, ou cria o endpoint /catalog/update."
+          ok: false,
+          error: "Endpoint /catalog/update não existe no backend.",
+          dica: "Usa “Copiar alterações (JSON)” e aplica manualmente, ou cria o endpoint /catalog/update."
         });
         return;
       }
-      const j = await r.json().catch(()=>({ok:false}));
+      const j = await r.json().catch(()=>({ ok:false }));
       if (j && j.ok !== false){
         Cat.changes.clear();
         $('#catChangedBadge').style.display = 'none';
         await loadCatalogEditor();
         printResult({ ok:true, saved:true, server:j });
-      }else{
-        printResult({ ok:false, server:j||{} });
+      } else {
+        printResult({ ok:false, server:j || {} });
       }
-    }catch(e){
-      printResult({ ok:false, error: String(e && e.message || e) });
+    } catch (e){
+      printResult({ ok:false, error: String((e && e.message) || e) });
     }
   });
 
