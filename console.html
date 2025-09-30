@@ -85,6 +85,7 @@
   .catalog-editor textarea{min-height:70px;resize:vertical}
   .badge-changed{display:inline-block;background:#1f2531;border:1px solid #2d3a52;color:#9fc3ff;
     padding:3px 8px;border-radius:999px;font-size:11px;margin-left:8px}
+  .thumb{width:54px;height:54px;object-fit:cover;border-radius:6px;border:1px solid #2a2a31;background:#0d0e12}
 </style>
 </head>
 <body>
@@ -107,7 +108,7 @@
     <section class="param-bar">
       <div class="field" style="min-width:240px">
         <label>Namespace (default)</label>
-        <input type="text" id="ns" placeholder="ex.: boasafra">
+        <input type="text" id="ns" placeholder="ex.: boasafra" value="boasafra">
       </div>
       <div class="field">
         <label>max_pages</label>
@@ -230,6 +231,45 @@
         <div class="tiny" id="catCsvStats">—</div>
         <div class="list" id="catCsvList"></div>
         <div class="tiny">Formato flexível: deteta cabeçalhos comuns (name/title, summary/description, ref/sku, price, currency, iva_pct, brand, dimensions, material, image_url, url/link).</div>
+      </div>
+
+      <!-- 🔎 Consultar Catálogo (Tabela) -->
+      <div class="tile" style="grid-column: 1 / -1">
+        <h3>Consultar Catálogo (Tabela)</h3>
+
+        <div class="inline" style="align-items:center">
+          <input id="tabNs" type="text" placeholder="namespace" value="boasafra" />
+          <input id="tabQ" type="text" placeholder="filtro (nome, resumo, URL, ref, marca) — opcional" />
+          <label style="display:flex;align-items:center;gap:6px;max-width:160px">
+            <input id="tabOnlyVar" type="checkbox"> Só variantes
+          </label>
+          <input id="tabPageSize" type="number" min="10" max="500" value="50" title="itens por página" />
+          <button id="btnTabList" class="btn">Listar</button>
+          <button id="btnTabPrev" class="btn">◀</button>
+          <button id="btnTabNext" class="btn">▶</button>
+        </div>
+
+        <div class="tiny" id="tabInfo">—</div>
+
+        <div id="tabWrap" style="max-height:520px;overflow:auto;border:1px solid #26262b;border-radius:10px;margin-top:8px">
+          <table id="tabCat" style="width:100%;border-collapse:collapse;font-size:13px;min-width:1100px">
+            <thead style="position:sticky;top:0;background:#111217;z-index:1">
+              <tr>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:5%">#</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:10%">NS</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:12%">Ref</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:18%">Nome</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:26%">Resumo</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:15%">Variante</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:10%">Preço (€)</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:10%">Marca</th>
+                <th style="text-align:left;border-bottom:1px solid #2a2a31;padding:8px 6px;width:20%">URL</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
       </div>
 
     </section>
@@ -563,6 +603,7 @@
         addLine(`✔ Importação concluída (OK: ${imported} • Falhas: ${failed})`, 'ok');
         printResult(j);
         await loadCatalogEditor();
+        await Tab.load(); // refrescar visor tabela
       } else {
         statsEl.textContent = 'Falha no upload';
         addLine(`✖ Erro: ${JSON.stringify(j).slice(0,200)}`, 'err');
@@ -584,7 +625,7 @@
     }
   });
 
-  // ====== Catálogo (Editor) grande ======
+  // ====== Catálogo (Editor) grande, por baixo dos tiles ======
   const Cat = {
     offset: 0, limit: 50, query: '',
     total: 0, items: [],
@@ -645,7 +686,6 @@
     Cat.total = j.total || (j.items||[]).length + Cat.offset;
 
     (j.items||[]).forEach((row, idx)=>{
-      // Mapeamento enxuto: sem imagem, moeda, IVA, dimensões, material
       const original = {
         id: row.id,
         ref: val(row.ref,''),
@@ -700,13 +740,8 @@
         });
         // recalcular campos derivados (Variante/Disponibilidade)
         const s = orig.summary || '';
-        row.querySelectorAll('input[readonly]').forEach(el=>{
-          const hdr = el.closest('td').previousElementSibling?.textContent || '';
-        });
         const cells = row.querySelectorAll('td');
-        // Variante = coluna 5 (index 4)
         cells[4].querySelector('input').value = extractVariant(s);
-        // Disponibilidade = coluna 6 (index 5)
         cells[5].querySelector('input').value = extractAvailability(s);
 
         Cat.changes.delete(id);
@@ -743,53 +778,152 @@
 
   // Copiar patch (JSON)
   $('#catCopyPatch').addEventListener('click', async ()=>{
-    const patch = Array.from(Cat.changes.entries()).map(([id, fields]) => ({ id, ...fields }));
+    const patch = Array.from(Cat.changes.entries()).map(([id, fields])=>({ id, ...fields }));
     const txt = JSON.stringify({ items: patch }, null, 2);
-    try {
-      await navigator.clipboard.writeText(txt);
-      printResult({ ok: true, copied: true, count: patch.length });
-    } catch {
-      printResult({ ok: true, copied: false, count: patch.length, payload: patch });
-    }
+    try{ await navigator.clipboard.writeText(txt); printResult({ ok:true, copied:true, count:patch.length }); }
+    catch{ printResult({ ok:true, copied:false, count:patch.length, payload:patch }); }
   });
 
   // Aplicar alterações (POST /catalog/update se existir)
   $('#catSave').addEventListener('click', async ()=>{
-    const patch = Array.from(Cat.changes.entries()).map(([id, fields]) => ({ id, ...fields }));
-    if (!patch.length){
-      printResult({ ok: true, message: 'Nada para gravar.' });
-      return;
-    }
-    try {
+    const patch = Array.from(Cat.changes.entries()).map(([id,fields])=>({ id, ...fields }));
+    if (!patch.length){ printResult({ ok:true, message:'Nada para gravar.'}); return; }
+    try{
       const r = await fetch('/catalog/update', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ items: patch })
       });
       if (r.status === 404){
         printResult({
-          ok: false,
-          error: "Endpoint /catalog/update não existe no backend.",
-          dica: "Usa “Copiar alterações (JSON)” e aplica manualmente, ou cria o endpoint /catalog/update."
+          ok:false,
+          error:"Endpoint /catalog/update não existe no backend.",
+          dica:"Usa “Copiar alterações (JSON)” e aplica no servidor, ou cria o endpoint /catalog/update."
         });
         return;
       }
-      const j = await r.json().catch(()=>({ ok:false }));
+      const j = await r.json().catch(()=>({ok:false}));
       if (j && j.ok !== false){
         Cat.changes.clear();
         $('#catChangedBadge').style.display = 'none';
         await loadCatalogEditor();
         printResult({ ok:true, saved:true, server:j });
-      } else {
-        printResult({ ok:false, server:j || {} });
+      }else{
+        printResult({ ok:false, server:j||{} });
       }
-    } catch (e){
-      printResult({ ok:false, error: String((e && e.message) || e) });
+    }catch(e){
+      printResult({ ok:false, error: String(e && e.message || e) });
     }
   });
 
-  // carregamento inicial do editor
-  document.addEventListener('DOMContentLoaded', ()=>{ loadCatalogEditor(); });
+  // =======================
+  // 🔎 Visor do Catálogo (Tabela) — client-side filter + paginação
+  // =======================
+  const Tab = {
+    items: [],
+    filtered: [],
+    page: 0,
+    pageSize: 50
+  };
+
+  function extractVariantFromSummary(summary){
+    if (!summary) return '';
+    const m = /(?:^|\n)\s*Variante:\s*(.+)/i.exec(summary);
+    return m ? m[1].trim() : '';
+  }
+
+  function renderTable(){
+    const tbody = document.querySelector('#tabCat tbody');
+    tbody.innerHTML = '';
+    const start = Tab.page * Tab.pageSize;
+    const end = Math.min(start + Tab.pageSize, Tab.filtered.length);
+    for (let i=start; i<end; i++){
+      const r = Tab.filtered[i];
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${i+1}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(r.namespace||'')}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(r.ref||'')}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(r.name||'')}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(r.summary||'')}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(extractVariantFromSummary(r.summary))}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${r.price!=null?escapeHtml(r.price):''}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px">${escapeHtml(r.brand||'')}</td>
+        <td style="border-bottom:1px solid #2a2a31;padding:8px 6px"><a href="${escapeHtml(r.url||'#')}" target="_blank">${escapeHtml(r.url||'')}</a></td>
+      `;
+      tbody.appendChild(tr);
+    }
+    $('#tabInfo').textContent = `itens filtrados: ${Tab.filtered.length} • página ${Tab.page+1}/${Math.max(1, Math.ceil(Tab.filtered.length/Tab.pageSize))}`;
+  }
+
+  function applyFilters(){
+    const ns = ($('#tabNs').value || $('#ns')?.value || 'boasafra').trim().toLowerCase();
+    const q = ($('#tabQ').value || '').trim().toLowerCase();
+    const onlyVar = $('#tabOnlyVar').checked;
+
+    Tab.filtered = Tab.items.filter(r=>{
+      // filtro por namespace
+      if (ns && (String(r.namespace||'').toLowerCase() !== ns)) return false;
+      // só variantes => URL contém #sku=
+      if (onlyVar && !(r.url||'').includes('#sku=')) return false;
+      if (!q) return true;
+      const hay = [
+        r.name||'',
+        r.summary||'',
+        r.url||'',
+        r.ref||'',
+        r.brand||''
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    Tab.page = 0;
+    renderTable();
+  }
+
+  async function fetchAllForViewer(){
+    // vamos buscar um “lote grande” para facilitar filtragem local
+    // (se o catálogo crescer muito, podemos fazer paginação remota + múltiplas chamadas)
+    const limit = 500, offset = 0;
+    const url = `/catalog/list?q=&limit=${limit}&offset=${offset}`;
+    const r = await fetch(url);
+    const j = await r.json().catch(()=>({ok:false}));
+    if (!j || j.ok === false || !Array.isArray(j.items)){ Tab.items = []; return; }
+    Tab.items = j.items.map(x=>({
+      id: x.id, namespace: x.namespace, name: x.name, summary: x.summary,
+      url: x.url, source: x.source, updated_at: x.updated_at,
+      ref: x.ref, price: x.price, brand: x.brand
+    }));
+  }
+
+  Tab.load = async ()=>{
+    await fetchAllForViewer();
+    Tab.pageSize = Math.max(10, Math.min(500, parseInt($('#tabPageSize').value||'50',10)));
+    applyFilters();
+  };
+
+  $('#btnTabList').addEventListener('click', async ()=>{
+    await Tab.load();
+  });
+
+  $('#btnTabPrev').addEventListener('click', ()=>{
+    if (Tab.page > 0){ Tab.page--; renderTable(); }
+  });
+
+  $('#btnTabNext').addEventListener('click', ()=>{
+    const maxPage = Math.max(0, Math.ceil(Tab.filtered.length/Tab.pageSize)-1);
+    if (Tab.page < maxPage){ Tab.page++; renderTable(); }
+  });
+
+  $('#tabPageSize').addEventListener('change', ()=>{
+    Tab.pageSize = Math.max(10, Math.min(500, parseInt($('#tabPageSize').value||'50',10)));
+    Tab.page = 0; renderTable();
+  });
+
+  // carregamento inicial do editor e preenchimento do visor (com defaults)
+  document.addEventListener('DOMContentLoaded', async ()=>{
+    await loadCatalogEditor();
+    await Tab.load();
+  });
 })();
 </script>
 </body>
