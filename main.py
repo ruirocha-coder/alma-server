@@ -1889,15 +1889,11 @@ def build_variant_key(attrs: dict) -> str:
 
 
 
-
-
-# ---- Importação CSV ) -----------------------------
-
-# ---- Importação CSV (9 campos essenciais) ----------------------------------
+# ---- Importação CSV (limpeza de HTML + variantes) -------------------------------------
 
 from fastapi import UploadFile, File, Form
 from io import StringIO
-import csv
+import csv, re, html
 
 def _parse_price(s: str):
     if not s:
@@ -1909,19 +1905,74 @@ def _parse_price(s: str):
     except Exception:
         return None
 
+def _html_to_text(s: str) -> str:
+    """
+    Converte HTML em texto limpo preservando quebras básicas.
+    - <br>, <br/>, </p> viram quebras de linha
+    - remove tags restantes
+    - unescape de entidades
+    - colapsa espaços/múltiplas linhas
+    """
+    if not s:
+        return ""
+    txt = s
+    # quebras “soft”
+    txt = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", txt)
+    txt = re.sub(r"(?i)</\s*p\s*>", "\n", txt)
+    # remove tags
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    # unescape
+    txt = html.unescape(txt)
+    # colapsa espaços e normaliza linhas
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n\s*\n+", "\n", txt)
+    return txt.strip()
+
+def _clean_variant_name(raw: str) -> str:
+    """
+    Limpa o 'Product Name' da SKU para obter um texto humano de variante.
+    Exemplos:
+      "[CS]Cor=Soft Indigo:https://.../4155.preview.jpg" -> "Cor=Soft Indigo"
+      "[RB]Conjunto Elétrico=Simples Branco 1M" -> "Conjunto Elétrico=Simples Branco 1M"
+      "Cor=Branco,[RB]Cabo=Tecido Areia 1m:https://...png" -> "Cor=Branco, Cabo=Tecido Areia 1m"
+    Regras:
+      - remove prefixos entre [] no início de cada segmento
+      - corta tudo o que vier depois de ":" (tipicamente URL de imagem)
+      - mantém pares chave=valor; junta com ", "
+    """
+    if not raw:
+        return ""
+    # dividir possíveis múltiplos atributos por vírgula
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    cleaned = []
+    for p in parts:
+        # remove prefixos [XX] no início
+        p = re.sub(r"^\[[^\]]+\]\s*", "", p).strip()
+        # se existir um ":" (url de imagem), fica só a parte antes
+        p = p.split(":", 1)[0].strip()
+        cleaned.append(p)
+    # juntar novamente
+    out = ", ".join(cleaned).strip(", ").strip()
+    # fallback: se ficou vazio, tenta pelo menos retirar prefixo global
+    if not out:
+        out = re.sub(r"^\[[^\]]+\]\s*", "", raw).split(":", 1)[0].strip()
+    return out
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
                              namespace: str = Form("boasafra")):
     """
-    Importa CSV do BigCommerce.
+    Importa CSV (BigCommerce export).
+
     Regras:
       - Ignora linhas 'Rule'
       - 'Product' = produto base
-      - 'SKU' = variante (herda do produto; url = base + #sku=ref)
-      - Descrição da variante = descrição do produto + "Variante: <Product Name da SKU>"
-      - Disponibilidade (Product Availability) é injectada no summary (sem alterar schema)
-    Guarda apenas a informação essencial nos campos:
-      item_type (implícito), name, ref, price, brand, summary(+availability), url, variant_attrs (texto), availability(embebida no summary)
+      - 'SKU'     = variante (herda do produto; url = base + "#sku=<ref>")
+      - Resumo: limpa HTML e injeta disponibilidade (Product Availability)
+      - Variante: limpa prefixos [..], remove URLs de imagem e normaliza “Chave=Valor”
+      - Não guarda imagens
+
+    Campos guardados: name, summary, url, source, ref, price, brand, variant_attrs (texto limpo)
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -1942,26 +1993,29 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 continue
 
             # 2) campos do CSV (essenciais)
-            name         = (row.get("Product Name") or "").strip()
+            name_raw     = (row.get("Product Name") or "").strip()
             ref          = (row.get("Product Code/SKU") or "").strip()
             price        = _parse_price(row.get("Price") or "")
             brand        = (row.get("Brand Name") or "").strip() or None
             summary_raw  = (row.get("Product Description") or "").strip()
             base_url     = (row.get("Product URL") or "").strip()
-            availability = (row.get("Product Availability") or "").strip()  # será embebido no summary
+            availability = (row.get("Product Availability") or "").strip()
 
-            # helper: summary + disponibilidade (se existir)
+            # limpar HTML do resumo
+            summary_clean = _html_to_text(summary_raw)
+
             def _with_availability(s: str) -> str:
-                s = (s or "").strip()
+                s1 = (s or "").strip()
                 if availability:
-                    s = (s + ("\n" if s else "") + f"Disponibilidade: {availability}").strip()
-                return s
+                    # usa label estável “Disponibilidade” (pode vir “entre 5 a 6 sem” etc.)
+                    s1 = (s1 + ("\n" if s1 else "") + f"Disponibilidade: {availability}").strip()
+                return s1
 
             # 3) produto base
             if row_type == "Product":
                 current_product = {
-                    "name": name,
-                    "summary": _with_availability(summary_raw),
+                    "name": name_raw,
+                    "summary": _with_availability(summary_clean),
                     "ref": ref or None,
                     "price": price,
                     "brand": brand,
@@ -1975,51 +2029,53 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     source="csv",
                     ref=current_product["ref"],
                     price=current_product["price"],
-                    currency=None,        # não guardamos moeda (assume EUR)
-                    iva_pct=None,         # preços já incluem IVA; não guardamos
+                    currency=None,        # assume EUR
+                    iva_pct=None,         # preços com IVA incluído (não guardamos)
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=None,       # não usamos imagem nesta fase
-                    variant_attrs=None,   # produto base não tem attrs de variante
+                    image_url=None,       # não guardamos imagem
+                    variant_attrs=None,   # produto base sem attrs
                 )
-                items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
+                items_out.append({"ok": True, "type": "product", "name": name_raw, "url": base_url})
                 imported += 1
                 continue
 
-            # 4) variante (SKU): herda do produto base
+            # 4) variante (SKU)
             elif row_type == "SKU" and current_product:
-                var_name   = name  # “Product Name” da SKU (texto humano da variante)
-                summary_v  = _with_availability(current_product["summary"])
-                if var_name:
-                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {var_name}").strip()
+                # limpar nome/atributos da variante
+                var_name_human = _clean_variant_name(name_raw)  # texto humano da opção
+                # resumo = resumo do produto (limpo) + disponibilidade + linha “Variante: …”
+                summary_v = _with_availability(current_product["summary"])
+                if var_name_human:
+                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {var_name_human}").strip()
 
-                # preço: usa o da SKU se houver; senão herda do produto
+                # preço: da SKU se houver; senão herda
                 price_v = price if price is not None else current_product["price"]
 
-                # URL única por variante (sem mexer no schema)
+                # URL única por variante
                 url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
                 _upsert_catalog_row(
                     ns=namespace,
-                    name=f"{current_product['name']} — {var_name}" if var_name else current_product["name"],
+                    name=f"{current_product['name']} — {var_name_human}" if var_name_human else current_product["name"],
                     summary=summary_v,
                     url=url_variant,
                     source="csv",
                     ref=ref or None,
                     price=price_v,
-                    currency=None,        # não guardamos moeda (assume EUR)
-                    iva_pct=None,         # preços com IVA incluído
+                    currency=None,
+                    iva_pct=None,
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
                     image_url=None,
-                    variant_attrs=var_name or None,  # guardamos o texto da variante
+                    variant_attrs=(var_name_human or None),
                 )
                 items_out.append({
                     "ok": True,
                     "type": "variant",
-                    "name": var_name,
+                    "name": var_name_human or name_raw,
                     "ref": ref,
                     "url": url_variant,
                     "price": price_v,
