@@ -1267,7 +1267,128 @@ def _catalog_query_for_question(ns: str, question: str, limit: int = 80) -> Tupl
                 lines.append(f"  - SKU: {ref} • Preço: {price_s} • Link: {link}")
 
         return ("\n".join(lines).strip(), total)
+# ---------------------------------------------------------------------------
+# 🔎 Helpers: pesquisa no Catálogo (SQLite) para alimentar o LLM
+# ---------------------------------------------------------------------------
+import sqlite3
+import re
+from typing import List, Dict, Optional
 
+def _catalog_search_rows(query: str, namespace: Optional[str], limit: int = 30) -> List[Dict]:
+    """
+    Pesquisa direta no SQLite por nome, summary, variant_attrs e ref.
+    Usa AND entre termos para reduzir falsos positivos.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip()
+    terms = [t for t in re.split(r"[,\s]+", query or "") if t]
+    with _catalog_conn() as c:
+        base_sql = """
+            SELECT id, namespace, name, summary, url, source, updated_at,
+                   ref, price, currency, iva_pct, brand, dimensions, material, image_url,
+                   IFNULL(variant_attrs, '') AS variant_attrs
+              FROM catalog_items
+             WHERE namespace = ?
+        """
+        params: List = [ns]
+
+        # construir filtros AND por termo, cada termo dá um OR nos campos textuais
+        for t in terms:
+            like = f"%{t}%"
+            base_sql += """
+              AND (
+                    name LIKE ?
+                 OR summary LIKE ?
+                 OR variant_attrs LIKE ?
+                 OR ref LIKE ?
+              )
+            """
+            params.extend([like, like, like, like])
+
+        base_sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, min(200, int(limit or 30))))
+        cur = c.execute(base_sql, tuple(params))
+        return [dict(r) for r in cur.fetchall()]
+
+def _group_variants(rows: List[Dict]) -> Dict[str, List[Dict]]:
+    """
+    Agrupa linhas por URL-pai (antes do '#sku=').
+    """
+    groups: Dict[str, List[Dict]] = {}
+    for r in rows:
+        u = (r.get("url") or "").strip()
+        parent = u.split("#", 1)[0] if u else ""
+        groups.setdefault(parent, []).append(r)
+    return groups
+
+def _fmt_price(v) -> str:
+    try:
+        if v is None: 
+            return "(sem preço)"
+        # mostrar com 2 decimais estilo PT
+        return f"{float(v):.2f}€"
+    except Exception:
+        return str(v)
+
+def build_catalog_block(question: str, namespace: Optional[str]) -> str:
+    """
+    Devolve um bloco SYSTEM com candidatos do catálogo (para guiar o LLM).
+    """
+    rows = _catalog_search_rows(question, namespace, limit=40)
+    if not rows:
+        # sinal explícito para o LLM de que pesquisámos e não há match
+        return "CATÁLOGO INTERNO — resultado: 0 itens para esta pesquisa. (Se for orçamento, não usar RAG.)"
+
+    lines = ["CATÁLOGO INTERNO — Candidatos (usar estes dados literalmente; preços com IVA incluído):"]
+    for r in rows[:25]:
+        name = r.get("name") or "(sem nome)"
+        ref  = r.get("ref") or "(sem ref)"
+        pr   = _fmt_price(r.get("price"))
+        url  = r.get("url") or "(sem url)"
+        va   = r.get("variant_attrs") or ""
+        if "#sku=" in (url or ""):
+            lines.append(f"- VARIANTE | {name} | SKU:{ref} | {pr} | {url} | attrs: {va}")
+        else:
+            lines.append(f"- PRODUTO  | {name} | SKU:{ref} | {pr} | {url}")
+    return "\n".join(lines)
+
+def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
+    """
+    Se houver múltiplas variantes do mesmo produto, lista-as por grupo.
+    Útil para queries como 'Orikomi Liso Branco' ou quando o utilizador diz 'mostra opções'.
+    """
+    rows = _catalog_search_rows(question, namespace, limit=80)
+    if not rows:
+        return ""
+
+    groups = _group_variants(rows)
+    # Filtra só grupos com 2+ variantes (#sku=)
+    variant_groups = {
+        parent: [r for r in lst if "#sku=" in (r.get("url") or "")]
+        for parent, lst in groups.items()
+    }
+    variant_groups = {p: lst for p, lst in variant_groups.items() if len(lst) >= 2}
+    if not variant_groups:
+        return ""
+
+    out = ["CATÁLOGO INTERNO — Variantes por produto (mostrar Nome Variante + SKU + Preço + Link):"]
+    for parent, lst in variant_groups.items():
+        # ordenar por nome/ref para estabilidade
+        lst_sorted = sorted(lst, key=lambda x: (x.get("name") or "", x.get("ref") or ""))
+        out.append(f"• Produto: {parent or '(sem URL base)'}")
+        for r in lst_sorted[:30]:
+            name = r.get("name") or "(sem nome)"
+            ref  = r.get("ref") or "(sem ref)"
+            pr   = _fmt_price(r.get("price"))
+            url  = r.get("url") or "(sem url)"
+            va   = r.get("variant_attrs") or ""
+            # tenta extrair só o texto humano da variante do nome
+            # (se vier no padrão 'Produto — Variante')
+            var_txt = va
+            if " — " in name and not var_txt:
+                var_txt = name.split(" — ", 1)[1].strip()
+            label = var_txt or name
+            out.append(f"   - {label} | SKU:{ref} | {pr} | {url}")
+    return "\n".join(out)
 
 # ---------- PATCH do build_messages (substitui a tua função por esta versão) ----------
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
