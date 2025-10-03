@@ -1272,72 +1272,61 @@ def _catalog_query_for_question(ns: str, question: str, limit: int = 80) -> Tupl
 # ---------- PATCH do build_messages (substitui a tua função por esta versão) ----------
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    ns_eff = (namespace or DEFAULT_NAMESPACE)
-
-    # 0) memoriza factos contextuais
+    # 1) sinais contextuais → mem0
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 1) memórias recentes
+    # 2) memórias recentes
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
     memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
-    # 2) intenção de orçamento → vamos buscar catálogo
-    is_budget = _is_budget_intent_pt(question)
+    # 3) 🔴 CATÁLOGO INTERNO (SQLite) — SEMPRE antes do RAG
+    catalog_block = build_catalog_block(question, namespace)
+    catalog_variants_block = build_catalog_variants_block(question, namespace)
 
-    # 3) bloco de CATÁLOGO (quando orçamento ou quando a query inclui SKU/variante)
-    catalog_block = ""
-    try:
-        cat_text, cat_count = _catalog_query_for_question(ns_eff, question, limit=80)
-        log.info(f"[ask] catalog-count ns={ns_eff}: {cat_count}")
-        if is_budget and cat_count > 0:
-            catalog_block = cat_text
-    except Exception as e:
-        log.warning(f"[catalog] lookup falhou: {e}")
-        catalog_block = ""
-
-    # 4) RAG (apenas se não for orçamento OU se orçamento sem catálogo)
+    # 4) RAG (apenas para conteúdo corporativo, NÃO para preços/orçamentos)
     rag_block = ""
     rag_used = False
     rag_hits: List[dict] = []
     if RAG_READY:
         try:
-            use_rag_here = (not is_budget) or (is_budget and not catalog_block)
-            if use_rag_here:
-                rag_hits = search_chunks(query=question, namespace=ns_eff, top_k=RAG_TOP_K_DEFAULT) or []
-                rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
-                rag_used = bool(rag_block)
+            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
+            rag_used = bool(rag_block)
         except Exception as e:
             log.warning(f"[rag] search falhou: {e}")
-            rag_block = ""
-            rag_used = False
-            rag_hits = []
+            rag_block, rag_used, rag_hits = "", False, []
 
-    # 5) bloco de links do RAG (NUNCA em orçamento)
+    # 5) links candidatos do RAG (o mission já proíbe usá-los para preços)
+    links_pairs = _links_from_matches(rag_hits, max_links=8)
     links_block = ""
-    if (not is_budget) and rag_hits:
-        pairs = _links_from_matches(rag_hits, max_links=8)
-        if pairs:
-            lines = ["Links candidatos (do RAG; usa estes URLs tal como estão):"]
-            for title, url in pairs:
-                lines.append(f"- {title or '-'} — {url}")
-            links_block = "\n".join(lines)
+    if links_pairs:
+        lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
+        for title, url in links_pairs:
+            lines.append(f"- {title or '-'} — {url}")
+        links_block = "\n".join(lines)
 
-    # 6) bloco auxiliar de produtos (mantido como tinhas)
+    # 6) bloco de produtos (se tiveres esta função ativa)
     products_block = build_rag_products_block(question)
 
-    # 7) construir messages
+    # 7) montar mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
     fb = facts_block_for_user(user_id)
-    if fb:
-        messages.append({"role": "system", "content": fb})
+    if fb: messages.append({"role": "system", "content": fb})
+
+    # 🔴 catálogo primeiro (para guiar o LLM)
     if catalog_block:
         messages.append({"role": "system", "content": catalog_block})
+    if catalog_variants_block:
+        messages.append({"role": "system", "content": catalog_variants_block})
+
+    # depois o RAG (contexto corporativo, docs, etc.)
     if rag_block:
-        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
     if links_block:
         messages.append({"role": "system", "content": links_block})
+
     if products_block:
         messages.append({"role": "system", "content": products_block})
     if memory_block:
@@ -1345,7 +1334,8 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-# ---------------------------------------------------------------------------------------
+    
+-------------
 # ROTAS BÁSICAS + páginas
 # ---------------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
@@ -1778,6 +1768,151 @@ def _table_cols(c) -> set:
     for r in c.execute("PRAGMA table_info(catalog_items)").fetchall():
         cols.add(r[1])
     return cols
+
+# ========= Blocos do Catálogo (SQLite) p/ injeção no prompt =========
+
+def _sanitize_like(s: str) -> str:
+    return (s or "").strip().replace("%", "").replace("_", "")
+
+def _extract_ref_tokens(text: str) -> list:
+    """
+    Puxa tokens do tipo SKU/ref (ex.: ORK.12-RO-TX, 741050527-SO). Útil p/ match exato.
+    """
+    import re
+    toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", text or "", flags=re.I)
+    # filtra coisas muito genéricas
+    return [t for t in toks if any(ch.isdigit() for ch in t)]
+
+def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    """
+    Procura no catálogo interno (SQLite) por nome/summary/ref e devolve
+    um bloco de linhas normalizadas para o LLM usar em orçamentos.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q = _sanitize_like(question)
+    ref_toks = _extract_ref_tokens(question)
+
+    rows = []
+    try:
+        with _catalog_conn() as c:
+            cur: sqlite3.Cursor
+
+            # 1) Se houver SKUs na pergunta → tenta match EXATO primeiro
+            if ref_toks:
+                cur = c.execute("""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                      FROM catalog_items
+                     WHERE namespace=? AND ref IN (%s)
+                     ORDER BY updated_at DESC
+                     LIMIT ?""" % (",".join("?"*len(ref_toks))),
+                    tuple([ns, *ref_toks, limit])  # ns + tokens + limit
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+
+            # 2) Se nada (ou também queremos mais contexto) → LIKE por nome/summary/ref
+            if len(rows) < 3:  # dá mais contexto
+                like = f"%{q}%"
+                cur = c.execute("""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                      FROM catalog_items
+                     WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?""", (ns, like, like, like, limit))
+                rows2 = [dict(r) for r in cur.fetchall()]
+                # evita duplicados mantendo ordem
+                seen = {(r["ref"], r["url"]) for r in rows}
+                for r in rows2:
+                    key = (r["ref"], r["url"])
+                    if key not in seen:
+                        rows.append(r); seen.add(key)
+    except Exception as e:
+        log.warning(f"[catalog] search falhou: {e}")
+        rows = []
+
+    if not rows:
+        return ""  # sem bloco → o LLM não “vê” catálogo
+
+    # Formatar linhas de catálogo — APENAS dados internos (nada de RAG)
+    lines = [
+        "Catálogo interno (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"
+    ]
+    for r in rows:
+        name = r.get("name") or "(sem nome)"
+        ref  = r.get("ref") or "(sem dado)"
+        price = r.get("price")
+        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
+        url = r.get("url") or "(sem URL)"
+        brand = r.get("brand") or ""
+        variant = (r.get("variant_attrs") or "").strip()
+        if variant:
+            name_show = f"{name} — Variante: {variant}"
+        else:
+            name_show = name
+        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+    return "\n".join(lines)
+
+
+def build_catalog_variants_block(question: str, namespace: Optional[str] = None, limit_families: int = 5, limit_variants: int = 40) -> str:
+    """
+    Se o pedido for sobre “variantes”, tenta agrupar por URL-pai e listar variantes (#sku) do mesmo produto.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q = (question or "").lower()
+    if not any(k in q for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes")):
+        return ""  # só ativa em perguntas que sugerem listagem
+
+    try:
+        with _catalog_conn() as c:
+            # primeiro encontra alguns itens relevantes
+            like = f"%{_sanitize_like(question)}%"
+            cur = c.execute("""
+                SELECT name, url
+                  FROM catalog_items
+                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ?)
+                 ORDER BY updated_at DESC
+                 LIMIT ?""", (ns, like, like, limit_families))
+            seeds = [dict(r) for r in cur.fetchall()]
+            if not seeds:
+                return ""
+
+            variants_lines = ["Variantes no catálogo interno (agrupadas por produto):"]
+            seen_parents = set()
+
+            for s in seeds:
+                url = s.get("url") or ""
+                parent = url.split("#")[0] if url else ""
+                if not parent or parent in seen_parents:
+                    continue
+                seen_parents.add(parent)
+
+                cur2 = c.execute("""
+                    SELECT name, ref, price, url, variant_attrs
+                      FROM catalog_items
+                     WHERE namespace=? AND url LIKE ?
+                     ORDER BY updated_at DESC
+                     LIMIT ?""", (ns, parent + "#sku=%", limit_variants))
+                vars_ = [dict(r) for r in cur2.fetchall()]
+                if not vars_:
+                    continue
+
+                # cabeçalho da família
+                variants_lines.append(f"\n• Produto: {s.get('name') or parent}")
+                for v in vars_:
+                    ref = v.get("ref") or "(sem dado)"
+                    price = v.get("price")
+                    price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
+                    var_txt = (v.get("variant_attrs") or "").strip()
+                    name_v = v.get("name") or ""
+                    show = var_txt if var_txt else name_v
+                    variants_lines.append(f"  - Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {v.get('url') or '(sem URL)'}")
+
+            if len(variants_lines) == 1:
+                return ""
+            return "\n".join(variants_lines)
+
+    except Exception as e:
+        log.warning(f"[catalog variants] falhou: {e}")
+        return ""
 
 # --- PATCH: catálogo (init + ensure cols) ------------------------------------
 def _ensure_cols(conn):
