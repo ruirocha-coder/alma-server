@@ -1599,6 +1599,7 @@ from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 from fastapi import UploadFile, File, Form
 
+DEFAULT_NAMESPACE = os.getenv("DEFAULT_NAMESPACE", "boasafra")
 CATALOG_DB_PATH = os.getenv("CATALOG_DB_PATH", "/tmp/catalog.db")
 
 # ---- DB helpers -----------------------------------------------------------------------
@@ -1617,7 +1618,6 @@ def _table_cols(c) -> set:
     return cols
 
 # --- PATCH: catálogo (init + ensure cols) ------------------------------------
-
 def _ensure_cols(conn):
     """
     Garante que a tabela catalog_items existe e tem todas as colunas necessárias.
@@ -1641,7 +1641,7 @@ def _ensure_cols(conn):
         ("namespace",      "TEXT"),
         ("name",           "TEXT"),
         ("summary",        "TEXT"),
-        ("url",            "TEXT"),       # UNIQUE tratado mais abaixo
+        ("url",            "TEXT"),       # UNIQUE via índice
         ("source",         "TEXT"),
         ("created_at",     "TEXT"),
         ("updated_at",     "TEXT"),
@@ -1653,7 +1653,8 @@ def _ensure_cols(conn):
         ("dimensions",     "TEXT"),
         ("material",       "TEXT"),
         ("image_url",      "TEXT"),
-        ("variant_attrs",  "TEXT")
+        ("variant_attrs",  "TEXT"),
+        ("variant_key",    "TEXT")        # <— NOVA: matching determinístico de variantes
     ]
 
     # 4) adicionar colunas em falta
@@ -1662,29 +1663,25 @@ def _ensure_cols(conn):
             try:
                 cur.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {coltype}")
             except Exception as e:
-                # tolera deploys em que a coluna foi criada noutra corrida
                 if "duplicate column name" in str(e).lower():
                     pass
                 else:
                     raise
 
-    # 5) garantir UNIQUE(url) via índice único (idempotente)
-    #    Nota: se já existir uma UNIQUE constraint antiga, isto não cria outra.
+    # 5) índices
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(url)")
     except Exception:
         pass
-
-    # 6) índices úteis
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_namespace ON catalog_items(namespace)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ref ON catalog_items(ref)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_updated ON catalog_items(updated_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_variantkey ON catalog_items(variant_key)")
     except Exception:
         pass
 
     conn.commit()
-
 
 def _catalog_init():
     """
@@ -1751,26 +1748,26 @@ def _upsert_catalog_row(ns: Optional[str],
                         dimensions: Optional[str] = None,
                         material: Optional[str] = None,
                         image_url: Optional[str] = None,
-                        variant_attrs: Optional[str] = None):
+                        variant_attrs: Optional[str] = None,
+                        variant_key: Optional[str] = None):
     if not url:
         return
     with _catalog_conn() as c:
-        row = None
         row_id = None
 
         # 1) tenta por REF (product code) — chave canónica para variantes
         if ref:
             cur = c.execute("SELECT id FROM catalog_items WHERE ref=?", (ref,))
-            row = cur.fetchone()
-            if row:
-                row_id = row["id"]
+            r = cur.fetchone()
+            if r:
+                row_id = r["id"]
 
         # 2) se não há ref (ou não encontrou), tenta por URL (apenas para itens sem ref)
         if row_id is None and not ref:
             cur = c.execute("SELECT id FROM catalog_items WHERE url=? AND (ref IS NULL OR ref='')", (url,))
-            row = cur.fetchone()
-            if row:
-                row_id = row["id"]
+            r = cur.fetchone()
+            if r:
+                row_id = r["id"]
 
         if row_id is not None:
             c.execute("""
@@ -1789,20 +1786,22 @@ def _upsert_catalog_row(ns: Optional[str],
                        material=COALESCE(?, material),
                        image_url=COALESCE(?, image_url),
                        variant_attrs=COALESCE(?, variant_attrs),
+                       variant_key=COALESCE(?, variant_key),
                        url=?            -- mantém a URL alinhada (produto nas variantes)
                  WHERE id=?""",
                 (ns, name, summary, source, _now(),
                  ref, price, currency, iva_pct, brand, dimensions, material, image_url,
-                 variant_attrs, url, row_id))
+                 variant_attrs, variant_key, url, row_id))
         else:
             c.execute("""
                 INSERT INTO catalog_items
                   (namespace,name,summary,url,source,created_at,updated_at,
-                   ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs)
+                   ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs,variant_key)
                 VALUES (?,?,?,?,?,?,?,
-                        ?,?,?,?,?,?,?,?,?)""",
+                        ?,?,?,?,?,?,?,?,?,?)
+            """,
                 (ns, name, summary, url, source, _now(), _now(),
-                 ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs))
+                 ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs, variant_key))
 
 # ---- helpers extra (cola estes dois logo acima do endpoint /catalog/import-csv) --------
 import unicodedata
@@ -1810,12 +1809,9 @@ from urllib.parse import urljoin
 
 def _norm_header(s: str) -> str:
     s = (s or "").strip().lower().replace("\ufeff", "")
-    # trocar separadores por espaço
     s = s.replace("/", " ").replace("_", " ").replace("-", " ")
-    # remover acentos
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # compactar espaços
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -1828,19 +1824,16 @@ def _to_abs_ig_url(u: str) -> str:
         u = "https:" + u
     if u.startswith("http://") or u.startswith("https://"):
         return _canon_ig_url(u) or u
-    # relativo → juntar à raiz do IG
     if not u.startswith("/"):
         u = "/" + u
     absu = f"https://{IG_HOST}{u}"
     return _canon_ig_url(absu) or absu
 
 # --- Helpers para variantes ---------------------------------------------------
-
 import json
 import hashlib
 import unicodedata
 
-# normaliza texto simples
 def _norm_txt(s: str) -> str:
     if s is None:
         return ""
@@ -1849,9 +1842,11 @@ def _norm_txt(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.lower()
 
-# constrói uma chave determinística a partir dos atributos de variante
-# ignora chaves "técnicas" e ordena por chave para ficar estável
 def build_variant_key(attrs: dict) -> str:
+    """
+    Constrói chave determinística para matching de variantes.
+    Ignora chaves técnicas; ordena pares; normaliza a=valor|b=valor…
+    """
     if not attrs or not isinstance(attrs, dict):
         return ""
     ignore = {
@@ -1861,8 +1856,7 @@ def build_variant_key(attrs: dict) -> str:
     pairs = []
     for k, v in attrs.items():
         kn = _norm_txt(k)
-        if kn in ignore or kn.startswith("option") and kn.endswith("name"):
-            # nomes dos options não entram, só os valores (ex.: "Cor" / "Branco")
+        if kn in ignore or (kn.startswith("option") and kn.endswith("name")):
             continue
         vn = _norm_txt(v)
         if vn == "":
@@ -1871,16 +1865,20 @@ def build_variant_key(attrs: dict) -> str:
     if not pairs:
         return ""
     pairs.sort(key=lambda x: x[0])
-    # string canónica
-    canon = "|".join([f"{k}={v}" for k, v in pairs])
-    # devolvemos a string legível; se preferires hash curto, ativa linha abaixo:
-    # return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
-    return canon
+    return "|".join([f"{k}={v}" for k, v in pairs])
 
-
+def values_to_variant_key(values_str: str) -> str:
+    """
+    De 'Soft Indigo, Tecido Areia 1m' -> 'soft indigo|tecido areia 1m'
+    (útil quando só guardamos os VALORES, sem as chaves).
+    """
+    if not values_str:
+        return ""
+    parts = [p.strip() for p in str(values_str).split(",") if p.strip()]
+    parts = [_norm_txt(p) for p in parts if p]
+    return "|".join(parts)
 
 # ---- Importação CSV (HTML clean + variantes normalizadas “valores”) --------------------
-
 from fastapi import UploadFile, File, Form
 from io import StringIO
 import csv, re, html
@@ -1893,12 +1891,9 @@ def _parse_price(s: str):
     if not s:
         return None
     s = str(s).strip().replace("[FIXED]", "").strip()
-    # remover tudo que não seja dígito, vírgula, ponto ou sinal
     s = re.sub(r"[^\d,.\-]", "", s)
-    # caso PT: milhar com ponto e decimal com vírgula (ex.: 1.739,00)
     if "." in s and "," in s and s.rfind(",") > s.rfind("."):
         s = s.replace(".", "").replace(",", ".")
-    # caso só vírgula (ex.: 79,00)
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
     try:
@@ -1908,39 +1903,24 @@ def _parse_price(s: str):
         return None
 
 def _html_to_text(s: str) -> str:
-    """
-    Converte HTML em texto limpo mantendo quebras razoáveis.
-    """
     if not s:
         return ""
     txt = s
-    # quebras suaves
     for tag in (r"<\s*br\s*/?\s*>", r"</\s*p\s*>", r"</\s*li\s*>", r"</\s*div\s*>"):
         txt = re.sub(rf"(?i){tag}", "\n", txt)
-    # remove restantes tags
     txt = re.sub(r"<[^>]+>", " ", txt)
-    # entidades HTML
     txt = html.unescape(txt)
-    # normalizar espaços/linhas
     txt = re.sub(r"[ \t]+", " ", txt)
     txt = re.sub(r"\n\s*\n+", "\n", txt)
     return txt.strip()
 
 def _split_attr_segments(raw: str):
-    """
-    Divide o texto bruto de atributos em segmentos 'chave=valor' (quando possível).
-    Regras:
-      - divide por vírgula de nível 1 (CSV export costuma separar atributos por vírgulas)
-      - remove prefixos como [CS], [RB], etc.
-      - corta tudo após ':' (normalmente URL de imagem)
-    Retorna lista de tuplos (key, value) ou (None, token) se não houver '='.
-    """
     if not raw:
         return []
     parts = [p.strip() for p in str(raw).split(",") if p.strip()]
     out = []
     for p in parts:
-        p = re.sub(r"^\[[^\]]+\]\s*", "", p)  # remove [XX] no início
+        p = re.sub(r"^\[[^\]]+\]\s*", "", p)  # remove [XX]
         p = p.split(":", 1)[0].strip()        # corta URL após ':'
         if "=" in p:
             k, v = p.split("=", 1)
@@ -1950,30 +1930,22 @@ def _split_attr_segments(raw: str):
     return out
 
 def _variant_to_values_only(raw: str) -> str:
-    """
-    De 'Cor=Soft Indigo, Cabo=Tecido Areia 1m' -> 'Soft Indigo, Tecido Areia 1m'
-    De '[CS]Cor=Soft Indigo:https://...'       -> 'Soft Indigo'
-    De 'Soft Indigo'                           -> 'Soft Indigo'
-    """
     pairs = _split_attr_segments(raw)
     values = [(v if v else (k or "")).strip() for (k, v) in pairs]
-    # filtrar vazios e colapsar múltiplos espaços
     values = [re.sub(r"\s+", " ", v) for v in values if v]
     return ", ".join(values).strip(", ").strip()
 
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
-                             namespace: str = Form("boasafra")):
+                             namespace: str = Form(DEFAULT_NAMESPACE)):
     """
     Importa CSV (BigCommerce).
-    Regras:
-      - Ignora linhas 'Rule'
-      - 'Product' = produto base
-      - 'SKU'     = variante (herda do produto; url = base + "#sku=<ref>")
-      - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (apenas no produto base)
-      - variant_attrs: NORMALIZADO para **VALORES** (ex.: 'Soft Indigo, Tecido Areia 1m')
-      - sem imagens/currency/iva (assume EUR e IVA incluído)
-    Campos guardados: name, summary, url, source, ref, price, brand, variant_attrs (VALORES)
+    - Ignora 'Rule'
+    - 'Product' = base  | 'SKU' = variante (url = base + "#sku=<ref>")
+    - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (só no base)
+    - variant_attrs: VALORES puros (ex.: 'Soft Indigo, Tecido Areia 1m')
+    - variant_key: 'soft indigo|tecido areia 1m' (para matching determinístico)
+    - URLs canonizadas para IG
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -1997,13 +1969,11 @@ async def catalog_import_csv(file: UploadFile = File(...),
             price        = _parse_price(row.get("Price") or "")
             brand        = (row.get("Brand Name") or "").strip() or None
             summary_raw  = (row.get("Product Description") or "").strip()
-            base_url     = (row.get("Product URL") or "").strip()
+            base_url     = _canon_ig_url((row.get("Product URL") or "").strip())
             availability = (row.get("Product Availability") or "").strip()
 
-            # summary HTML -> texto
             summary_clean = _html_to_text(summary_raw)
 
-            # helper: injeta disponibilidade APENAS no produto base
             def _with_availability_base(s: str) -> str:
                 s1 = (s or "").strip()
                 if availability:
@@ -2014,7 +1984,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
             if row_type == "Product":
                 current_product = {
                     "name": name_raw,
-                    "summary": _with_availability_base(summary_clean),  # já inclui disponibilidade
+                    "summary": _with_availability_base(summary_clean),
                     "ref": ref or None,
                     "price": price,
                     "brand": brand,
@@ -2026,15 +1996,16 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     summary=current_product["summary"],
                     url=current_product["url"],
                     source="csv",
-                    ref=current_product["ref"],      # pode vir vazio (produto base)
+                    ref=current_product["ref"],
                     price=current_product["price"],
-                    currency=None,                   # assume EUR
-                    iva_pct=None,                    # preços com IVA incluído
+                    currency=None,
+                    iva_pct=None,
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=None,                  # não guardamos imagem
-                    variant_attrs=None               # produto base não tem attrs
+                    image_url=None,
+                    variant_attrs=None,
+                    variant_key=None
                 )
                 items_out.append({"ok": True, "type": "product", "name": name_raw, "url": base_url})
                 imported += 1
@@ -2042,18 +2013,14 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
             # ----- variante (SKU) -----
             elif row_type == "SKU" and current_product:
-                # Normalizar para **VALORES** (ex.: "Soft Indigo, Tecido Areia 1m")
-                variant_values = _variant_to_values_only(name_raw)
+                variant_values = _variant_to_values_only(name_raw)  # "Soft Indigo, Tecido Areia 1m"
+                vkey = values_to_variant_key(variant_values)        # "soft indigo|tecido areia 1m"
 
-                # summary da variante = summary LIMPO do produto base (já com disponibilidade)
                 summary_v = current_product["summary"]
                 if variant_values:
                     summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {variant_values}").strip()
 
-                # preço: usa o da SKU se houver; senão herda do produto base
                 price_v = price if price is not None else current_product["price"]
-
-                # URL única por variante
                 url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
                 _upsert_catalog_row(
@@ -2069,8 +2036,9 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=None,                   # não guardamos imagem
-                    variant_attrs=(variant_values or None)  # guardamos **apenas valores**
+                    image_url=None,
+                    variant_attrs=(variant_values or None),
+                    variant_key=(vkey or None)
                 )
                 items_out.append({
                     "ok": True,
@@ -2100,6 +2068,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "skipped": skipped,
         "items": items_out,
     }
+
 # ---------------------------------------------------------------------------------------
 # Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
 # ---------------------------------------------------------------------------------------
@@ -2144,35 +2113,17 @@ async def catalog_clear(namespace: str = Form(None),
     except Exception as e:
         log.exception("[catalog/clear] falhou")
         return {"ok": False, "namespace": ns, "brand": b, "url_prefix": p, "error": str(e)}
+
 # ---- CRUD leve -------------------------------------------------------------------------
 from fastapi import Request
 
 @app.post("/catalog/upsert")
 async def catalog_upsert(request: Request):
     """
-    Upsert direto por URL.
-
-    Body exemplo:
-    {
-      "namespace": "boasafra",
-      "url": "https://interiorguider.com/produto/mesa-x#sku=BS.MX.180",
-      "name": "Mesa X 180",
-      "summary": "Mesa em carvalho maciço...",
-      "source": "manual",
-      "ref": "BS.MX.180",
-      "price": "1.290,00",
-      "currency": "eur",
-      "iva_pct": "23",
-      "brand": "Boa Safra",
-      "dimensions": "180x90xH75",
-      "material": "Carvalho / Óleo",
-      "image_url": "https://.../mesa-x.jpg",
-      "variant_attrs": {"Color":"Carvalho", "Tamanho":"180", "sku":"BS.MX.180"}
-    }
+    Upsert direto por URL. (Campos opcionais, normalizações incluídas)
     """
     data = await request.json()
 
-    # URL (canónica para IG se aplicável)
     raw_url = (data.get("url") or "").strip()
     url = _canon_ig_url(raw_url) or raw_url
     if not url:
@@ -2188,15 +2139,12 @@ async def catalog_upsert(request: Request):
     image_url= (data.get("image_url") or None)
     ref      = (data.get("ref") or None)
 
-    # Normalização de preço e IVA (aceita vírgula)
     def _to_float(v):
         if v in (None, "", "0", "0.0", "0.00"): 
             return None
         s = str(v).strip().replace(" ", "")
-        # troca separador decimal vírgula por ponto se necessário
         if "," in s and "." not in s:
             s = s.replace(",", ".")
-        # remove milhar
         if s.count(".") > 1:
             parts = s.split(".")
             s = "".join(parts[:-1]) + "." + parts[-1]
@@ -2205,26 +2153,28 @@ async def catalog_upsert(request: Request):
         except Exception:
             return None
 
-    price  = _to_float(data.get("price"))
-    iva_pct= _to_float(data.get("iva_pct"))
+    price   = _to_float(data.get("price"))
+    iva_pct = _to_float(data.get("iva_pct"))
 
-    # Moeda
     currency = (data.get("currency") or None)
     if currency:
         currency = str(currency).strip().upper() or None
 
-    # variant_attrs opcional (dict ou JSON string)
-    variant_attrs = data.get("variant_attrs") or None
-    if isinstance(variant_attrs, str):
-        try:
-            import json
-            variant_attrs = json.loads(variant_attrs)
-        except Exception:
-            variant_attrs = None
-    if variant_attrs and isinstance(variant_attrs, dict):
-        # garante coerência com REF
-        if ref and not variant_attrs.get("sku"):
-            variant_attrs["sku"] = ref
+    # variant_attrs pode ser dict (preferível) ou string "valores"
+    variant_attrs_raw = data.get("variant_attrs") or None
+    vkey = None
+    variant_attrs_out = None
+
+    if isinstance(variant_attrs_raw, dict):
+        # garantir coerência com REF
+        if ref and not variant_attrs_raw.get("sku"):
+            variant_attrs_raw["sku"] = ref
+        vkey = build_variant_key(variant_attrs_raw) or None
+        variant_attrs_out = json.dumps(variant_attrs_raw, ensure_ascii=False)
+    elif isinstance(variant_attrs_raw, str):
+        # assumir lista de valores "A, B, C"
+        variant_attrs_out = variant_attrs_raw.strip() or None
+        vkey = values_to_variant_key(variant_attrs_out) or None
 
     _upsert_catalog_row(
         ns,
@@ -2240,56 +2190,63 @@ async def catalog_upsert(request: Request):
         dimensions=dim,
         material=material,
         image_url=image_url,
-        variant_attrs=(json.dumps(variant_attrs, ensure_ascii=False) if isinstance(variant_attrs, dict) else None)
+        variant_attrs=variant_attrs_out,
+        variant_key=vkey
     )
 
     return {"ok": True, "url": url, "name": name}
+
 @app.get("/catalog/get")
-def catalog_get(url: str):
-    """Obtém 1 item por URL."""
+def catalog_get(url: str, namespace: str = DEFAULT_NAMESPACE):
+    """Obtém 1 item por URL (com filtro de namespace)."""
     url = _canon_ig_url((url or "").strip()) or (url or "").strip()
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
     if not url:
         return {"ok": False, "error": "Falta url"}
     with _catalog_conn() as c:
         cur = c.execute("""SELECT id, namespace, name, summary, url, source, updated_at,
                                   ref, price, currency, iva_pct, brand, dimensions, material, image_url
-                           FROM catalog_items WHERE url=?""", (url,))
+                           FROM catalog_items WHERE url=? AND namespace=?""", (url, ns))
         row = cur.fetchone()
         if not row:
-            return {"ok": False, "error": "não encontrado"}
+            return {"ok": False, "error": "não encontrado", "namespace": ns}
         return {"ok": True, "item": dict(row)}
 
 @app.get("/catalog/list")
-def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
+def catalog_list(q: str = "", limit: int = 100, offset: int = 0, namespace: str = DEFAULT_NAMESPACE):
     """
-    Lista o catálogo com paginação simples. Params: ?q=&limit=&offset=
+    Lista o catálogo com paginação simples. Params: ?q=&limit=&offset=&namespace=
     """
     limit = max(1, min(500, int(limit or 100)))
     offset = max(0, int(offset or 0))
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
     like = f"%{q.strip()}%" if q else None
+
     with _catalog_conn() as c:
         if like:
             cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
                                       ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
-                               WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?
+                               WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?)
                                ORDER BY updated_at DESC
                                LIMIT ? OFFSET ?""",
-                            (like, like, like, like, like, limit, offset))
+                            (ns, like, like, like, like, like, limit, offset))
             items = [dict(r) for r in cur.fetchall()]
             cur2 = c.execute("""SELECT count(*) as n FROM catalog_items
-                                WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?""",
-                             (like, like, like, like, like))
+                                WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?)""",
+                             (ns, like, like, like, like, like))
             total = int(cur2.fetchone()["n"])
         else:
             cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
                                       ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
+                               WHERE namespace=?
                                ORDER BY updated_at DESC
-                               LIMIT ? OFFSET ?""", (limit, offset))
+                               LIMIT ? OFFSET ?""", (ns, limit, offset))
             items = [dict(r) for r in cur.fetchall()]
-            cur2 = c.execute("SELECT count(*) as n FROM catalog_items")
+            cur2 = c.execute("SELECT count(*) as n FROM catalog_items WHERE namespace=?", (ns,))
             total = int(cur2.fetchone()["n"])
+
     out_items = []
     for r in items:
         out_items.append({
@@ -2311,12 +2268,6 @@ def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
         })
     return {"ok": True, "total": total, "items": out_items}
 
-@app.post("/catalog/clear")
-def catalog_clear_sqlite():
-    with _catalog_conn() as c:
-        c.execute("DELETE FROM catalog_items")
-    return {"ok": True}
-
 @app.post("/catalog/resolve-price")
 async def catalog_resolve_price(request: Request):
     """
@@ -2330,9 +2281,7 @@ async def catalog_resolve_price(request: Request):
     Regras:
       1) ref exato -> match imediato
       2) url com #sku -> match imediato por url
-      3) url pai + attrs -> derivar variant_key e procurar nessa família
-    Resposta:
-      { ok:true, match:{...}, missing_price:true? }  ou  { ok:false, candidates:[...] }
+      3) url pai + attrs -> variant_key
     """
     try:
       data = await request.json()
@@ -2363,7 +2312,7 @@ async def catalog_resolve_price(request: Request):
                 SELECT * FROM catalog_items
                  WHERE namespace=? AND url=? 
                  ORDER BY updated_at DESC LIMIT 1
-            """, (ns, url))
+            """, (ns, _canon_ig_url(url) or url))
             row = cur.fetchone()
             if row:
                 out = dict(row)
@@ -2373,8 +2322,6 @@ async def catalog_resolve_price(request: Request):
         if url and attrs and "#sku=" not in url:
             parent = _canon_ig_url(url) or url
             vkey = build_variant_key(attrs)
-            # duas estratégias:
-            # a) procurar por variant_key
             cur = c.execute("""
                 SELECT * FROM catalog_items
                  WHERE namespace=? AND variant_key=? AND url LIKE ? 
@@ -2385,22 +2332,23 @@ async def catalog_resolve_price(request: Request):
                 out = dict(row)
                 return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
 
-            # b) fallback: procurar via variant_attrs->product_url (string match simples)
-            like_snippet = f'%"{parent}"%'
-            cur = c.execute("""
-                SELECT * FROM catalog_items
-                 WHERE namespace=? AND variant_key=? AND IFNULL(variant_attrs,'') LIKE ?
-                 ORDER BY updated_at DESC LIMIT 1
-            """, (ns, vkey, like_snippet))
-            row = cur.fetchone()
-            if row:
-                out = dict(row)
-                return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
+            # fallback: tentar valores simples se attrs forem só valores
+            if not row and isinstance(attrs, str):
+                vkey2 = values_to_variant_key(attrs)
+                cur = c.execute("""
+                    SELECT * FROM catalog_items
+                     WHERE namespace=? AND variant_key=? AND url LIKE ? 
+                     ORDER BY updated_at DESC LIMIT 1
+                """, (ns, vkey2, parent + "#sku=%"))
+                row = cur.fetchone()
+                if row:
+                    out = dict(row)
+                    return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
 
         # sem match – devolver candidatos úteis se houver contexto
         candidates = []
         if url:
-            parent = url.split("#")[0]
+            parent = (_canon_ig_url(url) or url).split("#")[0]
             cur = c.execute("""
                 SELECT id,name,ref,url,price,currency,brand,variant_key FROM catalog_items
                  WHERE namespace=? AND url LIKE ?
@@ -2409,7 +2357,6 @@ async def catalog_resolve_price(request: Request):
             candidates = [dict(r) for r in cur.fetchall()]
 
         return {"ok": False, "reason": "sem_match", "candidates": candidates[:10]}
-
 
 # ---- Expor info do Catálogo (SQLite) no /status ----
 def _status_catalog_sqlite():
@@ -2430,8 +2377,8 @@ def _status_catalog_sqlite():
         "endpoints": {
             "import_csv": "POST /catalog/import-csv",
             "upsert": "POST /catalog/upsert",
-            "get": "GET /catalog/get?url=",
-            "list": "GET /catalog/list?q=&limit=&offset=",
+            "get": "GET /catalog/get?url=&namespace=",
+            "list": "GET /catalog/list?q=&limit=&offset=&namespace=",
             "clear": "POST /catalog/clear",
         }
     }
