@@ -1136,42 +1136,204 @@ def build_rag_products_block(question: str) -> str:
             lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
     return "Produtos para orçamento (do RAG; usa estes dados exatos para links):\n" + "\n".join(lines) if lines else ""
 
+# ---------- Helpers para intenção e catálogo (colar acima de build_messages) ----------
+
+import re
+from typing import Optional, List, Dict, Tuple
+
+def _is_budget_intent_pt(text: str) -> bool:
+    """Heurística PT simples para pedidos de orçamento / preço / variantes."""
+    if not text:
+        return False
+    t = text.lower()
+    triggers = [
+        "orçament", "orcament", "cotação", "cotacao", "preço", "preco",
+        "quanto custa", "quanto fica", "sku", "#sku=", "variante", "cor=",
+        "quantidade", "qtd", "unidades", "unidade", "preçário", "precario"
+    ]
+    if any(k in t for k in triggers):
+        return True
+    # “2x”, “3 unidades”, etc.
+    if re.search(r"\b\d+\s*x\b", t) or re.search(r"\b\d+\s+(unidade|unidades)\b", t):
+        return True
+    return False
+
+
+def _catalog_query_for_question(ns: str, question: str, limit: int = 80) -> Tuple[str, int]:
+    """
+    Procura no catálogo pelo namespace informado e pela questão.
+    - Se contiver ref explícita (ex.: ORK.02.03) → match direto.
+    - Caso contrário, tenta por termos no nome/summary/url/ref/brand.
+    - Agrupa variantes por URL-pai (url.split('#')[0]) e lista:
+      Variante (variant_attrs) • SKU (ref) • Preço • Link (#sku=)
+    Devolve (texto_bloco_catalogo, total_itens_encontrados).
+    """
+    ns = ns or DEFAULT_NAMESPACE
+    q = (question or "").strip()
+    refs = re.findall(r"\b[A-Z0-9][A-Z0-9.\-\_/]{2,}\b", q)  # captura refs tipo ORK.09.02
+    url_sku = None
+    m = re.search(r"(https?://\S+#sku=\S+)", q)
+    if m:
+        url_sku = m.group(1).strip()
+
+    with _catalog_conn() as c:
+        rows: List[sqlite3.Row] = []
+
+        # 1) match por REF (prioridade)
+        if refs:
+            placeholders = ",".join(["?"] * len(refs))
+            cur = c.execute(f"""
+                SELECT id, namespace, name, summary, url, source, updated_at,
+                       ref, price, currency, iva_pct, brand, dimensions, material,
+                       image_url, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=? AND ref IN ({placeholders})
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+            """, (ns, *refs, limit))
+            rows = cur.fetchall()
+
+        # 2) match por URL com #sku (prioridade)
+        if not rows and url_sku:
+            cur = c.execute("""
+                SELECT id, namespace, name, summary, url, source, updated_at,
+                       ref, price, currency, iva_pct, brand, dimensions, material,
+                       image_url, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=? AND url=?
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+            """, (ns, url_sku))
+            r = cur.fetchone()
+            if r:
+                rows = [r]
+
+        # 3) pesquisa textual (nome, summary, url, brand, ref)
+        if not rows:
+            like = f"%{q}%"
+            cur = c.execute("""
+                SELECT id, namespace, name, summary, url, source, updated_at,
+                       ref, price, currency, iva_pct, brand, dimensions, material,
+                       image_url, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND (name LIKE ? OR summary LIKE ? OR url LIKE ?
+                        OR brand LIKE ? OR ref LIKE ?)
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+            """, (ns, like, like, like, like, like, limit))
+            rows = cur.fetchall()
+
+        total = len(rows)
+        if total == 0:
+            return ("", 0)
+
+        # Agrupar por URL-pai (antes do #sku)
+        families: Dict[str, List[dict]] = {}
+        for r in rows:
+            url = (r["url"] or "").strip()
+            parent = url.split("#")[0] if "#sku=" in url else url
+            families.setdefault(parent, []).append(dict(r))
+
+        # Montar bloco CATALOG
+        lines: List[str] = []
+        lines.append("CATALOG (fonte interna; usar literalmente os dados abaixo):")
+        for parent_url, items in families.items():
+            # ordenar: variantes com #sku= primeiro
+            items_sorted = sorted(items, key=lambda x: (("#sku=" not in (x.get("url") or "")), x.get("updated_at") or ""), reverse=False)
+            # Cabeçalho por família
+            # Nota: se não houver variantes (#sku=), mostra só o produto base com os seus dados
+            has_variants = any("#sku=" in (it.get("url") or "") for it in items_sorted)
+            title = items_sorted[0].get("name") or parent_url
+            lines.append(f"\n• Produto: {title}\n  URL base: {parent_url}")
+            if has_variants:
+                lines.append("  Variantes:")
+                for it in items_sorted:
+                    if "#sku=" not in (it.get("url") or ""):
+                        continue
+                    vtxt = (it.get("variant_attrs") or "").strip() or "(sem dado)"
+                    ref = (it.get("ref") or "").strip() or "(sem dado)"
+                    price = it.get("price")
+                    price_s = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem dado)"
+                    link = (it.get("url") or "").strip()
+                    lines.append(f"  - Variante: {vtxt} • SKU: {ref} • Preço: {price_s} • Link: {link}")
+            else:
+                # sem variantes
+                it = items_sorted[0]
+                ref = (it.get("ref") or "").strip() or "(sem dado)"
+                price = it.get("price")
+                price_s = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem dado)"
+                link = (it.get("url") or "").strip()
+                lines.append(f"  - SKU: {ref} • Preço: {price_s} • Link: {link}")
+
+        return ("\n".join(lines).strip(), total)
+
+
+# ---------- PATCH do build_messages (substitui a tua função por esta versão) ----------
+
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    ns_eff = (namespace or DEFAULT_NAMESPACE)
+
+    # 0) memoriza factos contextuais
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
+    # 1) memórias recentes
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
     memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
+    # 2) intenção de orçamento → vamos buscar catálogo
+    is_budget = _is_budget_intent_pt(question)
+
+    # 3) bloco de CATÁLOGO (quando orçamento ou quando a query inclui SKU/variante)
+    catalog_block = ""
+    try:
+        cat_text, cat_count = _catalog_query_for_question(ns_eff, question, limit=80)
+        log.info(f"[ask] catalog-count ns={ns_eff}: {cat_count}")
+        if is_budget and cat_count > 0:
+            catalog_block = cat_text
+    except Exception as e:
+        log.warning(f"[catalog] lookup falhou: {e}")
+        catalog_block = ""
+
+    # 4) RAG (apenas se não for orçamento OU se orçamento sem catálogo)
     rag_block = ""
     rag_used = False
     rag_hits: List[dict] = []
     if RAG_READY:
         try:
-            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
-            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
-            rag_used = bool(rag_block)
+            use_rag_here = (not is_budget) or (is_budget and not catalog_block)
+            if use_rag_here:
+                rag_hits = search_chunks(query=question, namespace=ns_eff, top_k=RAG_TOP_K_DEFAULT) or []
+                rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
+                rag_used = bool(rag_block)
         except Exception as e:
             log.warning(f"[rag] search falhou: {e}")
             rag_block = ""
             rag_used = False
             rag_hits = []
 
-    # bloco de links candidatos (para o LLM usar tal como estão)
-    links_pairs = _links_from_matches(rag_hits, max_links=8)
+    # 5) bloco de links do RAG (NUNCA em orçamento)
     links_block = ""
-    if links_pairs:
-        lines = ["Links candidatos (do RAG; usa estes URLs tal como estão):"]
-        for title, url in links_pairs:
-            lines.append(f"- {title or '-'} — {url}")
-        links_block = "\n".join(lines)
+    if (not is_budget) and rag_hits:
+        pairs = _links_from_matches(rag_hits, max_links=8)
+        if pairs:
+            lines = ["Links candidatos (do RAG; usa estes URLs tal como estão):"]
+            for title, url in pairs:
+                lines.append(f"- {title or '-'} — {url}")
+            links_block = "\n".join(lines)
 
+    # 6) bloco auxiliar de produtos (mantido como tinhas)
     products_block = build_rag_products_block(question)
 
+    # 7) construir messages
     messages = [{"role": "system", "content": ALMA_MISSION}]
     fb = facts_block_for_user(user_id)
-    if fb: messages.append({"role": "system", "content": fb})
+    if fb:
+        messages.append({"role": "system", "content": fb})
+    if catalog_block:
+        messages.append({"role": "system", "content": catalog_block})
     if rag_block:
         messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
     if links_block:
@@ -1180,9 +1342,9 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
         messages.append({"role": "system", "content": products_block})
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
+
     messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-
 # ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS + páginas
 # ---------------------------------------------------------------------------------------
