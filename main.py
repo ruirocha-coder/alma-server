@@ -1270,7 +1270,6 @@ def _catalog_query_for_question(ns: str, question: str, limit: int = 80) -> Tupl
 
 
 # ---------- PATCH do build_messages (substitui a tua função por esta versão) ----------
-
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
     # 1) sinais contextuais → mem0
     new_facts = extract_contextual_facts_pt(question)
@@ -1279,9 +1278,13 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     # 2) memórias recentes
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
-    memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
+    memory_block = (
+        "Memórias recentes do utilizador (curto prazo):\n"
+        + "\n".join(f"- {s}" for s in short_snippets[:3])
+        if short_snippets else ""
+    )
 
-    # 3) 🔴 CATÁLOGO INTERNO (SQLite) — SEMPRE antes do RAG
+    # 3) CATÁLOGO INTERNO (SQLite) — SEMPRE antes do RAG
     catalog_block = build_catalog_block(question, namespace)
     catalog_variants_block = build_catalog_variants_block(question, namespace)
 
@@ -1291,7 +1294,11 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     rag_hits: List[dict] = []
     if RAG_READY:
         try:
-            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
+            rag_hits = search_chunks(
+                query=question,
+                namespace=namespace or DEFAULT_NAMESPACE,
+                top_k=RAG_TOP_K_DEFAULT
+            ) or []
             rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
             rag_used = bool(rag_block)
         except Exception as e:
@@ -1313,9 +1320,10 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     # 7) montar mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
     fb = facts_block_for_user(user_id)
-    if fb: messages.append({"role": "system", "content": fb})
+    if fb:
+        messages.append({"role": "system", "content": fb})
 
-    # 🔴 catálogo primeiro (para guiar o LLM)
+    # catálogo primeiro (para guiar o LLM)
     if catalog_block:
         messages.append({"role": "system", "content": catalog_block})
     if catalog_variants_block:
@@ -1334,10 +1342,9 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-    
--------------
+
+
 # ROTAS BÁSICAS + páginas
-# ---------------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
     try:
@@ -1368,7 +1375,11 @@ def status_json():
         "version": APP_VERSION,
         "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG).",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
-        "rag": {"available": RAG_READY, "top_k_default": RAG_TOP_K_DEFAULT, "namespace": DEFAULT_NAMESPACE},
+        "rag": {
+            "available": RAG_READY,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "namespace": DEFAULT_NAMESPACE
+        },
         "endpoints": {
             "health": "/health",
             "ask": "POST /ask {question, user_id?, namespace?, top_k?}",
@@ -1385,8 +1396,7 @@ def status_json():
             "budget_csv": "POST /budget/csv",
             "console": "/console",
         },
-        # ⬇️ adicionamos o estado do catálogo (SQLite)
-        "catalog": _status_catalog_sqlite(),
+        "catalog": _status_catalog_sqlite(),  # estado do catálogo (SQLite)
     }
 
 @app.get("/health")
@@ -1398,7 +1408,7 @@ def health():
         "model": MODEL,
         "rag_available": RAG_READY,
         "rag_default_namespace": DEFAULT_NAMESPACE,
-        "rag_top_k_default": RAG_TOP_K_DEFAULT
+        "rag_top_k_default": RAG_TOP_K_DEFAULT,
     }
 
 @app.post("/echo")
@@ -1414,7 +1424,6 @@ def ping_grok():
         return {"ok": True, "reply": content}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 # ---------------------------------------------------------------------------------------
 # Memória contextual (FACTs) e Mem0 debug
 # ---------------------------------------------------------------------------------------
