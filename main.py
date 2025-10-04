@@ -2021,6 +2021,84 @@ def _variant_to_values_only(raw: str) -> str:
     values = [re.sub(r"\s+", " ", v) for v in values if v]
     return ", ".join(values).strip(", ").strip()
 
+# ---- Upsert genérico (PRECISA existir antes de /catalog/import-csv) -------------------
+def _upsert_catalog_row(ns: Optional[str],
+                        name: str,
+                        summary: str,
+                        url: str,
+                        source: str = "csv",
+                        ref: Optional[str] = None,
+                        price: Optional[float] = None,
+                        currency: Optional[str] = None,
+                        iva_pct: Optional[float] = None,
+                        brand: Optional[str] = None,
+                        dimensions: Optional[str] = None,
+                        material: Optional[str] = None,
+                        image_url: Optional[str] = None,
+                        variant_attrs: Optional[str] = None,
+                        variant_key: Optional[str] = None):
+    """
+    Upsert por REF (prioritário) ou por URL (quando não há REF).
+    Mantém 'url' alinhada nas variantes. Usa _catalog_conn() e _now().
+    """
+    if not url:
+        return
+    with _catalog_conn() as c:
+        row_id = None
+
+        # 1) tenta por REF (chave canónica para variantes)
+        if ref:
+            cur = c.execute("SELECT id FROM catalog_items WHERE ref=?", (ref,))
+            r = cur.fetchone()
+            if r:
+                row_id = r["id"]
+
+        # 2) se não encontrou por REF, tenta por URL apenas quando NÃO há ref
+        if row_id is None and not ref:
+            cur = c.execute(
+                "SELECT id FROM catalog_items WHERE url=? AND (ref IS NULL OR ref='')",
+                (url,)
+            )
+            r = cur.fetchone()
+            if r:
+                row_id = r["id"]
+
+        if row_id is not None:
+            c.execute("""
+                UPDATE catalog_items
+                   SET namespace=?,
+                       name=?,
+                       summary=?,
+                       source=?,
+                       updated_at=?,
+                       ref=COALESCE(?, ref),
+                       price=COALESCE(?, price),
+                       currency=COALESCE(?, currency),
+                       iva_pct=COALESCE(?, iva_pct),
+                       brand=COALESCE(?, brand),
+                       dimensions=COALESCE(?, dimensions),
+                       material=COALESCE(?, material),
+                       image_url=COALESCE(?, image_url),
+                       variant_attrs=COALESCE(?, variant_attrs),
+                       variant_key=COALESCE(?, variant_key),
+                       url=?            -- mantém a URL alinhada (produto nas variantes)
+                 WHERE id=?""",
+                (ns, name, summary, source, _now(),
+                 ref, price, currency, iva_pct, brand, dimensions, material, image_url,
+                 variant_attrs, variant_key, url, row_id))
+        else:
+            c.execute("""
+                INSERT INTO catalog_items
+                  (namespace,name,summary,url,source,created_at,updated_at,
+                   ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs,variant_key)
+                VALUES (?,?,?,?,?,?,?,
+                        ?,?,?,?,?,?,?,?,?,?)
+            """,
+                (ns, name, summary, url, source, _now(), _now(),
+                 ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs, variant_key))
+
+
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
                              namespace: str = Form(DEFAULT_NAMESPACE)):
