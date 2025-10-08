@@ -1135,7 +1135,10 @@ def build_rag_products_block(question: str) -> str:
             lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
     return "Produtos para orçamento (do RAG; usa estes dados exatos para links):\n" + "\n".join(lines) if lines else ""
 
-# ---------- Helpers para intenção e catálogo (coerentes com o resto) ----------
+# ---------- Helpers para intenção e catálogo (colar acima de build_messages) ----------
+import re
+from typing import Optional, List, Dict, Tuple
+
 def _is_budget_intent_pt(text: str) -> bool:
     """Heurística PT simples para pedidos de orçamento / preço / variantes."""
     if not text:
@@ -1153,9 +1156,163 @@ def _is_budget_intent_pt(text: str) -> bool:
         return True
     return False
 
-# ---------- build_messages (ordena catálogo → RAG → memórias) ----------
+def _catalog_query_from_question(question: str) -> str:
+    """
+    Extrai uma query útil para o catálogo a partir da pergunta.
+    Se houver refs/SKUs, devolve-as; caso contrário, devolve o termo principal limpo.
+    """
+    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", question or "", flags=re.I)
+    if refs:
+        return " ".join(refs[:3])
+    q = (question or "").strip()
+    q = re.sub(r"[?!]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    """
+    Pesquisa no catálogo interno (SQLite) por nome, resumo ou SKU,
+    dividindo os termos em palavras e aplicando AND (todas têm de aparecer).
+    Se encontrar SKUs exatos, prioriza-os.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q = (question or "").strip()
+    ref_toks = _extract_ref_tokens(q)
+    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 2]
+
+    rows = []
+    try:
+        with _catalog_conn() as c:
+            cur: sqlite3.Cursor
+
+            # 1) Match exato por SKU/ref
+            if ref_toks:
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                      FROM catalog_items
+                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
+                     ORDER BY updated_at DESC
+                     LIMIT ?""",
+                    tuple([ns, *ref_toks, limit])
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+
+            # 2) Pesquisa por termos (AND)
+            if len(rows) < 3 and terms:
+                where = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
+                like_args = []
+                for t in terms:
+                    pattern = f"%{t}%"
+                    like_args.extend([pattern, pattern, pattern])
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                      FROM catalog_items
+                     WHERE namespace=? AND {where}
+                     ORDER BY updated_at DESC
+                     LIMIT ?""",
+                    tuple([ns, *like_args, limit])
+                )
+                rows2 = [dict(r) for r in cur.fetchall()]
+                seen = {(r["ref"], r["url"]) for r in rows}
+                for r in rows2:
+                    key = (r["ref"], r["url"])
+                    if key not in seen:
+                        rows.append(r)
+                        seen.add(key)
+    except Exception as e:
+        log.warning(f"[catalog] search falhou: {e}")
+        rows = []
+
+    if not rows:
+        # sem bloco → o LLM não “vê” catálogo (deixa o Mission aplicar as regras)
+        return ""
+
+    lines = ["Catálogo interno (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"]
+    for r in rows:
+        name = r.get("name") or "(sem nome)"
+        ref  = r.get("ref") or "(sem dado)"
+        price = r.get("price")
+        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
+        url = r.get("url") or "(sem URL)"
+        brand = r.get("brand") or ""
+        variant = (r.get("variant_attrs") or "").strip()
+        name_show = f"{name} — Variante: {variant}" if variant else name
+        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+    return "\n".join(lines)
+
+def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
+    """
+    Lista variantes (#sku=) por grupo de produto quando a query sugere listagem.
+    Mantém a apresentação enxuta para o LLM.
+    """
+    qlow = (question or "").lower()
+    if not any(k in qlow for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes")):
+        return ""
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(question)) if len(t) >= 2]
+
+    rows: List[Dict] = []
+    try:
+        with _catalog_conn() as c:
+            where = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * max(1, len(terms)))
+            like_args = []
+            if terms:
+                for t in terms:
+                    pattern = f"%{t}%"
+                    like_args.extend([pattern, pattern, pattern])
+            else:
+                # fallback leve se não houver termos
+                where = "(name LIKE ? OR summary LIKE ?)"
+                like_args.extend([f"%{_sanitize_like(question)}%", f"%{_sanitize_like(question)}%"])
+            cur = c.execute(f"""
+                SELECT name, ref, price, url, brand, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=? AND {where}
+                 ORDER BY updated_at DESC
+                 LIMIT 120
+            """, tuple([ns, *like_args]))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        log.warning(f"[catalog variants] falhou: {e}")
+        rows = []
+
+    if not rows:
+        return ""
+
+    # agrupar por URL-pai
+    groups: Dict[str, List[Dict]] = {}
+    for r in rows:
+        u = (r.get("url") or "").strip()
+        parent = u.split("#", 1)[0] if u else ""
+        groups.setdefault(parent, []).append(r)
+
+    # filtrar grupos com ≥2 variantes (#sku=)
+    groups = {
+        p: [it for it in lst if "#sku=" in (it.get("url") or "")]
+        for p, lst in groups.items()
+    }
+    groups = {p: lst for p, lst in groups.items() if len(lst) >= 2}
+    if not groups:
+        return ""
+
+    out = ["CATÁLOGO INTERNO — Variantes por produto (Variante | SKU | Preço | Link):"]
+    for parent, lst in groups.items():
+        lst_sorted = sorted(lst, key=lambda x: (x.get("name") or "", x.get("ref") or ""))
+        title = lst_sorted[0].get("name") or parent or "(produto)"
+        out.append(f"• Produto: {title}")
+        for r in lst_sorted[:40]:
+            ref  = r.get("ref") or "(sem ref)"
+            pr   = r.get("price")
+            pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
+            url  = r.get("url") or "(sem url)"
+            va   = (r.get("variant_attrs") or "").strip()
+            label = va or (r.get("name") or "")
+            out.append(f"   - {label} | SKU:{ref} | {pr_s} | {url}")
+    return "\n".join(out)
+
+# ---------- build_messages (patch consolidado) ----------
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # 1) sinais contextuais → mem0/local
+    # 1) sinais contextuais → mem0
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
@@ -1169,8 +1326,10 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
     )
 
     # 3) CATÁLOGO INTERNO (SQLite) — SEMPRE antes do RAG
-    catalog_block = build_catalog_block(question, namespace)
-    catalog_variants_block = build_catalog_variants_block(question, namespace)
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    cat_q = _catalog_query_from_question(question)
+    catalog_block = build_catalog_block(cat_q, ns)
+    catalog_variants_block = build_catalog_variants_block(cat_q, ns)
 
     # 4) RAG (apenas para conteúdo corporativo, NÃO para preços/orçamentos)
     rag_block = ""
@@ -1226,7 +1385,7 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 
     messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-
+# ---------- FIM DO PATCH ----------
 
 # ROTAS BÁSICAS + páginas
 @app.get("/", response_class=HTMLResponse)
