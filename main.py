@@ -1156,31 +1156,62 @@ def _is_budget_intent_pt(text: str) -> bool:
         return True
     return False
 
+# >>> PATCH: catálogo — query “limpa” + fallback AND→OR + logs
+
+# stopwords mínimas PT/EN e lixo de orçamento
+_STOP = {
+    "o","a","os","as","de","da","do","das","dos","para","por","com","sem","em","no","na","nos","nas",
+    "um","uma","uns","umas","e","ou","que","quanto","custa","fica","preço","preco","orcamento","orçamento",
+    "faz","fazer","favor","peço","pedido","proposta","cotacao","cotação","qtd","unidade","unidades","x",
+    "the","of","and","for","with","without","in","on"
+}
+
 def _catalog_query_from_question(question: str) -> str:
     """
-    Extrai uma query útil para o catálogo a partir da pergunta.
-    Se houver refs/SKUs, devolve-as; caso contrário, devolve o termo principal limpo.
+    Extrai uma query útil para o catálogo a partir da pergunta:
+    - devolve refs/SKUs se existirem
+    - caso contrário, devolve só tokens “de produto” (>=3 chars, não stopword, não só dígitos)
     """
-    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", question or "", flags=re.I)
-    if refs:
-        return " ".join(refs[:3])
     q = (question or "").strip()
-    q = re.sub(r"[?!]+", " ", q)
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
+    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q, flags=re.I)
+    if refs:
+        return " ".join(refs[:5])
+    toks = [t for t in re.split(r"[^\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]+", q) if t]
+    good = []
+    for t in toks:
+        tl = t.lower()
+        # ignora números puros e stopwords; exige 3+ chars úteis
+        if tl in _STOP: 
+            continue
+        if tl.isdigit():
+            continue
+        if len(tl) < 3:
+            continue
+        good.append(t)
+    # mantém ordem, dedup leve
+    seen = set(); cleaned = []
+    for t in good:
+        k = t.lower()
+        if k not in seen:
+            seen.add(k); cleaned.append(t)
+    return " ".join(cleaned[:6]) or q
+
 
 def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
     """
-    Pesquisa no catálogo interno (SQLite) por nome, resumo ou SKU,
-    dividindo os termos em palavras e aplicando AND (todas têm de aparecer).
-    Se encontrar SKUs exatos, prioriza-os.
+    Pesquisa no catálogo interno (SQLite) por nome/summary/ref.
+    Estratégia:
+      1) match exato por refs/SKUs, se existirem
+      2) pesquisa por termos úteis com AND
+      3) se (2) não devolver nada, repete com OR (mais tolerante)
+    Inclui log curto para validar que o LLM “viu” o bloco.
     """
     ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q = (question or "").strip()
-    ref_toks = _extract_ref_tokens(q)
-    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 2]
+    q_raw = (question or "").strip()
+    q = _catalog_query_from_question(q_raw)
+    ref_toks = _extract_ref_tokens(q_raw)
 
-    rows = []
+    rows: List[Dict] = []
     try:
         with _catalog_conn() as c:
             cur: sqlite3.Cursor
@@ -1188,7 +1219,7 @@ def build_catalog_block(question: str, namespace: Optional[str] = None, limit: i
             # 1) Match exato por SKU/ref
             if ref_toks:
                 cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
                       FROM catalog_items
                      WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
                      ORDER BY updated_at DESC
@@ -1197,38 +1228,58 @@ def build_catalog_block(question: str, namespace: Optional[str] = None, limit: i
                 )
                 rows = [dict(r) for r in cur.fetchall()]
 
-            # 2) Pesquisa por termos (AND)
-            if len(rows) < 3 and terms:
-                where = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
+            # Vamos construir termos “bons” para LIKE
+            terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 3]
+
+            # 2) Pesquisa AND (mais estrita)
+            if len(rows) < 1 and terms:
+                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
                 like_args = []
                 for t in terms:
-                    pattern = f"%{t}%"
-                    like_args.extend([pattern, pattern, pattern])
+                    p = f"%{t}%"
+                    like_args.extend([p, p, p])
                 cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
                       FROM catalog_items
-                     WHERE namespace=? AND {where}
-                     ORDER BY updated_at DESC
-                     LIMIT ?""",
-                    tuple([ns, *like_args, limit])
-                )
-                rows2 = [dict(r) for r in cur.fetchall()]
-                seen = {(r["ref"], r["url"]) for r in rows}
-                for r in rows2:
-                    key = (r["ref"], r["url"])
-                    if key not in seen:
-                        rows.append(r)
-                        seen.add(key)
+                     WHERE namespace=? AND {where_and}
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?""", tuple([ns, *like_args, limit]))
+                rows = [dict(r) for r in cur.fetchall()]
+
+            # 3) Fallback OR (tolerante)
+            if len(rows) < 1 and terms:
+                where_or_parts = []
+                like_args = []
+                for t in terms:
+                    p = f"%{t}%"
+                    where_or_parts.append("(name LIKE ? OR summary LIKE ? OR ref LIKE ?)")
+                    like_args.extend([p, p, p])
+                where_or = " OR ".join(where_or_parts) if where_or_parts else "1=1"
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
+                      FROM catalog_items
+                     WHERE namespace=? AND ({where_or})
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?""", tuple([ns, *like_args, limit]))
+                rows = [dict(r) for r in cur.fetchall()]
+
     except Exception as e:
         log.warning(f"[catalog] search falhou: {e}")
         rows = []
 
-    if not rows:
-        # sem bloco → o LLM não “vê” catálogo (deixa o Mission aplicar as regras)
-        return ""
+    # LOG do que vai ao LLM
+    try:
+        log.info(f"[catalog] ns={ns} q_raw={q_raw!r} q_clean={q!r} ref_toks={ref_toks} rows={len(rows)}")
+    except Exception:
+        pass
 
-    lines = ["Catálogo interno (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"]
-    for r in rows:
+    if not rows:
+        return ""  # sem bloco → o LLM pode cair na mensagem “sem dados” do Mission
+
+    # Bloco para o LLM
+    lines = [f"CATÁLOGO INTERNO — ns={ns} (usar SÓ estes dados para orçamentos/preços; NÃO usar RAG aqui)"]
+    seen = set()
+    for r in rows[:limit]:
         name = r.get("name") or "(sem nome)"
         ref  = r.get("ref") or "(sem dado)"
         price = r.get("price")
@@ -1236,9 +1287,15 @@ def build_catalog_block(question: str, namespace: Optional[str] = None, limit: i
         url = r.get("url") or "(sem URL)"
         brand = r.get("brand") or ""
         variant = (r.get("variant_attrs") or "").strip()
+        key = (ref, url)
+        if key in seen:
+            continue
+        seen.add(key)
         name_show = f"{name} — Variante: {variant}" if variant else name
         lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
     return "\n".join(lines)
+# <<< PATCH
+    
 
 def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
     """
