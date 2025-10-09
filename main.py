@@ -50,119 +50,34 @@ sobreviva e prospere, com respostas úteis, objetivas e calmas.
 Estilo (estrito)
 - Clareza e concisão: vai direto ao ponto. Máximo 1 frase de abertura.
 - Empatia sob medida: só comenta o estado emocional quando houver sinais de stress.
+- Valores implícitos: mantém o alinhamento sem o declarar.
 - Vocabulário disciplinado; evita entusiasmismos.
 - Seguimento: termina com 1 próxima ação concreta.
-- Usar o Tom de Voz do RAG quando presente, adota-o rigorosamente nas respostas.
+- usar o Tom de Voz do RAG quando presente, adota-o rigorosamente nas respostas.
 
 Proibido
 - Small talk, emojis ou tom efusivo.
-- Inventar links, nomes de variantes, SKUs ou preços.
-- Usar placeholders (“exemplo1”, “não especificado”, etc.).
-
-Fontes e prioridade
-- Catálogo interno (CSV → tabela catalog_items): fonte principal e prioritária.
-- RAG corporativo (sites, PDFs e marcas): só quando o utilizador pedir explicitamente opções fora do catálogo interno (nunca para orçamentos).
-- LLM base: livre para raciocínio, estratégia e contexto externo.
+- Inventar links ou preços.
 
 Funções
 1) Estratégia e apoio comercial (produtos, prazos, preços).
-2) Especialista e assistente no método psicoestético.
-3) Método e procedimentos (quando relevante).
-4) RAG + Grok; se faltar evidência, diz o que falta e o próximo passo.
+2) Método e procedimentos (quando relevante).
+3) RAG + Grok; se faltar evidência, diz o que falta e o próximo passo.
 
-──────────────────────────────────────────────────────────────────────────────
-MODO ORÇAMENTO / PREÇOS  (CATÁLOGO-ONLY, SEM FALLOUTS)
-- Sempre que o pedido for orçamento, cotação, preço, proforma ou semelhante:
-  • **É OBRIGATÓRIO usar apenas os dados do catálogo interno (catalog_items).**
-  • **PROIBIDO** consultar RAG, completar nomes/cores, inferir SKUs ou preços.
-  • Se não houver dados suficientes no catálogo, responde claramente:
-    “Sem dados no catálogo interno para este item.” e pede **apenas** a
-    informação mínima para localizar no catálogo (ex.: nome do produto ou SKU).
-  • Nunca “estimar”, nunca “assumir”, nunca mostrar opções fora do catálogo.
+Fontes e prioridade
+1) Catálogo interno (CSV → SQLite): usar SEMPRE que pedirem preços, orçamentos ou detalhes objetivos de produto.
+   - Se o produto não existir no Catálogo → assinala “fora do catálogo” e informa que precisa de confirmação dos serviços.
+   - Nunca inventes preços ou dimensões.
+2) RAG corporativo (sites, PDFs e marcas): fonte principal para informação da empresa e marcas vendidas.
+3) LLM base: livre para raciocínio, estratégia e contexto externo.
 
-MAPA DE CAMPOS (OBRIGATÓRIO)
-- SKU / Código / Ref  → usar **catalog_items.ref** (match exato, sem alterações).
-- Preço (IVA incluído) → usar **catalog_items.price** (valor final do catálogo).
-- Nome                → usar **catalog_items.name**.
-- Variante (texto)    → usar **catalog_items.variant_attrs**; se vazio, ler a linha “Variante:” no summary (após limpar HTML).
-- Disponibilidade     → usar **catalog_items.availability** (se existir) ou o texto “Disponibilidade:”/“Prazo de entrega:” no summary.
-- URL                 → usar **catalog_items.url** (para variantes contém “#sku=”).
-- O campo **summary pode conter HTML**: extrai apenas o **texto visível** antes de procurar “Variante:” ou disponibilidade.
+Regras de resposta sobre PRODUTOS
+- Inclui SEMPRE links clicáveis dos produtos (URL do Catálogo ou, na falta, do RAG; se não houver, escreve literalmente “sem URL”).
+- Resume SEMPRE em bullets claros (nome/ref, preço+moeda, dimensões/materiais, nota de disponibilidade/estado no site).
+- Sê direto e rápido; evita floreados.
 
-REGRAS DE CATÁLOGO (CSV → tabela catalog_items)
-
-1) PRIORIDADE DE FONTE
-- Usa SEMPRE primeiro os dados do catálogo interno.
-- Dentro do catálogo: dá prioridade às **VARIANTES** (linhas cuja URL contém “#sku=”).
-- Só usa o produto base (URL sem “#sku=”) se não houver variante identificável.
-
-2) DETEÇÃO E LISTAGEM DE VARIANTES (OBRIGATÓRIO)
-- Considera que existem variantes quando houver **≥2 linhas do mesmo produto**. Para agrupar:
-  • Preferir o mesmo **URL-pai** (parte antes de “#sku=”), quando existir; e
-  • Aceitar também o mesmo **nome base** normalizado (nome sem o sufixo de variante) e mesma **marca**,
-    para cobrir casos em que o SKU derivado não contém o SKU-pai.
-- Ao listar variantes, mostrar **exclusivamente** as linhas do catálogo desse grupo. Para cada uma:
-  **Variante (variant_attrs)** + **SKU (ref)** + **Preço (price)** + **Link (url com #sku= se existir; senão o url dessa linha)**.
-- NÃO completes nomes/cores via RAG. Se faltar algum campo no catálogo, escreve literalmente “(sem dado)”.
-- Só depois de listar as variantes do catálogo podes acrescentar:
-  “Existem também outras opções não listadas no catálogo interno; confirme disponibilidade junto dos serviços da empresa.” (sem preços).
-
-3) IDENTIFICAÇÃO DE VARIANTE (ALGORITMO CANÓNICO)
-A) Extrai pistas (prioridade):
-   1. SKU/ref explícita (ex.: ORK.02.03, #sku=ORK.02.03).
-   2. Texto de opção/variante (ex.: “Soft Indigo”, “Simples Branco 1M”, “cor=Soft Indigo”).
-   3. Nome do produto (ex.: “Dublexo Eik Sofá Cama”, “Orikomi Plus Taupe”).
-B) Consulta catálogo:
-   - Se houver **ref** → faz match **EXATO** em catalog_items.ref → usa essa linha e termina.
-   - Sem ref → determina o grupo do produto (ver 2) e filtra **só** as linhas desse grupo.
-     Dentro desse conjunto, procura a correspondência no **variant_attrs** e/ou na linha “Variante: …”
-     (após limpar HTML), usando **match literal** com normalização:
-       · minúsculas, sem acentos, sem pontuação/hífens redundantes, espaços colapsados;
-       · aceita padrão “chave=valor” (ex.: “cor=soft indigo”).
-     **Não** traduzir nem usar sinónimos (ex.: “granite” ≠ “charcoal”).
-   - Se houver 2–6 candidatas plausíveis e não der para decidir, **NÃO adivinhes**:
-     lista opções (Variante + SKU + Preço + Link) e pede escolha.
-   - Se nada casar, responde com o produto base desse grupo e avisa que o preço pode variar consoante a opção.
-
-4) FIXAÇÃO DE ESCOLHAS (SKU/VARIANTE)
-- Se o utilizador fornece um **SKU** → usar exatamente **essa** linha (ref, preço, link).
-- Se previamente **listaste** variantes e o utilizador escolhe uma pelo nome → **fixa a mesma linha** (ref/preço/link já apresentados).
-- Se o utilizador pedir uma variante **que não está** na lista do catálogo, responde:
-  “Essa variante não consta no catálogo interno para este produto.”
-
-5) PREÇOS
-- Variante identificada → **usa o price da variante**.
-- Sem variante → **usa o price do produto base** (e avisa da variação).
-- Nunca usar o preço de outra variante.
-- Mensagem padrão: **“preço com IVA incluído; portes não incluídos.”** (salvo exceção explícita no catálogo).
-
-6) LINKS (política rígida)
-- Só incluir **1 link** quando estiveres a falar de um **produto/variante** do catálogo interno (**interiorguider.com** / **boasafra.pt**).
-- Para variantes, usa **sempre** o link com “#sku=” dessa variante (se existir).
-- **Proibido** acrescentar blocos de “Links úteis”.
-- Em orçamentos, **PROIBIDO** usar links do RAG para produtos.
-
-7) AUTO-CHECK ANTES DE RESPONDER
-- Confirmar que o **SKU/ref** ou o **texto da variante** coincide com a linha escolhida (após normalização).
-- Confirmar que o **preço** mostrado é exatamente o **price** dessa linha.
-- Confirmar que o link segue a política (preferir `…#sku=…` quando existir).
-- Garantir a frase **“preço com IVA incluído; portes não incluídos”** (salvo exceção explícita).
-
-REGRA DURA + EXEMPLOS ANTI-ERRO
-- Se a pergunta mencionar explicitamente uma variante, é **PROIBIDO** responder com o preço do produto base.
-- Ex.1: “2x Orikomi Plus Taupe **Simples Branco 1M**” → usar SKU correto da variante, preço da variante, link `…#sku=…`.
-- Ex.2: “3x Orikomi Cinza Claro **Simples Branco 1M**” → usar SKU correto dessa variante; nunca o preço de outra.
-
-PEDIDOS AMBÍGUOS
-- Se a pergunta for ambígua entre várias variantes, faz **1** pergunta de clarificação e oferece **3–6** opções (Variante / SKU / Preço / Link) **do catálogo**.
-
-FORMATO DE RESPOSTA (ORÇAMENTOS)
-- Título curto com quantidade e variante (se houver).
-- Linhas: **Nome + SKU**, **Preço unitário (IVA incluído)**, **Quantidade**, **Subtotal**.
-- Nota: **“preço com IVA incluído; portes não incluídos”** (salvo indicação contrária).
-- Link único (conforme a política acima).
-
-Nunca inventes preços, nomes ou SKUs. Nunca assumes variantes sem sinal claro no catálogo interno.
+Formato
+- 1 bloco curto; bullets só quando ajudam a agir.
 """
 
 # ---------------------------------------------------------------------------------------
@@ -171,7 +86,6 @@ Nunca inventes preços, nomes ou SKUs. Nunca assumes variantes sem sinal claro n
 IG_HOST = os.getenv("IG_HOST", "interiorguider.com").lower()
 
 def _canon_ig_url(u: str) -> str:
-    """Canoniza URLs do domínio IG_HOST; deixa externos intactos."""
     try:
         p = urlparse((u or "").strip())
     except Exception:
@@ -384,6 +298,8 @@ def _expand_variants(term: str) -> List[str]:
     return out
 
 # --- Two-stage retrieval helpers (full-text + re-rank) -----------------------
+# Nota: se rag_client expuser search_fulltext(...), usamos. Caso contrário,
+# fazemos fallback para search_chunks(...) com variantes de query (embeddings).
 
 NUMERAL_MAP = {
     # pt
@@ -615,6 +531,8 @@ def rag_mini_search_urls(terms: List[str], namespace: Optional[str], top_k: int)
         if best_url:
             url_by_term[tnorm] = best_url
     return url_by_term
+    
+
 
 # ---------------------------------------------------------------------------------------
 # Memória Local + (opcional) Mem0
@@ -841,7 +759,7 @@ def _compat_score(name: str, title: str, slug: str) -> float:
     return (0.6*j_slug) + (0.4*j_title) + kind_hit
 
 class LinkResolver:
-    def __init__(self, namespace: Optional[str], prefer_host: str = IG_HOST, min_conf: float = 0.58):
+    def __init__(self, namespace: Optional[str], prefer_host: str = IG_HOST, min_conf: float = 0.55):
         self.ns = namespace or DEFAULT_NAMESPACE
         self.prefer_host = (prefer_host or "").lower()
         self.min_conf = min_conf
@@ -911,7 +829,6 @@ class LinkResolver:
                 line = l2
             parts[i] = line
         return "\n".join(parts)
-
 # ---------------------------------------------------------------------------------------
 # Injetor de links a partir do RAG (pós-processamento do texto) + Fallback
 # ---------------------------------------------------------------------------------------
@@ -992,8 +909,8 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
                     url = url_by_term_conf[tnorm][0]
                     m = re.search(rf"(\b{re.escape(item_name)}\b)", line, re.I)
                     if m:
-                        nome = m.group(1)
-                        lines[i] = line.replace(nome, f"[{nome}]({url})", 1)
+                        nome_part = m.group(1)
+                        lines[i] = line.replace(nome_part, f"[{nome_part}]({url})", 1)
         out = "\n".join(lines)
 
     return out
@@ -1135,316 +1052,56 @@ def build_rag_products_block(question: str) -> str:
             lines.append(f"- NOME={title or '-'}; URL={url or 'sem URL'}")
     return "Produtos para orçamento (do RAG; usa estes dados exatos para links):\n" + "\n".join(lines) if lines else ""
 
-# ---------- Helpers para intenção e catálogo (colar acima de build_messages) ----------
-import re
-from typing import Optional, List, Dict, Tuple
-
-def _is_budget_intent_pt(text: str) -> bool:
-    """Heurística PT simples para pedidos de orçamento / preço / variantes."""
-    if not text:
-        return False
-    t = text.lower()
-    triggers = [
-        "orçament", "orcament", "cotação", "cotacao", "preço", "preco",
-        "quanto custa", "quanto fica", "sku", "#sku=", "variante", "cor=",
-        "quantidade", "qtd", "unidades", "unidade", "preçário", "precario"
-    ]
-    if any(k in t for k in triggers):
-        return True
-    # “2x”, “3 unidades”, etc.
-    if re.search(r"\b\d+\s*x\b", t) or re.search(r"\b\d+\s+(unidade|unidades)\b", t):
-        return True
-    return False
-
-# >>> PATCH: catálogo — query “limpa” + fallback AND→OR + logs
-
-# stopwords mínimas PT/EN e lixo de orçamento
-_STOP = {
-    "o","a","os","as","de","da","do","das","dos","para","por","com","sem","em","no","na","nos","nas",
-    "um","uma","uns","umas","e","ou","que","quanto","custa","fica","preço","preco","orcamento","orçamento",
-    "faz","fazer","favor","peço","pedido","proposta","cotacao","cotação","qtd","unidade","unidades","x",
-    "the","of","and","for","with","without","in","on"
-}
-
-def _catalog_query_from_question(question: str) -> str:
-    """
-    Extrai uma query útil para o catálogo a partir da pergunta:
-    - devolve refs/SKUs se existirem
-    - caso contrário, devolve só tokens “de produto” (>=3 chars, não stopword, não só dígitos)
-    """
-    q = (question or "").strip()
-    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q, flags=re.I)
-    if refs:
-        return " ".join(refs[:5])
-    toks = [t for t in re.split(r"[^\wÁÂÃÀÉÊÍÓÔÕÚÇáâãàéêíóôõúç]+", q) if t]
-    good = []
-    for t in toks:
-        tl = t.lower()
-        # ignora números puros e stopwords; exige 3+ chars úteis
-        if tl in _STOP: 
-            continue
-        if tl.isdigit():
-            continue
-        if len(tl) < 3:
-            continue
-        good.append(t)
-    # mantém ordem, dedup leve
-    seen = set(); cleaned = []
-    for t in good:
-        k = t.lower()
-        if k not in seen:
-            seen.add(k); cleaned.append(t)
-    return " ".join(cleaned[:6]) or q
-
-
-def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
-    """
-    Pesquisa no catálogo interno (SQLite) por nome/summary/ref.
-    Estratégia:
-      1) match exato por refs/SKUs, se existirem
-      2) pesquisa por termos úteis com AND
-      3) se (2) não devolver nada, repete com OR (mais tolerante)
-    Inclui log curto para validar que o LLM “viu” o bloco.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q_raw = (question or "").strip()
-    q = _catalog_query_from_question(q_raw)
-    ref_toks = _extract_ref_tokens(q_raw)
-
-    rows: List[Dict] = []
-    try:
-        with _catalog_conn() as c:
-            cur: sqlite3.Cursor
-
-            # 1) Match exato por SKU/ref
-            if ref_toks:
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
-                     ORDER BY updated_at DESC
-                     LIMIT ?""",
-                    tuple([ns, *ref_toks, limit])
-                )
-                rows = [dict(r) for r in cur.fetchall()]
-
-            # Vamos construir termos “bons” para LIKE
-            terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 3]
-
-            # 2) Pesquisa AND (mais estrita)
-            if len(rows) < 1 and terms:
-                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND {where_and}
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
-
-            # 3) Fallback OR (tolerante)
-            if len(rows) < 1 and terms:
-                where_or_parts = []
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    where_or_parts.append("(name LIKE ? OR summary LIKE ? OR ref LIKE ?)")
-                    like_args.extend([p, p, p])
-                where_or = " OR ".join(where_or_parts) if where_or_parts else "1=1"
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ({where_or})
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
-
-    except Exception as e:
-        log.warning(f"[catalog] search falhou: {e}")
-        rows = []
-
-    # LOG do que vai ao LLM
-    try:
-        log.info(f"[catalog] ns={ns} q_raw={q_raw!r} q_clean={q!r} ref_toks={ref_toks} rows={len(rows)}")
-    except Exception:
-        pass
-
-    if not rows:
-        return ""  # sem bloco → o LLM pode cair na mensagem “sem dados” do Mission
-
-    # Bloco para o LLM
-    lines = [f"CATÁLOGO INTERNO — ns={ns} (usar SÓ estes dados para orçamentos/preços; NÃO usar RAG aqui)"]
-    seen = set()
-    for r in rows[:limit]:
-        name = r.get("name") or "(sem nome)"
-        ref  = r.get("ref") or "(sem dado)"
-        price = r.get("price")
-        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
-        url = r.get("url") or "(sem URL)"
-        brand = r.get("brand") or ""
-        variant = (r.get("variant_attrs") or "").strip()
-        key = (ref, url)
-        if key in seen:
-            continue
-        seen.add(key)
-        name_show = f"{name} — Variante: {variant}" if variant else name
-        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
-    return "\n".join(lines)
-# <<< PATCH
-    
-
-def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
-    """
-    Lista variantes (#sku=) por grupo de produto quando a query sugere listagem.
-    Mantém a apresentação enxuta para o LLM.
-    """
-    qlow = (question or "").lower()
-    if not any(k in qlow for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes")):
-        return ""
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(question)) if len(t) >= 2]
-
-    rows: List[Dict] = []
-    try:
-        with _catalog_conn() as c:
-            where = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * max(1, len(terms)))
-            like_args = []
-            if terms:
-                for t in terms:
-                    pattern = f"%{t}%"
-                    like_args.extend([pattern, pattern, pattern])
-            else:
-                # fallback leve se não houver termos
-                where = "(name LIKE ? OR summary LIKE ?)"
-                like_args.extend([f"%{_sanitize_like(question)}%", f"%{_sanitize_like(question)}%"])
-            cur = c.execute(f"""
-                SELECT name, ref, price, url, brand, variant_attrs
-                  FROM catalog_items
-                 WHERE namespace=? AND {where}
-                 ORDER BY updated_at DESC
-                 LIMIT 120
-            """, tuple([ns, *like_args]))
-            rows = [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        log.warning(f"[catalog variants] falhou: {e}")
-        rows = []
-
-    if not rows:
-        return ""
-
-    # agrupar por URL-pai
-    groups: Dict[str, List[Dict]] = {}
-    for r in rows:
-        u = (r.get("url") or "").strip()
-        parent = u.split("#", 1)[0] if u else ""
-        groups.setdefault(parent, []).append(r)
-
-    # filtrar grupos com ≥2 variantes (#sku=)
-    groups = {
-        p: [it for it in lst if "#sku=" in (it.get("url") or "")]
-        for p, lst in groups.items()
-    }
-    groups = {p: lst for p, lst in groups.items() if len(lst) >= 2}
-    if not groups:
-        return ""
-
-    out = ["CATÁLOGO INTERNO — Variantes por produto (Variante | SKU | Preço | Link):"]
-    for parent, lst in groups.items():
-        lst_sorted = sorted(lst, key=lambda x: (x.get("name") or "", x.get("ref") or ""))
-        title = lst_sorted[0].get("name") or parent or "(produto)"
-        out.append(f"• Produto: {title}")
-        for r in lst_sorted[:40]:
-            ref  = r.get("ref") or "(sem ref)"
-            pr   = r.get("price")
-            pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-            url  = r.get("url") or "(sem url)"
-            va   = (r.get("variant_attrs") or "").strip()
-            label = va or (r.get("name") or "")
-            out.append(f"   - {label} | SKU:{ref} | {pr_s} | {url}")
-    return "\n".join(out)
-
-# ---------- build_messages (patch consolidado) ----------
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # 1) sinais contextuais → mem0
     new_facts = extract_contextual_facts_pt(question)
     for k, v in new_facts.items():
         mem0_set_fact(user_id, k, v)
 
-    # 2) memórias recentes
     short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
-    memory_block = (
-        "Memórias recentes do utilizador (curto prazo):\n"
-        + "\n".join(f"- {s}" for s in short_snippets[:3])
-        if short_snippets else ""
-    )
+    memory_block = "Memórias recentes do utilizador (curto prazo):\n" + "\n".join(f"- {s}" for s in short_snippets[:3]) if short_snippets else ""
 
-    # 3) CATÁLOGO INTERNO (SQLite) — SEMPRE antes do RAG
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    cat_q = _catalog_query_from_question(question)
-    catalog_block = build_catalog_block(cat_q, ns)
-    catalog_variants_block = build_catalog_variants_block(cat_q, ns)
-
-    # 4) RAG (apenas para conteúdo corporativo, NÃO para preços/orçamentos)
     rag_block = ""
     rag_used = False
     rag_hits: List[dict] = []
     if RAG_READY:
         try:
-            rag_hits = search_chunks(
-                query=question,
-                namespace=namespace or DEFAULT_NAMESPACE,
-                top_k=RAG_TOP_K_DEFAULT
-            ) or []
+            rag_hits = search_chunks(query=question, namespace=namespace or DEFAULT_NAMESPACE, top_k=RAG_TOP_K_DEFAULT) or []
             rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
             rag_used = bool(rag_block)
         except Exception as e:
             log.warning(f"[rag] search falhou: {e}")
-            rag_block, rag_used, rag_hits = "", False, []
+            rag_block = ""
+            rag_used = False
+            rag_hits = []
 
-    # 5) links candidatos do RAG (o mission já proíbe usá-los para preços)
+    # bloco de links candidatos (para o LLM usar tal como estão)
     links_pairs = _links_from_matches(rag_hits, max_links=8)
     links_block = ""
     if links_pairs:
-        lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
+        lines = ["Links candidatos (do RAG; usa estes URLs tal como estão):"]
         for title, url in links_pairs:
             lines.append(f"- {title or '-'} — {url}")
         links_block = "\n".join(lines)
 
-    # 6) bloco de produtos (opcional)
     products_block = build_rag_products_block(question)
 
-    # 7) montar mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
     fb = facts_block_for_user(user_id)
-    if fb:
-        messages.append({"role": "system", "content": fb})
-
-    # catálogo primeiro (para guiar o LLM)
-    if catalog_block:
-        messages.append({"role": "system", "content": catalog_block})
-    if catalog_variants_block:
-        messages.append({"role": "system", "content": catalog_variants_block})
-
-    # depois o RAG (contexto corporativo, docs, etc.)
+    if fb: messages.append({"role": "system", "content": fb})
     if rag_block:
-        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
     if links_block:
         messages.append({"role": "system", "content": links_block})
-
     if products_block:
         messages.append({"role": "system", "content": products_block})
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
-
     messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-# ---------- FIM DO PATCH ----------
 
+# ---------------------------------------------------------------------------------------
 # ROTAS BÁSICAS + páginas
+# ---------------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def serve_index():
     try:
@@ -1475,11 +1132,7 @@ def status_json():
         "version": APP_VERSION,
         "message": "Alma server ativo. Use POST /ask (Grok+Memória+RAG).",
         "mem0": {"enabled": MEM0_ENABLE, "client_ready": bool(mem0_client)},
-        "rag": {
-            "available": RAG_READY,
-            "top_k_default": RAG_TOP_K_DEFAULT,
-            "namespace": DEFAULT_NAMESPACE
-        },
+        "rag": {"available": RAG_READY, "top_k_default": RAG_TOP_K_DEFAULT, "namespace": DEFAULT_NAMESPACE},
         "endpoints": {
             "health": "/health",
             "ask": "POST /ask {question, user_id?, namespace?, top_k?}",
@@ -1496,8 +1149,8 @@ def status_json():
             "budget_csv": "POST /budget/csv",
             "console": "/console",
         },
-        # _status_catalog_sqlite() é definido na Parte 3; a avaliação só acontece runtime
-        "catalog": _status_catalog_sqlite() if ' _status_catalog_sqlite' in globals() else {},
+        # ⬇️ adicionamos o estado do catálogo (SQLite)
+        "catalog": _status_catalog_sqlite(),
     }
 
 @app.get("/health")
@@ -1509,7 +1162,7 @@ def health():
         "model": MODEL,
         "rag_available": RAG_READY,
         "rag_default_namespace": DEFAULT_NAMESPACE,
-        "rag_top_k_default": RAG_TOP_K_DEFAULT,
+        "rag_top_k_default": RAG_TOP_K_DEFAULT
     }
 
 @app.post("/echo")
@@ -1713,9 +1366,9 @@ async def rag_extract_urls(request: Request):
         return {"ok": False, "error": str(e)}
 
 # ---------------------------------------------------------------------------------------
-# 🔸 Exportação CSV de Orçamentos
+# 🔸 Exportação CSV de Orçamentos (mesmo não havendo “modo orçamento” no prompt)
 # ---------------------------------------------------------------------------------------
-def _safe_float_csv(v, default=0.0):
+def _safe_float(v, default=0.0):
     try:
         if isinstance(v, str):
             v = v.replace("€", "").replace(",", ".").strip()
@@ -1740,7 +1393,7 @@ async def budget_csv(request: Request):
     """
     data = await request.json()
     mode = (data.get("mode") or "public").lower().strip()
-    iva_pct = _safe_float_csv(data.get("iva_pct", 23.0))
+    iva_pct = _safe_float(data.get("iva_pct", 23.0))
     rows = data.get("rows") or []
 
     if mode not in ("public", "pro"):
@@ -1758,8 +1411,8 @@ async def budget_csv(request: Request):
     for r in rows:
         ref = (r.get("ref") or "").strip()
         quant = int(r.get("quant") or 1)
-        preco_uni = _safe_float_csv(r.get("preco_uni"), 0.0)
-        desc_pct = _safe_float_csv(r.get("desc_pct"), 0.0)
+        preco_uni = _safe_float(r.get("preco_uni"), 0.0)
+        desc_pct = _safe_float(r.get("desc_pct"), 0.0)
 
         desc_main = (r.get("descricao") or "").strip() or "Produto"
         extra_lines = []
@@ -1854,19 +1507,15 @@ async def ask(request: Request):
             "namespace": namespace or DEFAULT_NAMESPACE
         }
     }
-
 # ---------------------------------------------------------------------------------------
 # 📚 Catálogo (SQLite) — backend único via CSV + integração no /status
 # ---------------------------------------------------------------------------------------
 import sqlite3
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
+from fastapi import UploadFile, File, Form
 
-# Respeita valores já definidos em partes anteriores
-if 'DEFAULT_NAMESPACE' not in globals():
-    DEFAULT_NAMESPACE = os.getenv("DEFAULT_NAMESPACE", "boasafra")
-if 'CATALOG_DB_PATH' not in globals():
-    CATALOG_DB_PATH = os.getenv("CATALOG_DB_PATH", "/tmp/catalog.db")
+CATALOG_DB_PATH = os.getenv("CATALOG_DB_PATH", "/tmp/catalog.db")
 
 # ---- DB helpers -----------------------------------------------------------------------
 def _catalog_conn():
@@ -1883,152 +1532,8 @@ def _table_cols(c) -> set:
         cols.add(r[1])
     return cols
 
-# ========= Blocos do Catálogo (SQLite) p/ injeção no prompt =========
-
-def _sanitize_like(s: str) -> str:
-    return (s or "").strip().replace("%", "").replace("_", "")
-
-def _extract_ref_tokens(text: str) -> list:
-    """
-    Puxa tokens do tipo SKU/ref (ex.: ORK.12-RO-TX, 741050527-SO). Útil p/ match exato.
-    """
-    import re
-    toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", text or "", flags=re.I)
-    # filtra coisas muito genéricas
-    return [t for t in toks if any(ch.isdigit() for ch in t)]
-
-def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
-    """
-    Procura no catálogo interno (SQLite) por nome/summary/ref e devolve
-    um bloco de linhas normalizadas para o LLM usar em orçamentos.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q = _sanitize_like(question)
-    ref_toks = _extract_ref_tokens(question)
-
-    rows = []
-    try:
-        with _catalog_conn() as c:
-            cur: sqlite3.Cursor
-
-            # 1) Se houver SKUs na pergunta → tenta match EXATO primeiro
-            if ref_toks:
-                cur = c.execute("""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs
-                      FROM catalog_items
-                     WHERE namespace=? AND ref IN (%s)
-                     ORDER BY updated_at DESC
-                     LIMIT ?""" % (",".join("?"*len(ref_toks))),
-                    tuple([ns, *ref_toks, limit])  # ns + tokens + limit
-                )
-                rows = [dict(r) for r in cur.fetchall()]
-
-            # 2) Se nada (ou também queremos mais contexto) → LIKE por nome/summary/ref
-            if len(rows) < 3:  # dá mais contexto
-                like = f"%{q}%"
-                cur = c.execute("""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs
-                      FROM catalog_items
-                     WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", (ns, like, like, like, limit))
-                rows2 = [dict(r) for r in cur.fetchall()]
-                # evita duplicados mantendo ordem
-                seen = {(r["ref"], r["url"]) for r in rows}
-                for r in rows2:
-                    key = (r["ref"], r["url"])
-                    if key not in seen:
-                        rows.append(r); seen.add(key)
-    except Exception as e:
-        log.warning(f"[catalog] search falhou: {e}")
-        rows = []
-
-    if not rows:
-        return ""  # sem bloco → o LLM não “vê” catálogo
-
-    # Formatar linhas de catálogo — APENAS dados internos (nada de RAG)
-    lines = [
-        "Catálogo interno (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"
-    ]
-    for r in rows:
-        name = r.get("name") or "(sem nome)"
-        ref  = r.get("ref") or "(sem dado)"
-        price = r.get("price")
-        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
-        url = r.get("url") or "(sem URL)"
-        brand = r.get("brand") or ""
-        variant = (r.get("variant_attrs") or "").strip()
-        if variant:
-            name_show = f"{name} — Variante: {variant}"
-        else:
-            name_show = name
-        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
-    return "\n".join(lines)
-
-
-def build_catalog_variants_block(question: str, namespace: Optional[str] = None, limit_families: int = 5, limit_variants: int = 40) -> str:
-    """
-    Se o pedido for sobre “variantes”, tenta agrupar por URL-pai e listar variantes (#sku) do mesmo produto.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q = (question or "").lower()
-    if not any(k in q for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes")):
-        return ""  # só ativa em perguntas que sugerem listagem
-
-    try:
-        with _catalog_conn() as c:
-            # primeiro encontra alguns itens relevantes
-            like = f"%{_sanitize_like(question)}%"
-            cur = c.execute("""
-                SELECT name, url
-                  FROM catalog_items
-                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ?)
-                 ORDER BY updated_at DESC
-                 LIMIT ?""", (ns, like, like, limit_families))
-            seeds = [dict(r) for r in cur.fetchall()]
-            if not seeds:
-                return ""
-
-            variants_lines = ["Variantes no catálogo interno (agrupadas por produto):"]
-            seen_parents = set()
-
-            for s in seeds:
-                url = s.get("url") or ""
-                parent = url.split("#")[0] if url else ""
-                if not parent or parent in seen_parents:
-                    continue
-                seen_parents.add(parent)
-
-                cur2 = c.execute("""
-                    SELECT name, ref, price, url, variant_attrs
-                      FROM catalog_items
-                     WHERE namespace=? AND url LIKE ?
-                     ORDER BY updated_at DESC
-                     LIMIT ?""", (ns, parent + "#sku=%", limit_variants))
-                vars_ = [dict(r) for r in cur2.fetchall()]
-                if not vars_:
-                    continue
-
-                # cabeçalho da família
-                variants_lines.append(f"\n• Produto: {s.get('name') or parent}")
-                for v in vars_:
-                    ref = v.get("ref") or "(sem dado)"
-                    price = v.get("price")
-                    price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
-                    var_txt = (v.get("variant_attrs") or "").strip()
-                    name_v = v.get("name") or ""
-                    show = var_txt if var_txt else name_v
-                    variants_lines.append(f"  - Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {v.get('url') or '(sem URL)'}")
-
-            if len(variants_lines) == 1:
-                return ""
-            return "\n".join(variants_lines)
-
-    except Exception as e:
-        log.warning(f"[catalog variants] falhou: {e}")
-        return ""
-
 # --- PATCH: catálogo (init + ensure cols) ------------------------------------
+
 def _ensure_cols(conn):
     """
     Garante que a tabela catalog_items existe e tem todas as colunas necessárias.
@@ -2052,7 +1557,7 @@ def _ensure_cols(conn):
         ("namespace",      "TEXT"),
         ("name",           "TEXT"),
         ("summary",        "TEXT"),
-        ("url",            "TEXT"),       # UNIQUE via índice
+        ("url",            "TEXT"),       # UNIQUE tratado mais abaixo
         ("source",         "TEXT"),
         ("created_at",     "TEXT"),
         ("updated_at",     "TEXT"),
@@ -2064,8 +1569,7 @@ def _ensure_cols(conn):
         ("dimensions",     "TEXT"),
         ("material",       "TEXT"),
         ("image_url",      "TEXT"),
-        ("variant_attrs",  "TEXT"),
-        ("variant_key",    "TEXT")        # matching determinístico de variantes
+        ("variant_attrs",  "TEXT")
     ]
 
     # 4) adicionar colunas em falta
@@ -2074,25 +1578,29 @@ def _ensure_cols(conn):
             try:
                 cur.execute(f"ALTER TABLE catalog_items ADD COLUMN {col} {coltype}")
             except Exception as e:
+                # tolera deploys em que a coluna foi criada noutra corrida
                 if "duplicate column name" in str(e).lower():
                     pass
                 else:
                     raise
 
-    # 5) índices
+    # 5) garantir UNIQUE(url) via índice único (idempotente)
+    #    Nota: se já existir uma UNIQUE constraint antiga, isto não cria outra.
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(url)")
     except Exception:
         pass
+
+    # 6) índices úteis
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_namespace ON catalog_items(namespace)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ref ON catalog_items(ref)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_updated ON catalog_items(updated_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_catalog_variantkey ON catalog_items(variant_key)")
     except Exception:
         pass
 
     conn.commit()
+
 
 def _catalog_init():
     """
@@ -2107,137 +1615,45 @@ def _catalog_init():
         raise
 _catalog_init()
 
-# ---- Helpers extra (headers CSV, URLs relativas/absolutas IG, variantes) --------------
-import unicodedata
-from urllib.parse import urljoin
-
-def _norm_header(s: str) -> str:
-    s = (s or "").strip().lower().replace("\ufeff", "")
-    s = s.replace("/", " ").replace("_", " ").replace("-", " ")
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _to_abs_ig_url(u: str) -> str:
-    """Converte /slug ou //host/path para https://interiorguider.com/slug e aplica canon IG."""
-    u = (u or "").strip()
-    if not u:
-        return ""
-    if u.startswith("//"):
-        u = "https:" + u
-    if u.startswith("http://") or u.startswith("https://"):
-        return _canon_ig_url(u) or u
-    if not u.startswith("/"):
-        u = "/" + u
-    absu = f"https://{IG_HOST}{u}"
-    return _canon_ig_url(absu) or absu
-
-# --- Helpers para variantes ---------------------------------------------------
-import json
-import hashlib
-
-def _norm_txt(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.lower()
-
-def build_variant_key(attrs: dict) -> str:
-    """
-    Constrói chave determinística para matching de variantes.
-    Ignora chaves técnicas; ordena pares; normaliza a=valor|b=valor…
-    """
-    if not attrs or not isinstance(attrs, dict):
-        return ""
-    ignore = {
-        "product_url", "sku", "ref", "price", "moeda", "currency",
-        "iva", "iva_pct", "image", "image_url", "url", "link"
-    }
-    pairs = []
-    for k, v in attrs.items():
-        kn = _norm_txt(k)
-        if kn in ignore or (kn.startswith("option") and kn.endswith("name")):
-            continue
-        vn = _norm_txt(v)
-        if vn == "":
-            continue
-        pairs.append((kn, vn))
-    if not pairs:
-        return ""
-    pairs.sort(key=lambda x: x[0])
-    return "|".join([f"{k}={v}" for k, v in pairs])
-
-def values_to_variant_key(values_str: str) -> str:
-    """
-    De 'Soft Indigo, Tecido Areia 1m' -> 'soft indigo|tecido areia 1m'
-    (útil quando só guardamos os VALORES, sem as chaves).
-    """
-    if not values_str:
-        return ""
-    parts = [p.strip() for p in str(values_str).split(",") if p.strip()]
-    parts = [_norm_txt(p) for p in parts if p]
-    return "|".join(parts)
-
-# ---- Importação CSV (HTML clean + variantes normalizadas “valores”) --------------------
-from io import StringIO
-import html
-
-def _parse_price(s: str):
-    """
-    Normaliza formatos PT (1.739,00) e EN (1739.00).
-    Remove símbolos e milhares; devolve float ou None.
-    """
-    if not s:
-        return None
-    s = str(s).strip().replace("[FIXED]", "").strip()
-    s = re.sub(r"[^\d,.\-]", "", s)
-    if "." in s and "," in s and s.rfind(",") > s.rfind("."):
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
+# ---- Utils -----------------------------------------------------------------------------
+def _canon_ig_url(u: str) -> str:
+    # Usa a função já definida acima no ficheiro (mantemos aqui só no caso de chamada direta)
     try:
-        v = float(s)
-        return v if v != 0.0 else None
+        p = urlparse((u or "").strip())
     except Exception:
-        return None
+        return u or ""
+    if not p.netloc:
+        return u or ""
+    host = p.netloc.lower().replace("www.", "")
+    if IG_HOST not in host:
+        return u or ""  # só canonizamos IG
+    path = re.sub(r"/(products?|produtos?)\/", "/", p.path, flags=re.I)
+    path = re.sub(r"//+", "/", path)
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    p = p._replace(scheme="https", netloc=IG_HOST, path=path)
+    return urlunparse(p)
 
-def _html_to_text(s: str) -> str:
-    if not s:
-        return ""
-    txt = s
-    for tag in (r"<\s*br\s*/?\s*>", r"</\s*p\s*>", r"</\s*li\s*>", r"</\s*div\s*>"):
-        txt = re.sub(rf"(?i){tag}", "\n", txt)
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = html.unescape(txt)
-    txt = re.sub(r"[ \t]+", " ", txt)
-    txt = re.sub(r"\n\s*\n+", "\n", txt)
-    return txt.strip()
+def _safe_float(v, default=None):
+    try:
+        if v is None or v == "":
+            return default
+        if isinstance(v, str):
+            t = v.replace("€", "").replace("\u00A0"," ").strip()
+            t = t.replace(".", "").replace(" ", "")
+            t = t.replace(",", ".")
+            return float(t)
+        return float(v)
+    except Exception:
+        return default
 
-def _split_attr_segments(raw: str):
-    if not raw:
-        return []
-    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
-    out = []
-    for p in parts:
-        p = re.sub(r"^\[[^\]]+\]\s*", "", p)  # remove [XX]
-        p = p.split(":", 1)[0].strip()        # corta URL após ':'
-        if "=" in p:
-            k, v = p.split("=", 1)
-            out.append((k.strip(), v.strip()))
-        else:
-            out.append((None, p))
-    return out
+def _coalesce(*vals, default=""):
+    for x in vals:
+        if x not in (None, "", [], {}):
+            return x
+    return default
 
-def _variant_to_values_only(raw: str) -> str:
-    pairs = _split_attr_segments(raw)
-    values = [(v if v else (k or "")).strip() for (k, v) in pairs]
-    values = [re.sub(r"\s+", " ", v) for v in values if v]
-    return ", ".join(values).strip(", ").strip()
-
-# ---- Upsert genérico (PRECISA existir antes de /catalog/import-csv) -------------------
+# ---- Upsert genérico -------------------------------------------------------------------
 def _upsert_catalog_row(ns: Optional[str],
                         name: str,
                         summary: str,
@@ -2251,33 +1667,26 @@ def _upsert_catalog_row(ns: Optional[str],
                         dimensions: Optional[str] = None,
                         material: Optional[str] = None,
                         image_url: Optional[str] = None,
-                        variant_attrs: Optional[str] = None,
-                        variant_key: Optional[str] = None):
-    """
-    Upsert por REF (prioritário) ou por URL (quando não há REF).
-    Mantém 'url' alinhada nas variantes. Usa _catalog_conn() e _now().
-    """
+                        variant_attrs: Optional[str] = None):
     if not url:
         return
     with _catalog_conn() as c:
+        row = None
         row_id = None
 
-        # 1) tenta por REF (chave canónica para variantes)
+        # 1) tenta por REF (product code) — chave canónica para variantes
         if ref:
             cur = c.execute("SELECT id FROM catalog_items WHERE ref=?", (ref,))
-            r = cur.fetchone()
-            if r:
-                row_id = r["id"]
+            row = cur.fetchone()
+            if row:
+                row_id = row["id"]
 
-        # 2) se não encontrou por REF, tenta por URL apenas quando NÃO há ref
+        # 2) se não há ref (ou não encontrou), tenta por URL (apenas para itens sem ref)
         if row_id is None and not ref:
-            cur = c.execute(
-                "SELECT id FROM catalog_items WHERE url=? AND (ref IS NULL OR ref='')",
-                (url,)
-            )
-            r = cur.fetchone()
-            if r:
-                row_id = r["id"]
+            cur = c.execute("SELECT id FROM catalog_items WHERE url=? AND (ref IS NULL OR ref='')", (url,))
+            row = cur.fetchone()
+            if row:
+                row_id = row["id"]
 
         if row_id is not None:
             c.execute("""
@@ -2296,36 +1705,123 @@ def _upsert_catalog_row(ns: Optional[str],
                        material=COALESCE(?, material),
                        image_url=COALESCE(?, image_url),
                        variant_attrs=COALESCE(?, variant_attrs),
-                       variant_key=COALESCE(?, variant_key),
                        url=?            -- mantém a URL alinhada (produto nas variantes)
                  WHERE id=?""",
                 (ns, name, summary, source, _now(),
                  ref, price, currency, iva_pct, brand, dimensions, material, image_url,
-                 variant_attrs, variant_key, url, row_id))
+                 variant_attrs, url, row_id))
         else:
             c.execute("""
                 INSERT INTO catalog_items
                   (namespace,name,summary,url,source,created_at,updated_at,
-                   ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs,variant_key)
+                   ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs)
                 VALUES (?,?,?,?,?,?,?,
-                        ?,?,?,?,?,?,?,?,?,?)
-            """,
+                        ?,?,?,?,?,?,?,?,?)""",
                 (ns, name, summary, url, source, _now(), _now(),
-                 ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs, variant_key))
+                 ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs))
+
+# ---- helpers extra (cola estes dois logo acima do endpoint /catalog/import-csv) --------
+import unicodedata
+from urllib.parse import urljoin
+
+def _norm_header(s: str) -> str:
+    s = (s or "").strip().lower().replace("\ufeff", "")
+    # trocar separadores por espaço
+    s = s.replace("/", " ").replace("_", " ").replace("-", " ")
+    # remover acentos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # compactar espaços
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _to_abs_ig_url(u: str) -> str:
+    """Converte /slug ou //host/path para https://interiorguider.com/slug e aplica canon IG."""
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        u = "https:" + u
+    if u.startswith("http://") or u.startswith("https://"):
+        return _canon_ig_url(u) or u
+    # relativo → juntar à raiz do IG
+    if not u.startswith("/"):
+        u = "/" + u
+    absu = f"https://{IG_HOST}{u}"
+    return _canon_ig_url(absu) or absu
+
+# --- Helpers para variantes ---------------------------------------------------
+
+import json
+import hashlib
+import unicodedata
+
+# normaliza texto simples
+def _norm_txt(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
+
+# constrói uma chave determinística a partir dos atributos de variante
+# ignora chaves "técnicas" e ordena por chave para ficar estável
+def build_variant_key(attrs: dict) -> str:
+    if not attrs or not isinstance(attrs, dict):
+        return ""
+    ignore = {
+        "product_url", "sku", "ref", "price", "moeda", "currency",
+        "iva", "iva_pct", "image", "image_url", "url", "link"
+    }
+    pairs = []
+    for k, v in attrs.items():
+        kn = _norm_txt(k)
+        if kn in ignore or kn.startswith("option") and kn.endswith("name"):
+            # nomes dos options não entram, só os valores (ex.: "Cor" / "Branco")
+            continue
+        vn = _norm_txt(v)
+        if vn == "":
+            continue
+        pairs.append((kn, vn))
+    if not pairs:
+        return ""
+    pairs.sort(key=lambda x: x[0])
+    # string canónica
+    canon = "|".join([f"{k}={v}" for k, v in pairs])
+    # devolvemos a string legível; se preferires hash curto, ativa linha abaixo:
+    # return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
+    return canon
 
 
+
+
+
+# ---- Importação CSV ) -----------------------------
+
+from fastapi import UploadFile, File, Form
+from io import StringIO
+import csv
+
+def _parse_price(s: str):
+    if not s:
+        return None
+    s = s.strip().replace("[FIXED]", "").strip().replace(",", ".")
+    try:
+        v = float(s)
+        return v if v != 0.0 else None
+    except Exception:
+        return None
 
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
-                             namespace: str = Form(DEFAULT_NAMESPACE)):
+                             namespace: str = Form("boasafra")):
     """
-    Importa CSV (BigCommerce).
-    - Ignora 'Rule'
-    - 'Product' = base  | 'SKU' = variante (url = base + "#sku=<ref>")
-    - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (só no base)
-    - variant_attrs: VALORES puros (ex.: 'Soft Indigo, Tecido Areia 1m')
-    - variant_key: 'soft indigo|tecido areia 1m' (para matching determinístico)
-    - URLs canonizadas para IG
+    Importa CSV do BigCommerce.
+      - Ignora linhas 'Rule'
+      - 'Product' = produto base
+      - 'SKU' = variante (herda do produto; url = base + #sku=ref)
+      - Descrição da variante = descrição do produto + "Variante: <Product Name da SKU>"
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -2333,41 +1829,36 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
     imported, failed, skipped = 0, 0, 0
     items_out = []
-    current_product = None  # memoriza o último produto base
+    current_product = None  # último produto visto
 
     for row in reader:
         try:
-            row_type     = (row.get("Item Type") or "").strip()
+            row_type = (row.get("Item Type") or "").strip()
+
+            # 1) ignora regras logo
             if row_type.lower() == "rule":
                 skipped += 1
                 items_out.append({"ok": True, "type": "rule", "skipped": True})
                 continue
 
-            # campos base BigCommerce
-            name_raw     = (row.get("Product Name") or "").strip()
-            ref          = (row.get("Product Code/SKU") or "").strip()
-            price        = _parse_price(row.get("Price") or "")
-            brand        = (row.get("Brand Name") or "").strip() or None
-            summary_raw  = (row.get("Product Description") or "").strip()
-            base_url     = _canon_ig_url((row.get("Product URL") or "").strip())
-            availability = (row.get("Product Availability") or "").strip()
+            # 2) campos comuns
+            name = (row.get("Product Name") or "").strip()
+            ref = (row.get("Product Code/SKU") or "").strip()
+            price = _parse_price(row.get("Price") or "")
+            brand = (row.get("Brand Name") or "").strip() or None
+            summary = (row.get("Product Description") or "").strip()
+            image_url = (row.get("Product Image URL") or "").strip() or None
+            base_url = (row.get("Product URL") or "").strip()
 
-            summary_clean = _html_to_text(summary_raw)
-
-            def _with_availability_base(s: str) -> str:
-                s1 = (s or "").strip()
-                if availability:
-                    s1 = (s1 + ("\n" if s1 else "") + f"Disponibilidade: {availability}").strip()
-                return s1
-
-            # ----- produto base -----
+            # 3) produto base
             if row_type == "Product":
                 current_product = {
-                    "name": name_raw,
-                    "summary": _with_availability_base(summary_clean),
+                    "name": name,
+                    "summary": summary,
                     "ref": ref or None,
                     "price": price,
                     "brand": brand,
+                    "image_url": image_url,
                     "url": base_url,
                 }
                 _upsert_catalog_row(
@@ -2378,52 +1869,52 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     source="csv",
                     ref=current_product["ref"],
                     price=current_product["price"],
-                    currency=None,
-                    iva_pct=None,
+                    currency="EUR",
+                    iva_pct=23.0,
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=None,
+                    image_url=current_product["image_url"],
                     variant_attrs=None,
-                    variant_key=None
                 )
-                items_out.append({"ok": True, "type": "product", "name": name_raw, "url": base_url})
+                items_out.append({"ok": True, "type": "product", "name": name, "url": base_url})
                 imported += 1
                 continue
 
-            # ----- variante (SKU) -----
+            # 4) variante (SKU)
             elif row_type == "SKU" and current_product:
-                variant_values = _variant_to_values_only(name_raw)  # "Soft Indigo, Tecido Areia 1m"
-                vkey = values_to_variant_key(variant_values)        # "soft indigo|tecido areia 1m"
-
+                var_name = name  # “Product Name” da SKU
+                # descrição = desc do produto + linha de variante
                 summary_v = current_product["summary"]
-                if variant_values:
-                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {variant_values}").strip()
+                if var_name:
+                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {var_name}").strip()
 
+                # preço: usa o da SKU se houver; senão herda do produto
                 price_v = price if price is not None else current_product["price"]
+
+                # URL estável por variante
                 url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
                 _upsert_catalog_row(
                     ns=namespace,
-                    name=f"{current_product['name']} — {variant_values}" if variant_values else current_product["name"],
+                    name=f"{current_product['name']} — {var_name}" if var_name else current_product["name"],
                     summary=summary_v,
                     url=url_variant,
                     source="csv",
                     ref=ref or None,
                     price=price_v,
-                    currency=None,
-                    iva_pct=None,
+                    currency="EUR",
+                    iva_pct=23.0,
                     brand=current_product["brand"],
                     dimensions=None,
                     material=None,
-                    image_url=None,
-                    variant_attrs=(variant_values or None),
-                    variant_key=(vkey or None)
+                    image_url=current_product["image_url"],
+                    variant_attrs=var_name or None,
                 )
                 items_out.append({
                     "ok": True,
                     "type": "variant",
-                    "name": variant_values or name_raw,
+                    "name": var_name,
                     "ref": ref,
                     "url": url_variant,
                     "price": price_v,
@@ -2431,7 +1922,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 imported += 1
                 continue
 
-            # ----- outros tipos (ignorar) -----
+            # 5) qualquer outra coisa: ignorar
             else:
                 skipped += 1
                 items_out.append({"ok": True, "type": (row_type or "unknown").lower(), "skipped": True})
@@ -2448,58 +1939,35 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "skipped": skipped,
         "items": items_out,
     }
-
-# ---------------------------------------------------------------------------------------
-# Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
-# ---------------------------------------------------------------------------------------
-@app.post("/catalog/clear")
-async def catalog_clear(namespace: str = Form(None),
-                        brand: str = Form(None),
-                        url_prefix: str = Form(None)):
-    """
-    Apaga items do catálogo de forma seletiva:
-      - Se só vier 'namespace': apaga tudo desse namespace.
-      - Se vier 'namespace' + 'brand': apaga apenas itens dessa marca no namespace.
-      - Se vier 'namespace' + 'url_prefix': apaga apenas itens cuja URL começa por esse prefixo.
-    NOTA: Pelo menos 'namespace' é obrigatório.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    if not ns:
-        return {"ok": False, "error": "Falta 'namespace'."}
-
-    b = (brand or "").strip() or None
-    p = (url_prefix or "").strip() or None
-
-    where = ["namespace=?"]
-    params = [ns]
-
-    if b:
-        where.append("brand=?")
-        params.append(b)
-
-    if p:
-        where.append("url LIKE ?")
-        params.append(f"{p}%")
-
-    where_clause = " AND ".join(where)
-    try:
-        with _catalog_conn() as c:
-            before = c.execute(f"SELECT COUNT(*) FROM catalog_items WHERE {where_clause}", tuple(params)).fetchone()[0]
-            c.execute(f"DELETE FROM catalog_items WHERE {where_clause}", tuple(params))
-            c.commit()
-        return {"ok": True, "namespace": ns, "brand": b, "url_prefix": p, "deleted": before}
-    except Exception as e:
-        log.exception("[catalog/clear] falhou")
-        return {"ok": False, "namespace": ns, "brand": b, "url_prefix": p, "error": str(e)}
-
 # ---- CRUD leve -------------------------------------------------------------------------
+from fastapi import Request
+
 @app.post("/catalog/upsert")
 async def catalog_upsert(request: Request):
     """
-    Upsert direto por URL. (Campos opcionais, normalizações incluídas)
+    Upsert direto por URL.
+
+    Body exemplo:
+    {
+      "namespace": "boasafra",
+      "url": "https://interiorguider.com/produto/mesa-x#sku=BS.MX.180",
+      "name": "Mesa X 180",
+      "summary": "Mesa em carvalho maciço...",
+      "source": "manual",
+      "ref": "BS.MX.180",
+      "price": "1.290,00",
+      "currency": "eur",
+      "iva_pct": "23",
+      "brand": "Boa Safra",
+      "dimensions": "180x90xH75",
+      "material": "Carvalho / Óleo",
+      "image_url": "https://.../mesa-x.jpg",
+      "variant_attrs": {"Color":"Carvalho", "Tamanho":"180", "sku":"BS.MX.180"}
+    }
     """
     data = await request.json()
 
+    # URL (canónica para IG se aplicável)
     raw_url = (data.get("url") or "").strip()
     url = _canon_ig_url(raw_url) or raw_url
     if not url:
@@ -2515,12 +1983,15 @@ async def catalog_upsert(request: Request):
     image_url= (data.get("image_url") or None)
     ref      = (data.get("ref") or None)
 
+    # Normalização de preço e IVA (aceita vírgula)
     def _to_float(v):
         if v in (None, "", "0", "0.0", "0.00"): 
             return None
         s = str(v).strip().replace(" ", "")
+        # troca separador decimal vírgula por ponto se necessário
         if "," in s and "." not in s:
             s = s.replace(",", ".")
+        # remove milhar
         if s.count(".") > 1:
             parts = s.split(".")
             s = "".join(parts[:-1]) + "." + parts[-1]
@@ -2529,28 +2000,26 @@ async def catalog_upsert(request: Request):
         except Exception:
             return None
 
-    price   = _to_float(data.get("price"))
-    iva_pct = _to_float(data.get("iva_pct"))
+    price  = _to_float(data.get("price"))
+    iva_pct= _to_float(data.get("iva_pct"))
 
+    # Moeda
     currency = (data.get("currency") or None)
     if currency:
         currency = str(currency).strip().upper() or None
 
-    # variant_attrs pode ser dict (preferível) ou string "valores"
-    variant_attrs_raw = data.get("variant_attrs") or None
-    vkey = None
-    variant_attrs_out = None
-
-    if isinstance(variant_attrs_raw, dict):
-        # garantir coerência com REF
-        if ref and not variant_attrs_raw.get("sku"):
-            variant_attrs_raw["sku"] = ref
-        vkey = build_variant_key(variant_attrs_raw) or None
-        variant_attrs_out = json.dumps(variant_attrs_raw, ensure_ascii=False)
-    elif isinstance(variant_attrs_raw, str):
-        # assumir lista de valores "A, B, C"
-        variant_attrs_out = variant_attrs_raw.strip() or None
-        vkey = values_to_variant_key(variant_attrs_out) or None
+    # variant_attrs opcional (dict ou JSON string)
+    variant_attrs = data.get("variant_attrs") or None
+    if isinstance(variant_attrs, str):
+        try:
+            import json
+            variant_attrs = json.loads(variant_attrs)
+        except Exception:
+            variant_attrs = None
+    if variant_attrs and isinstance(variant_attrs, dict):
+        # garante coerência com REF
+        if ref and not variant_attrs.get("sku"):
+            variant_attrs["sku"] = ref
 
     _upsert_catalog_row(
         ns,
@@ -2566,63 +2035,56 @@ async def catalog_upsert(request: Request):
         dimensions=dim,
         material=material,
         image_url=image_url,
-        variant_attrs=variant_attrs_out,
-        variant_key=vkey
+        variant_attrs=(json.dumps(variant_attrs, ensure_ascii=False) if isinstance(variant_attrs, dict) else None)
     )
 
     return {"ok": True, "url": url, "name": name}
-
 @app.get("/catalog/get")
-def catalog_get(url: str, namespace: str = DEFAULT_NAMESPACE):
-    """Obtém 1 item por URL (com filtro de namespace)."""
+def catalog_get(url: str):
+    """Obtém 1 item por URL."""
     url = _canon_ig_url((url or "").strip()) or (url or "").strip()
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
     if not url:
         return {"ok": False, "error": "Falta url"}
     with _catalog_conn() as c:
         cur = c.execute("""SELECT id, namespace, name, summary, url, source, updated_at,
                                   ref, price, currency, iva_pct, brand, dimensions, material, image_url
-                           FROM catalog_items WHERE url=? AND namespace=?""", (url, ns))
+                           FROM catalog_items WHERE url=?""", (url,))
         row = cur.fetchone()
         if not row:
-            return {"ok": False, "error": "não encontrado", "namespace": ns}
+            return {"ok": False, "error": "não encontrado"}
         return {"ok": True, "item": dict(row)}
 
 @app.get("/catalog/list")
-def catalog_list(q: str = "", limit: int = 100, offset: int = 0, namespace: str = DEFAULT_NAMESPACE):
+def catalog_list(q: str = "", limit: int = 100, offset: int = 0):
     """
-    Lista o catálogo com paginação simples. Params: ?q=&limit=&offset=&namespace=
+    Lista o catálogo com paginação simples. Params: ?q=&limit=&offset=
     """
     limit = max(1, min(500, int(limit or 100)))
     offset = max(0, int(offset or 0))
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
     like = f"%{q.strip()}%" if q else None
-
     with _catalog_conn() as c:
         if like:
             cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
                                       ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
-                               WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?)
+                               WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?
                                ORDER BY updated_at DESC
                                LIMIT ? OFFSET ?""",
-                            (ns, like, like, like, like, like, limit, offset))
+                            (like, like, like, like, like, limit, offset))
             items = [dict(r) for r in cur.fetchall()]
             cur2 = c.execute("""SELECT count(*) as n FROM catalog_items
-                                WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?)""",
-                             (ns, like, like, like, like, like))
+                                WHERE name LIKE ? OR summary LIKE ? OR url LIKE ? OR brand LIKE ? OR ref LIKE ?""",
+                             (like, like, like, like, like))
             total = int(cur2.fetchone()["n"])
         else:
             cur = c.execute("""SELECT id, namespace, name, summary, url, source, created_at, updated_at,
                                       ref, price, currency, iva_pct, brand, dimensions, material, image_url
                                FROM catalog_items
-                               WHERE namespace=?
                                ORDER BY updated_at DESC
-                               LIMIT ? OFFSET ?""", (ns, limit, offset))
+                               LIMIT ? OFFSET ?""", (limit, offset))
             items = [dict(r) for r in cur.fetchall()]
-            cur2 = c.execute("SELECT count(*) as n FROM catalog_items WHERE namespace=?", (ns,))
+            cur2 = c.execute("SELECT count(*) as n FROM catalog_items")
             total = int(cur2.fetchone()["n"])
-
     out_items = []
     for r in items:
         out_items.append({
@@ -2644,6 +2106,12 @@ def catalog_list(q: str = "", limit: int = 100, offset: int = 0, namespace: str 
         })
     return {"ok": True, "total": total, "items": out_items}
 
+@app.post("/catalog/clear")
+def catalog_clear_sqlite():
+    with _catalog_conn() as c:
+        c.execute("DELETE FROM catalog_items")
+    return {"ok": True}
+
 @app.post("/catalog/resolve-price")
 async def catalog_resolve_price(request: Request):
     """
@@ -2657,7 +2125,9 @@ async def catalog_resolve_price(request: Request):
     Regras:
       1) ref exato -> match imediato
       2) url com #sku -> match imediato por url
-      3) url pai + attrs -> variant_key
+      3) url pai + attrs -> derivar variant_key e procurar nessa família
+    Resposta:
+      { ok:true, match:{...}, missing_price:true? }  ou  { ok:false, candidates:[...] }
     """
     try:
       data = await request.json()
@@ -2688,7 +2158,7 @@ async def catalog_resolve_price(request: Request):
                 SELECT * FROM catalog_items
                  WHERE namespace=? AND url=? 
                  ORDER BY updated_at DESC LIMIT 1
-            """, (ns, _canon_ig_url(url) or url))
+            """, (ns, url))
             row = cur.fetchone()
             if row:
                 out = dict(row)
@@ -2698,6 +2168,8 @@ async def catalog_resolve_price(request: Request):
         if url and attrs and "#sku=" not in url:
             parent = _canon_ig_url(url) or url
             vkey = build_variant_key(attrs)
+            # duas estratégias:
+            # a) procurar por variant_key
             cur = c.execute("""
                 SELECT * FROM catalog_items
                  WHERE namespace=? AND variant_key=? AND url LIKE ? 
@@ -2708,23 +2180,22 @@ async def catalog_resolve_price(request: Request):
                 out = dict(row)
                 return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
 
-            # fallback: tentar valores simples se attrs forem só valores
-            if not row and isinstance(attrs, str):
-                vkey2 = values_to_variant_key(attrs)
-                cur = c.execute("""
-                    SELECT * FROM catalog_items
-                     WHERE namespace=? AND variant_key=? AND url LIKE ? 
-                     ORDER BY updated_at DESC LIMIT 1
-                """, (ns, vkey2, parent + "#sku=%"))
-                row = cur.fetchone()
-                if row:
-                    out = dict(row)
-                    return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
+            # b) fallback: procurar via variant_attrs->product_url (string match simples)
+            like_snippet = f'%"{parent}"%'
+            cur = c.execute("""
+                SELECT * FROM catalog_items
+                 WHERE namespace=? AND variant_key=? AND IFNULL(variant_attrs,'') LIKE ?
+                 ORDER BY updated_at DESC LIMIT 1
+            """, (ns, vkey, like_snippet))
+            row = cur.fetchone()
+            if row:
+                out = dict(row)
+                return {"ok": True, "match": out, "missing_price": (out.get("price") is None)}
 
         # sem match – devolver candidatos úteis se houver contexto
         candidates = []
         if url:
-            parent = (_canon_ig_url(url) or url).split("#")[0]
+            parent = url.split("#")[0]
             cur = c.execute("""
                 SELECT id,name,ref,url,price,currency,brand,variant_key FROM catalog_items
                  WHERE namespace=? AND url LIKE ?
@@ -2733,6 +2204,7 @@ async def catalog_resolve_price(request: Request):
             candidates = [dict(r) for r in cur.fetchall()]
 
         return {"ok": False, "reason": "sem_match", "candidates": candidates[:10]}
+
 
 # ---- Expor info do Catálogo (SQLite) no /status ----
 def _status_catalog_sqlite():
@@ -2753,12 +2225,11 @@ def _status_catalog_sqlite():
         "endpoints": {
             "import_csv": "POST /catalog/import-csv",
             "upsert": "POST /catalog/upsert",
-            "get": "GET /catalog/get?url=&namespace=",
-            "list": "GET /catalog/list?q=&limit=&offset=&namespace=",
+            "get": "GET /catalog/get?url=",
+            "list": "GET /catalog/list?q=&limit=&offset=",
             "clear": "POST /catalog/clear",
         }
     }
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
