@@ -2759,6 +2759,112 @@ def _status_catalog_sqlite():
         }
     }
 
+# ================== HOTFIX: catálogo — override tolerante ==================
+import re
+
+# stopwords simples para limpar a query
+_HOTFIX_STOP = {
+    "o","a","os","as","um","uma","uns","umas","de","do","da","dos","das","d",
+    "e","com","para","por","em","no","na","nos","nas","faz","faca","faça","fazer",
+    "orçamento","orcamento","cotação","cotacao","preço","preco","quanto","custa",
+    "fica","preçario","precario","pedido","proforma","x","the","of","for","please",
+    "quote","budget","precio","presupuesto"
+}
+
+def _hotfix_clean_q(q: str) -> str:
+    if not q: return ""
+    # se houver refs/SKUs, devolve-as já
+    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q or "", flags=re.I)
+    if refs:
+        return " ".join(refs[:4])
+    t = (q or "").lower()
+    t = re.sub(r"[?!,:;()\[\]{}]+", " ", t)
+    toks = [w for w in re.split(r"\s+", t) if w]
+    toks = [w for w in toks if w not in _HOTFIX_STOP and not re.fullmatch(r"\d+[xX]?", w)]
+    return " ".join(toks[:5]).strip() or (q or "").strip()
+
+def build_catalog_block_override(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    """
+    Override minimal: tenta AND; se 0 resultados, faz OR.
+    Prioriza linhas com '#sku='. Mantém formato esperado pelo prompt.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip()
+    qraw = (question or "").strip()
+    q = _hotfix_clean_q(qraw)
+    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 2]
+
+    rows = []
+    try:
+        with _catalog_conn() as c:
+            cur: sqlite3.Cursor
+
+            # 1) Match exato por SKU/ref se a query tiver tokens de ref
+            ref_toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", q)
+            if ref_toks:
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
+                      FROM catalog_items
+                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
+                     ORDER BY updated_at DESC
+                     LIMIT ?""", tuple([ns, *ref_toks, limit]))
+                rows = [dict(r) for r in cur.fetchall()]
+
+            # 2) AND entre termos
+            if len(rows) < 1 and terms:
+                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
+                like_args = []
+                for t in terms:
+                    p = f"%{t}%"
+                    like_args.extend([p, p, p])
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
+                      FROM catalog_items
+                     WHERE namespace=? AND {where_and}
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?""", tuple([ns, *like_args, limit]))
+                rows = [dict(r) for r in cur.fetchall()]
+
+            # 3) Fallback OR se ainda vazio
+            if len(rows) < 1 and terms:
+                where_or = " OR ".join(["name LIKE ?","summary LIKE ?","ref LIKE ?"] * len(terms))
+                like_args = []
+                for t in terms:
+                    p = f"%{t}%"
+                    like_args.extend([p, p, p])
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
+                      FROM catalog_items
+                     WHERE namespace=? AND ({where_or})
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?""", tuple([ns, *like_args, limit]))
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        log.warning(f"[catalog/hotfix] search falhou: {e}")
+        rows = []
+
+    log.info(f"[catalog/hotfix] ns={ns} q_raw={qraw!r} q_clean={q!r} terms={terms} rows={len(rows)}")
+
+    if not rows:
+        return ""
+
+    lines = [f"Catálogo interno — ns={ns} (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"]
+    for r in rows[:limit]:
+        name = r.get("name") or "(sem nome)"
+        ref  = r.get("ref") or "(sem dado)"
+        price = r.get("price")
+        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
+        url = r.get("url") or "(sem URL)"
+        brand = r.get("brand") or ""
+        variant = (r.get("variant_attrs") or "").strip()
+        name_show = f"{name} — Variante: {variant}" if variant else name
+        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+    return "\n".join(lines)
+
+# ⚠️ sobrepor a função antiga sem apagar nada
+build_catalog_block = build_catalog_block_override
+# ================== /HOTFIX =================================================
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
