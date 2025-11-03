@@ -2758,97 +2758,134 @@ def _status_catalog_sqlite():
             "clear": "POST /catalog/clear",
         }
     }
+# ===================== HOTFIX — Pesquisa Tolerante (colar no fim do ficheiro) =====================
 
-# ================== HOTFIX: catálogo — override tolerante ==================
-import re
+def _hf_strip_accents(s: str) -> str:
+    import unicodedata, re
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^\w\s#/.-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# stopwords simples para limpar a query
-_HOTFIX_STOP = {
-    "o","a","os","as","um","uma","uns","umas","de","do","da","dos","das","d",
-    "e","com","para","por","em","no","na","nos","nas","faz","faca","faça","fazer",
-    "orçamento","orcamento","cotação","cotacao","preço","preco","quanto","custa",
-    "fica","preçario","precario","pedido","proforma","x","the","of","for","please",
-    "quote","budget","precio","presupuesto"
-}
+def _hf_tokens(q: str):
+    # stopwords PT + “referências vagas”
+    STOP = {
+        "de","do","da","dos","das","para","por","o","a","os","as",
+        "um","uma","uns","umas","e","ou","com","sem","em","no","na","nos","nas",
+        "este","esta","isto","isso","aquele","aquela","artigo","produto","orçamento","orcamento"
+    }
+    toks = [t for t in _hf_strip_accents(q).split() if t and t not in STOP and len(t) >= 2]
+    return toks[:8]
 
-def _hotfix_clean_q(q: str) -> str:
-    if not q: return ""
-    # se houver refs/SKUs, devolve-as já
-    refs = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q or "", flags=re.I)
-    if refs:
-        return " ".join(refs[:4])
-    t = (q or "").lower()
-    t = re.sub(r"[?!,:;()\[\]{}]+", " ", t)
-    toks = [w for w in re.split(r"\s+", t) if w]
-    toks = [w for w in toks if w not in _HOTFIX_STOP and not re.fullmatch(r"\d+[xX]?", w)]
-    return " ".join(toks[:5]).strip() or (q or "").strip()
+def _hf_like_pat(t: str) -> str:
+    # escapa curingas do LIKE
+    t = t.replace("%", "\\%").replace("_", "\\_")
+    return f"%{t}%"
 
-def build_catalog_block_override(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
-    """
-    Override minimal: tenta AND; se 0 resultados, faz OR.
-    Prioriza linhas com '#sku='. Mantém formato esperado pelo prompt.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE or "").strip()
-    qraw = (question or "").strip()
-    q = _hotfix_clean_q(qraw)
-    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 2]
+def _hf_catalog_query_tuple(ns: str, terms: list, limit: int):
+    """Monta SQL + args para AND ou OR dinamicamente."""
+    base = "FROM catalog_items WHERE namespace=?"
+    args = [ns]
+    # cada termo procura em name/summary/ref
+    conds = []
+    for _ in terms:
+        conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+    where_and = f"{base} AND " + " AND ".join(conds) if conds else base
+    where_or  = f"{base} AND (" + " OR ".join(conds) + ")" if conds else base
+    return where_and, where_or
 
-    rows = []
+# --- REDEFINE build_catalog_block com fallback tolerante ---
+def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
+    q_raw = (question or "").strip()
+
+    # 0) tenta match exato por REF na pergunta
+    import re, sqlite3
+    ref_toks = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q_raw, flags=re.I)
+
+    rows: list = []
     try:
         with _catalog_conn() as c:
             cur: sqlite3.Cursor
 
-            # 1) Match exato por SKU/ref se a query tiver tokens de ref
-            ref_toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", q)
             if ref_toks:
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
-                     ORDER BY updated_at DESC
-                     LIMIT ?""", tuple([ns, *ref_toks, limit]))
+                q_marks = ",".join("?" * len(ref_toks))
+                cur = c.execute(
+                    f"""SELECT namespace,name,ref,price,url,brand,variant_attrs
+                          FROM catalog_items
+                         WHERE namespace=? AND ref IN ({q_marks})
+                         ORDER BY updated_at DESC LIMIT ?""",
+                    tuple([ns, *ref_toks, limit])
+                )
                 rows = [dict(r) for r in cur.fetchall()]
 
-            # 2) AND entre termos
-            if len(rows) < 1 and terms:
-                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND {where_and}
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
+            # 1) pesquisa AND estrita (tokens úteis)
+            if len(rows) < 3:
+                terms = _hf_tokens(q_raw)
+                and_sql, or_sql = _hf_catalog_query_tuple(ns, terms, limit)
+                if terms:
+                    like_args = []
+                    for t in terms:
+                        pat = _hf_like_pat(t)
+                        like_args.extend([pat, pat, pat])
+                    cur = c.execute(
+                        f"""SELECT namespace,name,ref,price,url,brand,variant_attrs
+                               {and_sql}
+                               ORDER BY updated_at DESC
+                               LIMIT ?""",
+                        tuple([*([ns] if and_sql.startswith("FROM") else []), *like_args, limit])
+                    )
+                    rows = rows + [dict(r) for r in cur.fetchall()]
 
-            # 3) Fallback OR se ainda vazio
-            if len(rows) < 1 and terms:
-                where_or = " OR ".join(["name LIKE ?","summary LIKE ?","ref LIKE ?"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ({where_or})
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
+            # 2) fallback OR se AND não deu nada
+            if not rows:
+                terms = _hf_tokens(q_raw)
+                if terms:
+                    like_args = []
+                    for t in terms:
+                        pat = _hf_like_pat(t)
+                        like_args.extend([pat, pat, pat])
+                    _, or_sql = _hf_catalog_query_tuple(ns, terms, limit)
+                    cur = c.execute(
+                        f"""SELECT namespace,name,ref,price,url,brand,variant_attrs
+                               {or_sql}
+                               ORDER BY updated_at DESC
+                               LIMIT ?""",
+                        tuple([ns, *like_args, limit])
+                    )
+                    rows = [dict(r) for r in cur.fetchall()]
+
+            # 3) último fallback: “frase compacta” (tokens na ordem)
+            if not rows:
+                compact = " ".join(_hf_tokens(q_raw))
+                if compact:
+                    pat = f"%{compact.replace(' ', '%')}%"
+                    cur = c.execute(
+                        """SELECT namespace,name,ref,price,url,brand,variant_attrs
+                             FROM catalog_items
+                            WHERE namespace=? AND (LOWER(name) LIKE ? ESCAPE '\\' OR LOWER(summary) LIKE ? ESCAPE '\\')
+                            ORDER BY updated_at DESC
+                            LIMIT ?""",
+                        (ns, pat, pat, limit)
+                    )
+                    rows = [dict(r) for r in cur.fetchall()]
     except Exception as e:
         log.warning(f"[catalog/hotfix] search falhou: {e}")
         rows = []
 
-    log.info(f"[catalog/hotfix] ns={ns} q_raw={qraw!r} q_clean={q!r} terms={terms} rows={len(rows)}")
-
     if not rows:
-        return ""
+        return ""  # deixa o Mission proceder (e não diz que “não há catálogo”)
 
-    lines = [f"Catálogo interno — ns={ns} (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"]
+    # saída compacta para o LLM
+    lines = ["Catálogo interno (usa SÓ estes dados para orçamentos/preços; não usar RAG aqui):"]
+    seen = set()
     for r in rows[:limit]:
+        key = (r.get("ref"), r.get("url"))
+        if key in seen: 
+            continue
+        seen.add(key)
         name = r.get("name") or "(sem nome)"
         ref  = r.get("ref") or "(sem dado)"
         price = r.get("price")
@@ -2860,10 +2897,74 @@ def build_catalog_block_override(question: str, namespace: Optional[str] = None,
         lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
     return "\n".join(lines)
 
-# ⚠️ sobrepor a função antiga sem apagar nada
-build_catalog_block = build_catalog_block_override
-# ================== /HOTFIX =================================================
+# --- REDEFINE build_catalog_variants_block para usar os mesmos tokens tolerantes ---
+def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
+    qlow = (question or "").lower()
+    if not any(k in qlow for k in ("variante","variantes","cores","tamanhos","opções","opcoes")):
+        return ""
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
+    terms = _hf_tokens(question)
 
+    import sqlite3
+    rows: List[Dict] = []
+    try:
+        with _catalog_conn() as c:
+            if not terms:
+                return ""
+            like_args = []
+            conds = []
+            for t in terms:
+                pat = _hf_like_pat(t)
+                like_args.extend([pat, pat, pat])
+                conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+            where = " AND ".join(conds) if conds else "1=1"
+            cur = c.execute(f"""
+                SELECT name, ref, price, url, brand, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=? AND {where}
+                 ORDER BY updated_at DESC
+                 LIMIT 160
+            """, tuple([ns, *like_args]))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        log.warning(f"[catalog variants/hotfix] falhou: {e}")
+        rows = []
+
+    if not rows:
+        return ""
+
+    # agrupar por URL-pai
+    groups: Dict[str, List[Dict]] = {}
+    for r in rows:
+        u = (r.get("url") or "").strip()
+        parent = u.split("#", 1)[0] if u else ""
+        groups.setdefault(parent, []).append(r)
+
+    # manter só grupos com >=2 variantes (com #sku=)
+    groups = {
+        p: [it for it in lst if "#sku=" in (it.get("url") or "")]
+        for p, lst in groups.items()
+    }
+    groups = {p: lst for p, lst in groups.items() if len(lst) >= 2}
+    if not groups:
+        return ""
+
+    out = ["CATÁLOGO INTERNO — Variantes por produto (Variante | SKU | Preço | Link):"]
+    for parent, lst in groups.items():
+        lst_sorted = sorted(lst, key=lambda x: (x.get("name") or "", x.get("ref") or ""))
+        title = lst_sorted[0].get("name") or parent or "(produto)"
+        out.append(f"• Produto: {title}")
+        for r in lst_sorted[:40]:
+            ref  = r.get("ref") or "(sem ref)"
+            pr   = r.get("price")
+            pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
+            url  = r.get("url") or "(sem url)"
+            va   = (r.get("variant_attrs") or "").strip()
+            label = va or (r.get("name") or "")
+            out.append(f"   - {label} | SKU:{ref} | {pr_s} | {url}")
+    return "\n".join(out)
+
+# ===================== /HOTFIX =====================
 
 # ---------------------------------------------------------------------------------------
 # Local run
