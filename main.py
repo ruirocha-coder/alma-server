@@ -2966,6 +2966,29 @@ def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str
 
 # ===================== /HOTFIX =====================
 
+# ========================= HOTFIX: _canon_ig_url aceita URLs relativas =========================
+def _canon_ig_url(u: str) -> str:
+    """Normaliza URLs relativas do catálogo para o domínio principal IG."""
+    try:
+        u = (u or "").strip()
+        if not u:
+            return ""
+        if u.startswith("//"):
+            u = "https:" + u
+        # se for relativo, prefixar domínio
+        if not u.startswith("http"):
+            if not u.startswith("/"):
+                u = "/" + u
+            u = f"https://{IG_HOST}{u}"
+        # limpeza leve
+        u = u.replace(" ", "")
+        while "//" in u.replace("https://", ""):
+            u = u.replace("//", "/").replace("https:/", "https://")
+        return u
+    except Exception:
+        return u or ""
+# ======================= /HOTFIX ==============================================================
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
