@@ -164,7 +164,113 @@ FORMATO DE RESPOSTA (ORÇAMENTOS)
 - Link único (conforme a política acima).
 
 Nunca inventes preços, nomes ou SKUs. Nunca assumes variantes sem sinal claro no catálogo interno.
+
+──────────────────────────────────────────────────────────────────────────────
+ELFOS (ASSISTENTES ESPECIALIZADOS — SINTRA AI)
+
+A Alma trabalha com assistentes especializados internos, designados por **Elfos**.
+Os Elfos são ajudantes funcionais, focados em tarefas específicas, e **não substituem**
+a Alma nem tomam decisões comerciais, estratégicas ou de preços.
+
+A Alma mantém sempre:
+- o contexto global,
+- a coerência estratégica,
+- a responsabilidade final pela resposta.
+
+Os Elfos são sugeridos **apenas quando a tarefa beneficia claramente de especialização**
+e **não envolve dados críticos do catálogo interno** (preços, SKUs, orçamentos).
+
+──────────────────────────────────────────────────────────────────────────────
+QUANDO A ALMA PODE SUGERIR UM ELFO
+
+A Alma pode sugerir um Elfo quando:
+- o pedido é exploratório, operacional ou criativo;
+- a tarefa é bem delimitada por função (ex.: estratégia, marketing, copy, análise);
+- não exige consulta nem modificação de preços, variantes ou regras comerciais;
+- o utilizador beneficia de trabalhar diretamente com um agente especializado.
+
+É **PROIBIDO** delegar para Elfos:
+- orçamentos, cotações, preços ou proformas;
+- decisões comerciais finais;
+- interpretação de dados incompletos do catálogo interno.
+
+──────────────────────────────────────────────────────────────────────────────
+ELFOS DISPONÍVEIS E FUNÇÕES
+
+Buddy — Estratégia e Desenvolvimento de Negócio  
+https://app.sintra.ai/buddy  
+Usar quando o utilizador pede:
+- análise estratégica,
+- estruturação de propostas,
+- reflexão sobre posicionamento, crescimento ou decisão de negócio.
+
+Cassie — Atendimento ao Cliente  
+https://app.sintra.ai/cassie  
+Usar para:
+- respostas a clientes,
+- organização de FAQs,
+- fluxos de suporte e comunicação.
+
+Dexter — Análise de Dados  
+https://app.sintra.ai/dexter  
+Usar quando há:
+- dados, métricas ou números a analisar,
+- necessidade de leitura quantitativa ou padrões.
+
+Penn — Escrita e Copywriting  
+https://app.sintra.ai/penn  
+Usar para:
+- copy comercial,
+- textos de marketing,
+- reformulação e clareza de mensagens.
+
+Seomi — SEO e Conteúdo  
+https://app.sintra.ai/seomi  
+Usar quando o foco é:
+- otimização SEO,
+- estrutura de conteúdos,
+- títulos, keywords e organização editorial.
+
+Soshie — Redes Sociais  
+https://app.sintra.ai/soshie  
+Usar para:
+- planeamento de posts,
+- ideias de conteúdo social,
+- consistência de presença digital.
+
+Emmie — Email Marketing  
+https://app.sintra.ai/emmie  
+Usar para:
+- campanhas de email,
+- newsletters,
+- sequências automatizadas.
+
+Vizzy — Assistente Virtual Geral  
+https://app.sintra.ai/vizzy  
+Usar para:
+- tarefas administrativas,
+- organização operacional,
+- apoio funcional genérico.
+
+──────────────────────────────────────────────────────────────────────────────
+FORMA DE APRESENTAÇÃO AO UTILIZADOR
+
+A Alma deve sugerir um Elfo de forma natural e contida, por exemplo:
+
+“Para esta parte, um dos meus ajudantes especializados pode aprofundar o trabalho.
+Se quiseres, podes continuar diretamente com ele aqui: https://app.sintra.ai/buddy”
+
+A Alma **não transfere responsabilidade**, apenas orienta o utilizador.
+
+──────────────────────────────────────────────────────────────────────────────
+PRINCÍPIO CENTRAL
+
+Os Elfos são extensões funcionais da Alma.
+A Alma coordena, integra e valida.
+Os Elfos executam, exploram e apoiam.
+
 """
+
 
 # ---------------------------------------------------------------------------------------
 # Utilidades de URL e normalização
@@ -1057,7 +1163,7 @@ def _force_links_block(answer: str, matches: List[dict], min_links: int = 3) -> 
 # ---------------------------------------------------------------------------------------
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-MODEL = os.getenv("XAI_MODEL", "grok-4-0709")
+MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
 
 _session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
@@ -3170,6 +3276,226 @@ def _hotfix_force_tolerant_search_active():
 
 _hotfix_force_tolerant_search_active()
 # ===================== /HOTFIX FINAL — Forçar pesquisa tolerante ativa =====================
+
+# ===================== HOTFIX FINAL — Resolver incoerências por redefinições =====================
+def _final_fix_incoherences():
+    """
+    Resolve incoerências típicas do teu ficheiro:
+    1) Múltiplas redefinições: fixa (no fim) qual versão fica ativa em runtime.
+    2) Corrige o typo do /status: a rota verifica ' _status_catalog_sqlite' com espaço.
+    3) Garante uma _canon_ig_url final coerente (aceita relativos e normaliza para IG_HOST).
+    Nota: não toca em modelo Grok/XAI nem adiciona endpoints.
+    """
+    import logging
+    from urllib.parse import urlparse
+
+    log = logging.getLogger("alma")
+
+    # --- (A) Fix /status typo sem editar a rota: criar a key com espaço no globals() ---
+    if "_status_catalog_sqlite" in globals():
+        globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
+
+    # --- (B) Fixar UMA _canon_ig_url final (evita a tua alternância entre versões) ---
+    def _canon_ig_url_final(u: str) -> str:
+        try:
+            u = (u or "").strip()
+            if not u:
+                return ""
+            if u.startswith("//"):
+                u = "https:" + u
+            # relativo -> absoluto no IG_HOST
+            if not u.startswith("http"):
+                if not u.startswith("/"):
+                    u = "/" + u
+                u = f"https://{IG_HOST}{u}"
+            # canon host + limpeza leve
+            u = u.replace(" ", "")
+            p = urlparse(u)
+            host = (p.netloc or "").lower().replace("www.", "")
+            if IG_HOST and IG_HOST in host:
+                # força https + netloc “limpo”
+                u = u.replace(p.scheme + "://", "https://", 1)
+                u = u.replace(p.netloc, IG_HOST, 1)
+            return u
+        except Exception:
+            return (u or "")
+
+    globals()["_canon_ig_url"] = _canon_ig_url_final
+
+    # --- (C) Fixar pesquisa do catálogo: preferir as versões tolerantes se existirem ---
+    # Tens várias versões (patch, hotfix, redef). Aqui escolhemos uma só:
+    # - Se existirem helpers do hotfix tolerante (_hf_tokens/_hf_like_pat), usa-os.
+    # - Caso contrário, mantém a última definição existente (não inventamos outra).
+    if ("_hf_tokens" in globals()) and ("_hf_like_pat" in globals()) and ("_catalog_conn" in globals()):
+        import re
+        from typing import Optional, List, Dict
+
+        def build_catalog_block_final(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+            ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
+            q_raw = (question or "").strip()
+
+            rows: List[Dict] = []
+            ref_toks = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q_raw, flags=re.I)
+
+            try:
+                with _catalog_conn() as c:
+                    # 0) match exato por ref
+                    if ref_toks:
+                        q_marks = ",".join("?" * len(ref_toks))
+                        cur = c.execute(
+                            f"""SELECT name,ref,price,url,brand,variant_attrs
+                                  FROM catalog_items
+                                 WHERE namespace=? AND ref IN ({q_marks})
+                                 ORDER BY updated_at DESC
+                                 LIMIT ?""",
+                            tuple([ns, *ref_toks, limit])
+                        )
+                        rows = [dict(r) for r in cur.fetchall()]
+
+                    # 1) AND tokens úteis
+                    if not rows:
+                        terms = _hf_tokens(q_raw)
+                        if terms:
+                            conds = []
+                            like_args = []
+                            for t in terms:
+                                pat = _hf_like_pat(t)
+                                conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+                                like_args.extend([pat, pat, pat])
+                            where = " AND ".join(conds)
+                            cur = c.execute(
+                                f"""SELECT name,ref,price,url,brand,variant_attrs
+                                      FROM catalog_items
+                                     WHERE namespace=? AND {where}
+                                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                                     LIMIT ?""",
+                                tuple([ns, *like_args, limit])
+                            )
+                            rows = [dict(r) for r in cur.fetchall()]
+
+                    # 2) OR fallback
+                    if not rows:
+                        terms = _hf_tokens(q_raw)
+                        if terms:
+                            conds = []
+                            like_args = []
+                            for t in terms:
+                                pat = _hf_like_pat(t)
+                                conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+                                like_args.extend([pat, pat, pat])
+                            where = " OR ".join(conds)
+                            cur = c.execute(
+                                f"""SELECT name,ref,price,url,brand,variant_attrs
+                                      FROM catalog_items
+                                     WHERE namespace=? AND ({where})
+                                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                                     LIMIT ?""",
+                                tuple([ns, *like_args, limit])
+                            )
+                            rows = [dict(r) for r in cur.fetchall()]
+
+            except Exception as e:
+                log.warning(f"[catalog/final] search falhou: {e}")
+                rows = []
+
+            if not rows:
+                return ""
+
+            lines = ["CATÁLOGO INTERNO (final; usar só estes dados p/ preços/orçamentos):"]
+            seen = set()
+            for r in rows[:limit]:
+                key = (r.get("ref"), r.get("url"))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                name = r.get("name") or "(sem nome)"
+                ref  = r.get("ref") or "(sem ref)"
+                price = r.get("price")
+                price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+                url = r.get("url") or "(sem url)"
+                brand = r.get("brand") or ""
+                variant = (r.get("variant_attrs") or "").strip()
+                name_show = f"{name} — Variante: {variant}" if variant else name
+
+                lines.append(f"- {name_show} • SKU:{ref} • Preço:{price_txt} • Marca:{brand} • Link:{url}")
+            return "\n".join(lines)
+
+        def build_catalog_variants_block_final(question: str, namespace: Optional[str]) -> str:
+            qlow = (question or "").lower()
+            if not any(k in qlow for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes")):
+                return ""
+
+            ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
+            terms = _hf_tokens(question)
+            if not terms:
+                return ""
+
+            rows: List[Dict] = []
+            try:
+                with _catalog_conn() as c:
+                    conds = []
+                    like_args = []
+                    for t in terms:
+                        pat = _hf_like_pat(t)
+                        conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+                        like_args.extend([pat, pat, pat])
+                    where = " AND ".join(conds)
+                    cur = c.execute(
+                        f"""SELECT name, ref, price, url, brand, variant_attrs
+                              FROM catalog_items
+                             WHERE namespace=? AND {where}
+                             ORDER BY updated_at DESC
+                             LIMIT 160""",
+                        tuple([ns, *like_args])
+                    )
+                    rows = [dict(r) for r in cur.fetchall()]
+            except Exception as e:
+                log.warning(f"[catalog variants/final] falhou: {e}")
+                rows = []
+
+            if not rows:
+                return ""
+
+            # agrupar por URL-pai e manter só grupos com >=2 variantes (#sku=)
+            groups: Dict[str, List[Dict]] = {}
+            for r in rows:
+                u = (r.get("url") or "").strip()
+                parent = u.split("#", 1)[0] if u else ""
+                if parent:
+                    groups.setdefault(parent, []).append(r)
+
+            groups = {
+                p: [it for it in lst if "#sku=" in (it.get("url") or "")]
+                for p, lst in groups.items()
+            }
+            groups = {p: lst for p, lst in groups.items() if len(lst) >= 2}
+            if not groups:
+                return ""
+
+            out = ["CATÁLOGO INTERNO — Variantes por produto (Variante | SKU | Preço | Link):"]
+            for parent, lst in groups.items():
+                lst_sorted = sorted(lst, key=lambda x: (x.get("name") or "", x.get("ref") or ""))
+                title = lst_sorted[0].get("name") or parent or "(produto)"
+                out.append(f"• Produto: {title}")
+                for r in lst_sorted[:40]:
+                    ref = r.get("ref") or "(sem ref)"
+                    pr = r.get("price")
+                    pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
+                    url = r.get("url") or "(sem url)"
+                    va = (r.get("variant_attrs") or "").strip()
+                    label = va or (r.get("name") or "")
+                    out.append(f"   - {label} | SKU:{ref} | {pr_s} | {url}")
+            return "\n".join(out)
+
+        globals()["build_catalog_block"] = build_catalog_block_final
+        globals()["build_catalog_variants_block"] = build_catalog_variants_block_final
+        log.info("[hotfix-final] catálogo: build_catalog_block + variants fixados (tolerante).")
+    else:
+        log.info("[hotfix-final] catálogo: mantidas definições existentes (helpers tolerantes não encontrados).")
+
+_final_fix_incoherences()
+# ===================== /HOTFIX FINAL =============================================================
 
 
 # ---------------------------------------------------------------------------------------
