@@ -3548,161 +3548,340 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
-# ===================== HOTFIX — URL sanitization + no auto-#sku + cleanup =====================
 
-import re
+# ===================== HOTFIX V3 — URLs base (sem #sku), UPSERT por (ns,url,ref) + migração schema =====================
+import os, sqlite3, csv, re
+from io import StringIO
+from fastapi import UploadFile, File, Form
 
-DEFAULT_IG_HOST = globals().get("IG_HOST", "interiorguider.com")
-
-def _looks_like_ref_or_sku(s: str) -> bool:
+def _hotfix_v3_migrate_schema_and_upsert():
     """
-    Heurística: strings que parecem SKU/ref e NÃO URL.
-    Exemplos: 740021316-2-NI, ORK.02.03, ABC123, etc.
-    """
-    if not s:
-        return False
-    x = s.strip()
-
-    # já é URL/relativo => não é sku
-    if x.startswith(("http://", "https://", "/")):
-        return False
-
-    # tem espaços => não é sku puro, mas também não é URL; será tratado noutro lado
-    if " " in x:
-        return False
-
-    # padrões comuns SKU/REF
-    if re.fullmatch(r"[A-Za-z]{2,6}\.\d{1,4}(\.\d{1,4})*", x):  # ORK.02.03
-        return True
-    if re.fullmatch(r"\d{6,}([-_][A-Za-z0-9]+)+", x):  # 740021316-2-NI
-        return True
-    if re.fullmatch(r"[A-Za-z0-9]{5,}", x) and not "." in x:  # bloco alfanumérico
-        return True
-
-    return False
-
-def _sanitize_url_value(raw: str, host: str = DEFAULT_IG_HOST) -> str | None:
-    """
-    Converte:
-      - '/slug' -> 'https://host/slug'
-      - 'https://host/slug (texto...)' -> 'https://host/slug'
-    Regras:
-      - nunca inventa '#sku='
-      - nunca acrescenta variante ao slug
-      - se parecer SKU/ref, devolve None (para não gravar porcaria em url)
-    """
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-
-    # cortar "lixo" frequente quando vem colado ao texto
-    # ex: "https://.../zeal-laser-nist-blue)" ou "https://.../x (variante...)"
-    s = s.splitlines()[0].strip()
-    for sep in [" (", " |", "  ", "\t", "]", ")"]:
-        if sep in s:
-            s = s.split(sep, 1)[0].strip()
-
-    # remover trailing pontuação típica
-    s = s.rstrip(".,;:>")
-
-    # se parece SKU/ref, não usar como URL
-    if _looks_like_ref_or_sku(s):
-        return None
-
-    # se vier relativo
-    if s.startswith("/"):
-        return f"https://{host}{s}"
-
-    # se vier sem esquema mas com domínio
-    if s.startswith(host):
-        return f"https://{s}"
-
-    # se for URL absoluta, manter
-    if s.startswith(("http://", "https://")):
-        return s
-
-    # se não é nada de seguro, não inventar
-    return None
-
-def _hotfix_patch_upsert_url_policy():
-    """
-    Interceta _upsert_catalog_row para:
-      - sanear url SEM inventar '#sku='
-      - se url vier inválida, tenta recuperar de campos alternativos se existirem (link)
-    """
-    if "_upsert_catalog_row" not in globals():
-        print("[hotfix] _upsert_catalog_row not found; skipping")
-        return False
-
-    orig = globals()["_upsert_catalog_row"]
-
-    def wrapped(ns, **kwargs):
-        host = DEFAULT_IG_HOST
-
-        # candidatos possíveis (alguns imports usam 'link' ou 'url')
-        raw_url = kwargs.get("url") or kwargs.get("link") or ""
-        clean = _sanitize_url_value(raw_url, host=host)
-
-        # NÃO inventar; se não houver URL limpa, grava None (melhor do que gravar SKU)
-        kwargs["url"] = clean
-
-        # regra dura: não deixar ninguém anexar '#sku=' por fora via kwargs
-        if kwargs.get("url") and "#sku=" in kwargs["url"]:
-            # mantém só se já viesse explicitamente no CSV/entrada (não dá para provar aqui),
-            # mas como tu queres política "não inventar", deixamos ficar se já existe.
-            pass
-
-        return orig(ns, **kwargs)
-
-    globals()["_upsert_catalog_row"] = wrapped
-    print("[hotfix] patched _upsert_catalog_row (sanitize url, no auto-building)")
-    return True
-
-def _hotfix_cleanup_existing_bad_urls():
-    """
-    Limpeza SEGURA (não adivinha URLs corretos):
-      - corta URLs que têm espaços/parênteses/etc.
-      - apaga (set NULL) URLs que parecem SKU/ref
-      - converte relativos '/slug' -> 'https://host/slug'
+    Objetivo:
+      - Permitir múltiplas SKUs com o MESMO url base (sem #sku)
+      - Evitar UNIQUE constraint por url
+      - UPSERT determinístico por (namespace, url, ref)
     """
     try:
-        host = DEFAULT_IG_HOST
-        with _catalog_conn() as c:
-            rows = c.execute("SELECT id, url FROM catalog_items WHERE url IS NOT NULL AND url <> ''").fetchall()
-            fixed = 0
-            nulled = 0
+        if "_catalog_conn" not in globals():
+            print("[hotfix v3] _catalog_conn não existe — abort")
+            return False
 
-            for r in rows:
-                _id = r["id"]
-                u = (r["url"] or "").strip()
+        def _conn():
+            return globals()["_catalog_conn"]()
 
-                newu = _sanitize_url_value(u, host=host)
+        with _conn() as c:
+            c.execute("PRAGMA foreign_keys=OFF")
+            c.execute("BEGIN")
 
-                if newu is None:
-                    # se o original era "claramente" sku/ref, nulamos
-                    if _looks_like_ref_or_sku(u):
-                        c.execute("UPDATE catalog_items SET url=NULL WHERE id=?", (_id,))
-                        nulled += 1
-                    # senão, não mexe (pode ser um slug sem /, etc.)
-                    continue
+            # 1) Ver se existe tabela
+            row = c.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name='catalog_items'
+            """).fetchone()
+            if not row:
+                c.execute("COMMIT")
+                print("[hotfix v3] tabela catalog_items não existe — nada a migrar")
+                return False
 
-                if newu != u:
-                    c.execute("UPDATE catalog_items SET url=? WHERE id=?", (newu, _id))
-                    fixed += 1
+            # 2) Criar nova tabela SEM UNIQUE(url) e com UNIQUE(namespace,url,ref)
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS catalog_items__v3 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL,
+                name TEXT,
+                summary TEXT,
+                url TEXT NOT NULL,
+                source TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                ref TEXT,
+                price REAL,
+                currency TEXT,
+                iva_pct REAL,
+                brand TEXT,
+                dimensions TEXT,
+                material TEXT,
+                image_url TEXT,
+                variant_attrs TEXT,
+                variant_key TEXT,
+                UNIQUE(namespace, url, COALESCE(ref,'')) ON CONFLICT REPLACE
+            )
+            """)
 
-        print(f"[hotfix] cleanup urls: fixed={fixed}, nulled={nulled}")
+            # 3) Copiar dados existentes (se já tiver colunas a mais/menos, tentamos mapear pelo mínimo comum)
+            #    Colunas esperadas no "velho"
+            old_cols = [r[1] for r in c.execute("PRAGMA table_info(catalog_items)").fetchall()]
+            wanted = [
+                "namespace","name","summary","url","source","created_at","updated_at",
+                "ref","price","currency","iva_pct","brand","dimensions","material","image_url",
+                "variant_attrs","variant_key"
+            ]
+            common = [x for x in wanted if x in old_cols]
+
+            if common:
+                cols_csv = ",".join(common)
+                c.execute(f"""
+                    INSERT OR REPLACE INTO catalog_items__v3 ({cols_csv})
+                    SELECT {cols_csv} FROM catalog_items
+                """)
+            else:
+                # se isto acontecer, algo está muito fora do esperado
+                print("[hotfix v3] sem colunas comuns para copiar — a manter tabela antiga")
+                c.execute("ROLLBACK")
+                return False
+
+            # 4) Trocar tabelas
+            c.execute("DROP TABLE catalog_items")
+            c.execute("ALTER TABLE catalog_items__v3 RENAME TO catalog_items")
+
+            # índices úteis
+            c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ns ON catalog_items(namespace)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_ref ON catalog_items(namespace, ref)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_url ON catalog_items(namespace, url)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_catalog_vkey ON catalog_items(namespace, variant_key)")
+
+            c.execute("COMMIT")
+            c.execute("PRAGMA foreign_keys=ON")
+
+        # 5) Redefinir UPSERT por (namespace,url,ref)
+        def _upsert_catalog_row_v3(
+            ns,
+            name=None, summary=None, url=None, source=None,
+            ref=None, price=None, currency=None, iva_pct=None,
+            brand=None, dimensions=None, material=None, image_url=None,
+            variant_attrs=None, variant_key=None
+        ):
+            now = int(__import__("time").time())
+            ns = (ns or globals().get("DEFAULT_NAMESPACE") or "default").strip()
+            url = (url or "").strip()
+            if not url:
+                raise ValueError("url vazio no upsert")
+
+            ref_norm = (ref or "").strip()  # pode ser vazio (produto base)
+
+            with globals()["_catalog_conn"]() as c:
+                # tenta update primeiro (match exato)
+                cur = c.execute("""
+                    SELECT id FROM catalog_items
+                    WHERE namespace=? AND url=? AND COALESCE(ref,'')=?
+                    LIMIT 1
+                """, (ns, url, ref_norm))
+                r = cur.fetchone()
+
+                if r:
+                    c.execute("""
+                        UPDATE catalog_items SET
+                          name=?,
+                          summary=?,
+                          source=?,
+                          updated_at=?,
+                          ref=?,
+                          price=?,
+                          currency=?,
+                          iva_pct=?,
+                          brand=?,
+                          dimensions=?,
+                          material=?,
+                          image_url=?,
+                          variant_attrs=?,
+                          variant_key=?
+                        WHERE id=?
+                    """, (
+                        name, summary, source, now,
+                        (ref_norm or None),
+                        price, currency, iva_pct, brand, dimensions, material, image_url,
+                        variant_attrs, variant_key,
+                        r["id"] if isinstance(r, sqlite3.Row) else r[0]
+                    ))
+                else:
+                    c.execute("""
+                        INSERT OR REPLACE INTO catalog_items (
+                          namespace,name,summary,url,source,created_at,updated_at,
+                          ref,price,currency,iva_pct,brand,dimensions,material,image_url,
+                          variant_attrs,variant_key
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        ns, name, summary, url, source, now, now,
+                        (ref_norm or None),
+                        price, currency, iva_pct, brand, dimensions, material, image_url,
+                        variant_attrs, variant_key
+                    ))
+                c.commit()
+
+        globals()["_upsert_catalog_row"] = _upsert_catalog_row_v3
+        print("[hotfix v3] migração OK + _upsert_catalog_row refeito (ns,url,ref)")
         return True
+
     except Exception as e:
-        print(f"[hotfix] cleanup FAILED: {e}")
+        try:
+            with globals()["_catalog_conn"]() as c:
+                c.execute("ROLLBACK")
+        except Exception:
+            pass
+        print(f"[hotfix v3] FAIL: {e}")
         return False
 
-_hotfix_patch_upsert_url_policy()
-_hotfix_cleanup_existing_bad_urls()
 
-# ===================== HOTFIX — URL sanitization + no auto-#sku + cleanup ==========================================================
+_hotfix_v3_migrate_schema_and_upsert()
 
+# --------- IMPORT CSV (substitui o endpoint) ----------
+# Nota: este handler assume que as funções abaixo já existem no teu main:
+#  - _parse_price, _html_to_text, _canon_ig_url, _variant_to_values_only, values_to_variant_key
+# Se alguma não existir, vai falhar e isso é propositado (para não “inventar”).
+
+from fastapi import Request
+
+@app.post("/catalog/import-csv")
+async def catalog_import_csv(
+    file: UploadFile = File(...),
+    namespace: str = Form(DEFAULT_NAMESPACE),
+    replace: int = Form(0)  # 1 = limpa tudo do source=csv nesse namespace antes de importar
+):
+    """
+    Importa CSV (BigCommerce) — conservador, sem inventar links.
+    - Ignora 'Rule'
+    - 'Product' = base
+    - 'SKU' = variante (NÃO altera url; url fica sempre o base do produto)
+    - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (só no base)
+    - variant_attrs: valores puros (ex.: 'Soft Indigo, Tecido Areia 1m')
+    - variant_key: normalizado p/ matching determinístico
+    - URL: sempre URL base canonizado (nunca #sku, nunca texto de variante)
+    - replace=1: apaga tudo do catálogo vindo de CSV (source='csv') nesse namespace e reimporta
+    """
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    sio = StringIO(text, newline="")
+    reader = csv.DictReader(sio)
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+
+    # limpeza opcional (segura, só source=csv)
+    if int(replace or 0) == 1:
+        try:
+            with _catalog_conn() as c:
+                n = c.execute("SELECT COUNT(*) FROM catalog_items WHERE namespace=? AND source='csv'", (ns,)).fetchone()[0]
+                c.execute("DELETE FROM catalog_items WHERE namespace=? AND source='csv'", (ns,))
+                c.commit()
+            print(f"[import-csv] replace=1 :: deleted {n} rows (ns={ns}, source=csv)")
+        except Exception as e:
+            return {"ok": False, "error": f"Falha a limpar CSV anterior: {e}"}
+
+    imported, failed, skipped = 0, 0, 0
+    items_out = []
+    current_product = None
+
+    for row in reader:
+        try:
+            row_type = (row.get("Item Type") or "").strip()
+            if row_type.lower() == "rule":
+                skipped += 1
+                continue
+
+            name_raw     = (row.get("Product Name") or "").strip()
+            ref          = (row.get("Product Code/SKU") or "").strip()
+            price        = _parse_price(row.get("Price") or "")
+            brand        = (row.get("Brand Name") or "").strip() or None
+            summary_raw  = (row.get("Product Description") or "").strip()
+            raw_url      = (row.get("Product URL") or "").strip()
+            availability = (row.get("Product Availability") or "").strip()
+
+            # URL base — só aceitamos “url/path” plausível (para evitar lixo ir parar ao url)
+            base_url = _canon_ig_url(raw_url) if raw_url else None
+            if base_url:
+                base_url = base_url.strip()
+
+            summary_clean = _html_to_text(summary_raw)
+
+            def _with_availability_base(s: str) -> str:
+                s1 = (s or "").strip()
+                if availability:
+                    s1 = (s1 + ("\n" if s1 else "") + f"Disponibilidade: {availability}").strip()
+                return s1
+
+            if row_type == "Product":
+                if not base_url:
+                    # Sem URL de produto base => não importamos (para não inventar)
+                    skipped += 1
+                    continue
+
+                current_product = {
+                    "name": name_raw,
+                    "summary": _with_availability_base(summary_clean),
+                    "ref": (ref or None),
+                    "price": price,
+                    "brand": brand,
+                    "url": base_url,
+                }
+
+                _upsert_catalog_row(
+                    ns=ns,
+                    name=current_product["name"],
+                    summary=current_product["summary"],
+                    url=current_product["url"],
+                    source="csv",
+                    ref=current_product["ref"],
+                    price=current_product["price"],
+                    currency=None,
+                    iva_pct=None,
+                    brand=current_product["brand"],
+                    dimensions=None,
+                    material=None,
+                    image_url=None,
+                    variant_attrs=None,
+                    variant_key=None
+                )
+                imported += 1
+                continue
+
+            elif row_type == "SKU" and current_product:
+                variant_values = _variant_to_values_only(name_raw)
+                vkey = values_to_variant_key(variant_values) if variant_values else None
+
+                summary_v = current_product["summary"]
+                if variant_values:
+                    summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {variant_values}").strip()
+
+                price_v = price if price is not None else current_product["price"]
+
+                # ✅ URL SEMPRE base
+                url_variant = current_product["url"]
+
+                _upsert_catalog_row(
+                    ns=ns,
+                    name=f"{current_product['name']} — {variant_values}" if variant_values else current_product["name"],
+                    summary=summary_v,
+                    url=url_variant,
+                    source="csv",
+                    ref=(ref or None),  # aqui ref distingue a SKU
+                    price=price_v,
+                    currency=None,
+                    iva_pct=None,
+                    brand=current_product["brand"],
+                    dimensions=None,
+                    material=None,
+                    image_url=None,
+                    variant_attrs=(variant_values or None),
+                    variant_key=(vkey or None)
+                )
+                imported += 1
+                continue
+
+            else:
+                skipped += 1
+
+        except Exception as e:
+            failed += 1
+            items_out.append({"ok": False, "error": str(e)})
+
+    return {
+        "ok": True,
+        "namespace": ns,
+        "imported": imported,
+        "failed": failed,
+        "skipped": skipped,
+        "replace": int(replace or 0)
+    }
+
+# ===================== /HOTFIX V3 =====================================================================
 
 
 
