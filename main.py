@@ -3490,114 +3490,160 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
-
-# ===================== HOTFIX FINAL 2 — URL do catálogo SEM variantes + dedupe por REF =====================
-# Objetivo:
-# 1) Garantir que catalog_items.url guarda SEMPRE o link base do produto (sem "#sku=", sem "-nist-blue", etc.)
-# 2) Aceitar links relativos do CSV (ex.: "/zeal-laser") e convertê-los para https://interiorguider.com/zeal-laser
-# 3) Remover duplicados criados por imports anteriores (mantém o registo mais recente por namespace+ref)
+# ===================== HOTFIX — URL sanitization + no auto-#sku + cleanup =====================
 
 import re
 
-def _hotfix_catalog_url_base_only():
-    # --- helpers ---
-    def _to_base_product_url(u: str) -> str | None:
-        if not u:
-            return None
-        u = str(u).strip()
-        if not u:
-            return None
+DEFAULT_IG_HOST = globals().get("IG_HOST", "interiorguider.com")
 
-        # se vier como /slug
-        if u.startswith("/"):
-            u = f"https://{IG_HOST}{u}"
+def _looks_like_ref_or_sku(s: str) -> bool:
+    """
+    Heurística: strings que parecem SKU/ref e NÃO URL.
+    Exemplos: 740021316-2-NI, ORK.02.03, ABC123, etc.
+    """
+    if not s:
+        return False
+    x = s.strip()
 
-        # garantir esquema
-        if not re.match(r"^https?://", u, re.I):
-            # se vier "interiorguider.com/zeal-laser"
-            if u.lower().startswith(IG_HOST.lower()):
-                u = "https://" + u
-            else:
-                # não inventar domínios: deixa como está
-                pass
-
-        # canon básico (se existir)
-        try:
-            cu = (_canon_ig_url(u) or u).strip()
-        except Exception:
-            cu = u
-
-        # regra DURA: tirar fragmento e query (sem #sku e sem parâmetros)
-        cu = cu.split("#", 1)[0].split("?", 1)[0].strip()
-
-        # regra DURA: não permitir “url de variante” baseada em slug (…-nist-blue, …-twist-granite, etc.)
-        # aqui não conseguimos “adivinhar” o slug base se já vier adulterado;
-        # por isso: a fonte de verdade deve ser o CSV (link), e este fix impede que volte a ser adulterado.
-        return cu or None
-
-    # --- patch do upsert para forçar url base + dedupe ---
-    if "_upsert_catalog_row" not in globals():
-        print("[hotfix] _upsert_catalog_row não existe no globals() — não apliquei patch.")
+    # já é URL/relativo => não é sku
+    if x.startswith(("http://", "https://", "/")):
         return False
 
-    _orig_upsert = globals()["_upsert_catalog_row"]
+    # tem espaços => não é sku puro, mas também não é URL; será tratado noutro lado
+    if " " in x:
+        return False
 
-    def _upsert_catalog_row_urlbase(ns, **kwargs):
-        # forçar url base
-        url_in = kwargs.get("url")
-        base_url = _to_base_product_url(url_in) or url_in
-        kwargs["url"] = base_url
+    # padrões comuns SKU/REF
+    if re.fullmatch(r"[A-Za-z]{2,6}\.\d{1,4}(\.\d{1,4})*", x):  # ORK.02.03
+        return True
+    if re.fullmatch(r"\d{6,}([-_][A-Za-z0-9]+)+", x):  # 740021316-2-NI
+        return True
+    if re.fullmatch(r"[A-Za-z0-9]{5,}", x) and not "." in x:  # bloco alfanumérico
+        return True
 
-        # executar upsert original
-        _orig_upsert(ns, **kwargs)
+    return False
 
-        # dedupe por (namespace, ref) quando houver ref
-        ref = (kwargs.get("ref") or "").strip()
-        if ref:
-            try:
-                with _catalog_conn() as c:
-                    # manter o mais recente (updated_at maior), apagar restantes
-                    rows = c.execute(
-                        """SELECT id FROM catalog_items
-                           WHERE namespace=? AND ref=?
-                           ORDER BY updated_at DESC, id DESC""",
-                        (ns, ref)
-                    ).fetchall()
-                    if rows and len(rows) > 1:
-                        keep_id = rows[0][0]
-                        drop_ids = [r[0] for r in rows[1:]]
-                        c.execute(
-                            f"DELETE FROM catalog_items WHERE id IN ({','.join(['?']*len(drop_ids))})",
-                            drop_ids
-                        )
-                        print(f"[hotfix] dedupe namespace={ns} ref={ref} dropped={len(drop_ids)} kept={keep_id}")
-            except Exception as e:
-                print(f"[hotfix] dedupe falhou: {e}")
+def _sanitize_url_value(raw: str, host: str = DEFAULT_IG_HOST) -> str | None:
+    """
+    Converte:
+      - '/slug' -> 'https://host/slug'
+      - 'https://host/slug (texto...)' -> 'https://host/slug'
+    Regras:
+      - nunca inventa '#sku='
+      - nunca acrescenta variante ao slug
+      - se parecer SKU/ref, devolve None (para não gravar porcaria em url)
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
 
-    globals()["_upsert_catalog_row"] = _upsert_catalog_row_urlbase
+    # cortar "lixo" frequente quando vem colado ao texto
+    # ex: "https://.../zeal-laser-nist-blue)" ou "https://.../x (variante...)"
+    s = s.splitlines()[0].strip()
+    for sep in [" (", " |", "  ", "\t", "]", ")"]:
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
 
-    # --- limpeza opcional imediata (corrigir urls já estragadas onde dá) ---
-    # NOTA: sem o link original do CSV não há como “reverter” um slug de variante para o slug base com 100% certeza.
-    # Mas conseguimos pelo menos garantir que não há "#sku=" e que não há query/fragment.
-    try:
-        with _catalog_conn() as c:
-            cur = c.execute("SELECT id, url FROM catalog_items")
-            rows = cur.fetchall()
-            for r in rows:
-                rid = r[0]
-                u = r[1] or ""
-                fixed = (u.split("#",1)[0].split("?",1)[0]).strip()
-                if fixed and fixed != u:
-                    c.execute("UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?", (fixed, rid))
-        print("[hotfix] cleanup: removidos #/? dos urls existentes (quando existiam).")
-    except Exception as e:
-        print(f"[hotfix] cleanup falhou: {e}")
+    # remover trailing pontuação típica
+    s = s.rstrip(".,;:>")
 
-    print("[hotfix] OK — URL base only + dedupe por REF ativo.")
+    # se parece SKU/ref, não usar como URL
+    if _looks_like_ref_or_sku(s):
+        return None
+
+    # se vier relativo
+    if s.startswith("/"):
+        return f"https://{host}{s}"
+
+    # se vier sem esquema mas com domínio
+    if s.startswith(host):
+        return f"https://{s}"
+
+    # se for URL absoluta, manter
+    if s.startswith(("http://", "https://")):
+        return s
+
+    # se não é nada de seguro, não inventar
+    return None
+
+def _hotfix_patch_upsert_url_policy():
+    """
+    Interceta _upsert_catalog_row para:
+      - sanear url SEM inventar '#sku='
+      - se url vier inválida, tenta recuperar de campos alternativos se existirem (link)
+    """
+    if "_upsert_catalog_row" not in globals():
+        print("[hotfix] _upsert_catalog_row not found; skipping")
+        return False
+
+    orig = globals()["_upsert_catalog_row"]
+
+    def wrapped(ns, **kwargs):
+        host = DEFAULT_IG_HOST
+
+        # candidatos possíveis (alguns imports usam 'link' ou 'url')
+        raw_url = kwargs.get("url") or kwargs.get("link") or ""
+        clean = _sanitize_url_value(raw_url, host=host)
+
+        # NÃO inventar; se não houver URL limpa, grava None (melhor do que gravar SKU)
+        kwargs["url"] = clean
+
+        # regra dura: não deixar ninguém anexar '#sku=' por fora via kwargs
+        if kwargs.get("url") and "#sku=" in kwargs["url"]:
+            # mantém só se já viesse explicitamente no CSV/entrada (não dá para provar aqui),
+            # mas como tu queres política "não inventar", deixamos ficar se já existe.
+            pass
+
+        return orig(ns, **kwargs)
+
+    globals()["_upsert_catalog_row"] = wrapped
+    print("[hotfix] patched _upsert_catalog_row (sanitize url, no auto-building)")
     return True
 
-_hotfix_catalog_url_base_only()
-# ===================== /HOTFIX FINAL 2 =====================================================================
+def _hotfix_cleanup_existing_bad_urls():
+    """
+    Limpeza SEGURA (não adivinha URLs corretos):
+      - corta URLs que têm espaços/parênteses/etc.
+      - apaga (set NULL) URLs que parecem SKU/ref
+      - converte relativos '/slug' -> 'https://host/slug'
+    """
+    try:
+        host = DEFAULT_IG_HOST
+        with _catalog_conn() as c:
+            rows = c.execute("SELECT id, url FROM catalog_items WHERE url IS NOT NULL AND url <> ''").fetchall()
+            fixed = 0
+            nulled = 0
+
+            for r in rows:
+                _id = r["id"]
+                u = (r["url"] or "").strip()
+
+                newu = _sanitize_url_value(u, host=host)
+
+                if newu is None:
+                    # se o original era "claramente" sku/ref, nulamos
+                    if _looks_like_ref_or_sku(u):
+                        c.execute("UPDATE catalog_items SET url=NULL WHERE id=?", (_id,))
+                        nulled += 1
+                    # senão, não mexe (pode ser um slug sem /, etc.)
+                    continue
+
+                if newu != u:
+                    c.execute("UPDATE catalog_items SET url=? WHERE id=?", (newu, _id))
+                    fixed += 1
+
+        print(f"[hotfix] cleanup urls: fixed={fixed}, nulled={nulled}")
+        return True
+    except Exception as e:
+        print(f"[hotfix] cleanup FAILED: {e}")
+        return False
+
+_hotfix_patch_upsert_url_policy()
+_hotfix_cleanup_existing_bad_urls()
+
+# ===================== HOTFIX — URL sanitization + no auto-#sku + cleanup ==========================================================
 
 
 
