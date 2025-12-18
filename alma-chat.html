@@ -382,5 +382,124 @@ document.getElementById('prompt').addEventListener('focus', () => {
 /* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
+
+<!-- =========================
+     HOTFIX FINAL (Markdown + Safe Copy)
+     Cola ISTO no fim do ficheiro, mesmo antes de </body>
+     ========================= -->
+
+<!-- 1) Libs: Markdown renderer + sanitização -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+
+<style>
+/* 2) Estilos Markdown dentro do balão da Alma (sem mexer no teu tema) */
+.msg.alma .bubble h1, .msg.alma .bubble h2, .msg.alma .bubble h3{
+  margin: 0.4em 0 0.2em;
+  line-height: 1.25;
+}
+.msg.alma .bubble p{ margin: 0.35em 0; }
+.msg.alma .bubble ul, .msg.alma .bubble ol{ margin: 0.35em 0 0.35em 1.2em; }
+.msg.alma .bubble li{ margin: 0.15em 0; }
+.msg.alma .bubble blockquote{
+  margin: 0.5em 0; padding: 0.6em 0.9em;
+  border-left: 3px solid rgba(212,160,23,.7);
+  background: rgba(255,255,255,0.03);
+  border-radius: 10px;
+}
+.msg.alma .bubble code{
+  padding: 0.12em 0.35em; border-radius: 8px;
+  background: rgba(255,255,255,0.06);
+}
+.msg.alma .bubble pre{
+  overflow:auto; padding: 10px 12px; border-radius: 12px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.msg.alma .bubble a{ color: var(--accent); text-decoration: none; }
+.msg.alma .bubble a:hover{ text-decoration: underline; }
+</style>
+
+<script>
+/* 3) HOTFIX: substituir renderMsgs() por uma versão que:
+      - Renderiza Markdown completo (marked)
+      - Sanitiza HTML (DOMPurify) para evitar XSS
+      - Copia Markdown original sem perder formatação
+*/
+(function(){
+  // Se o teu script original não expõe estas funções/vars no global, isto não terá efeito.
+  // No teu caso, estão no global (function declarations + let sessions/activeId), por isso funciona.
+
+  // Melhor config do marked (GFM + quebras de linha)
+  function ensureMarkedConfig(){
+    if (window.marked && !window.__alma_marked_configured){
+      marked.setOptions({ gfm:true, breaks:true });
+      window.__alma_marked_configured = true;
+    }
+  }
+
+  // Função auxiliar segura
+  function safeMarkdownToHtml(md){
+    const raw = window.marked ? marked.parse(md || "") : (md || "");
+    return window.DOMPurify ? DOMPurify.sanitize(raw) : raw;
+  }
+
+  // Guardas simples
+  if (typeof window.renderMsgs !== "function") return;
+  if (typeof window.byId !== "function") return;
+
+  // Override da renderMsgs
+  window.renderMsgs = function renderMsgs(){
+    ensureMarkedConfig();
+
+    const s = (window.sessions||[]).find(x=>x.id===window.activeId);
+    const box = window.byId("messages");
+    if(!box) return;
+
+    box.innerHTML="";
+    if(!s) return;
+
+    (s.msgs||[]).forEach(m=>{
+      const row=document.createElement("div");
+      row.className="msg "+(m.role||"");
+
+      const bubble=document.createElement("div");
+      bubble.className="bubble";
+
+      const content = (m.content||"");
+
+      if(m.role==="alma"){
+        // Markdown -> HTML seguro
+        bubble.innerHTML = safeMarkdownToHtml(content);
+
+        // Botão copiar (Markdown original)
+        const copy=document.createElement("span");
+        copy.className="copy-btn";
+        copy.textContent="copiar";
+        copy.onclick=()=>navigator.clipboard.writeText(content);
+        bubble.appendChild(copy);
+      }else{
+        // User: texto puro (não interpretar HTML/Markdown)
+        bubble.textContent = content;
+      }
+
+      row.appendChild(bubble);
+      box.appendChild(row);
+    });
+
+    box.scrollTop = box.scrollHeight;
+  };
+
+  // Re-render imediato para aplicar ao histórico já carregado
+  try { window.renderMsgs(); } catch(e){}
+
+})();
+</script>
+
+<!-- =========================
+     FIM HOTFIX FINAL
+     ========================= -->
+
+  
 </body>
 </html>
