@@ -3490,105 +3490,155 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
-# ===================== HOTFIX V5 (URL slug fix + não apagar URLs) =====================
-import os, re, sqlite3, time
 
-def _hotfix_v5_urls():
-    try:
-        db_path = globals().get("CATALOG_DB_PATH") or os.getenv("CATALOG_DB_PATH") or "/data/catalog.db"
-        globals()["CATALOG_DB_PATH"] = db_path
-        os.environ["CATALOG_DB_PATH"] = db_path
+# ===================== HOTFIX V8 (URL pai SEM #sku + upsert por REF + anti-duplicados) =====================
+import re, time
 
-        def _catalog_conn_v5():
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            return conn
-        globals()["_catalog_conn"] = _catalog_conn_v5
+def _hotfix_v8_url_parent_only_and_upsert_by_ref():
+    IG_HOST = globals().get("IG_HOST", "interiorguider.com")
+    DEFAULT_NS = globals().get("DEFAULT_NAMESPACE", "boasafra")
 
-        IG_HOST = globals().get("IG_HOST", "interiorguider.com")
-        BASE_IG = f"https://{IG_HOST}"
+    def _clean(s): return (s or "").strip()
 
-        url_re = re.compile(r"(https?://[^\s]+)", re.I)
-        slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", re.I)  # ex: zeal-laser
+    def _normalize_url_parent(raw_url: str) -> str:
+        """
+        Regras:
+        - Se relativo "/x" -> "https://{IG_HOST}/x"
+        - Se "www." -> "https://www."
+        - Remove qualquer fragmento "#..." (inclui #sku=...)
+        - Remove lixo tipo " /zeal-laser  cor=..." (fica só o primeiro token)
+        - NUNCA acrescenta #sku nem texto de variante
+        """
+        u = _clean(raw_url)
+        if not u:
+            return ""
 
-        def norm_url(u: str) -> str:
-            if not u:
-                return ""
-            u = str(u).strip()
+        u = u.strip().strip('"').strip("'")
 
-            # Se vier “com lixo” (ex.: "https://.../zeal-laser Soft Indigo") guarda só o URL
-            m = url_re.search(u)
-            if m:
-                u = m.group(1).strip()
+        if u.startswith("www."):
+            u = "https://" + u
 
-            # Se vier relativo "/zeal-laser" -> absoluto
-            if u.startswith("/"):
-                return BASE_IG + u
+        if u.startswith("/"):
+            u = f"https://{IG_HOST}{u}"
 
-            # Se vier slug "zeal-laser" -> tratar como path relativo (ISTO era o teu caso)
-            if slug_re.match(u) and "http" not in u.lower():
-                return BASE_IG + "/" + u.lstrip("/")
+        # se contiver domínio mas sem esquema
+        if (not u.startswith("http://") and not u.startswith("https://")) and (IG_HOST in u):
+            u = "https://" + u.lstrip("/")
 
-            # Se vier "interiorguider.com/zeal-laser" sem esquema
-            if u.lower().startswith(IG_HOST.lower()+"/"):
-                return "https://" + u
+        # corta tudo depois de espaços (caso tenha sido concatenado texto)
+        u = u.split(" ")[0].strip()
 
-            # Remove #sku= (no teu site não existe)
-            u = re.sub(r"#sku=[^#\s]+", "", u, flags=re.I).strip()
-            u = re.sub(r"#\s*$", "", u).strip()
+        # remove fragmento (#sku=..., #qualquercoisa)
+        u = u.split("#")[0].strip()
 
-            return u
+        return u
 
-        # Retro-fix: normalizar URLs existentes + reconstruir URLs vazios se houver slug guardado noutro campo
-        fixed = 0
-        with _catalog_conn_v5() as c:
-            rows = c.execute("""
-                SELECT id, url, name
-                FROM catalog_items
-                ORDER BY updated_at DESC
-            """).fetchall()
+    # patch do canonizador usado em vários sítios
+    def _canon_ig_url_v8(raw_url: str):
+        return _normalize_url_parent(raw_url) or (raw_url or "").strip()
 
-            for r in rows:
-                rid = int(r["id"])
-                url = (r["url"] or "").strip()
-                name = (r["name"] or "").strip()
+    globals()["_canon_ig_url"] = _canon_ig_url_v8
 
-                new_url = norm_url(url)
-
-                # Se URL ficou vazio, tenta reconstruir a partir de um slug no próprio url antigo (já não existe),
-                # então aqui só repara casos em que o url atual é mesmo slug (ou relativo) — já coberto acima.
-                # NÃO inventamos a partir do nome (para evitar erros).
-
-                if new_url != url:
-                    c.execute("UPDATE catalog_items SET url=?, updated_at=? WHERE id=?",
-                              (new_url, int(time.time()), rid))
-                    fixed += 1
-
-        # Fix no resolve-price: garantir que devolve url normalizada (sem acrescentar variante)
-        if "catalog_resolve_price" in globals():
-            orig = globals()["catalog_resolve_price"]
-            async def catalog_resolve_price_v5(request):
-                out = await orig(request)
-                try:
-                    if isinstance(out, dict) and out.get("match") and isinstance(out["match"], dict):
-                        out["match"]["url"] = norm_url(out["match"].get("url") or "")
-                except Exception:
-                    pass
-                return out
-            globals()["catalog_resolve_price"] = catalog_resolve_price_v5
-
-        # typo /status (se existir)
-        if "_status_catalog_sqlite" in globals():
-            globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
-
-        print(f"[hotfix v5] db={db_path} url_fixed={fixed}")
-        return True
-    except Exception as e:
-        print(f"[hotfix v5] FAILED: {e}")
+    if "_catalog_conn" not in globals():
+        print("[hotfix v8] _catalog_conn não existe; abort.")
         return False
 
-_hotfix_v5_urls()
-# ===================== /HOTFIX V5 =======================================================================
+    # patch do upsert: se existir ref -> upsert por (namespace, ref); senão por (namespace, url)
+    def _upsert_catalog_row_v8(
+        ns,
+        name=None,
+        summary=None,
+        url=None,
+        source=None,
+        ref=None,
+        price=None,
+        currency=None,
+        iva_pct=None,
+        brand=None,
+        dimensions=None,
+        material=None,
+        image_url=None,
+        variant_attrs=None,
+        variant_key=None
+    ):
+        ns = (ns or DEFAULT_NS).strip()
+        ref = _clean(ref) or None
+        url_norm = _normalize_url_parent(url)
+
+        now = int(time.time())
+
+        with globals()["_catalog_conn"]() as c:
+            # garantir schema mínimo (se existir helper)
+            if "_ensure_cols" in globals():
+                globals()["_ensure_cols"](c)
+
+            row = None
+
+            if ref:
+                row = c.execute(
+                    "SELECT id FROM catalog_items WHERE namespace=? AND ref=? ORDER BY updated_at DESC LIMIT 1",
+                    (ns, ref)
+                ).fetchone()
+
+            if (not row) and url_norm:
+                # só tenta por URL quando não há ref (ou não encontrou por ref)
+                row = c.execute(
+                    "SELECT id FROM catalog_items WHERE namespace=? AND url=? AND (ref IS NULL OR ref='') "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (ns, url_norm)
+                ).fetchone()
+
+            if row:
+                c.execute("""
+                    UPDATE catalog_items
+                       SET name=?,
+                           summary=?,
+                           url=?,
+                           source=?,
+                           updated_at=?,
+                           ref=?,
+                           price=?,
+                           currency=?,
+                           iva_pct=?,
+                           brand=?,
+                           dimensions=?,
+                           material=?,
+                           image_url=?,
+                           variant_attrs=?,
+                           variant_key=?
+                     WHERE id=?
+                """, (
+                    name, summary, url_norm or (url or ""),
+                    source, now,
+                    ref, price, currency, iva_pct,
+                    brand, dimensions, material, image_url,
+                    variant_attrs, variant_key,
+                    row["id"] if isinstance(row, dict) else row[0]
+                ))
+            else:
+                c.execute("""
+                    INSERT INTO catalog_items
+                    (namespace,name,summary,url,source,created_at,updated_at,
+                     ref,price,currency,iva_pct,brand,dimensions,material,image_url,variant_attrs,variant_key)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    ns, name, summary, url_norm or (url or ""),
+                    source, now, now,
+                    ref, price, currency, iva_pct,
+                    brand, dimensions, material, image_url,
+                    variant_attrs, variant_key
+                ))
+
+            c.commit()
+        return True
+
+    globals()["_upsert_catalog_row"] = _upsert_catalog_row_v8
+
+    print("[hotfix v8] OK: URL pai SEM #sku; variantes identificadas por ref/variant_key; upsert por ref evita duplicados.")
+    return True
+
+_hotfix_v8_url_parent_only_and_upsert_by_ref()
+# ===================== /HOTFIX V8 =====================================================================
 
 
 
