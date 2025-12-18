@@ -3491,145 +3491,138 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
-# ===================== HOTFIX — URL de variante (NÃO fabricar #sku=) =====================
-def safe_catalog_url(row: dict) -> str | None:
-    """
-    Regra dura:
-    - Se há URL no catálogo, devolver EXACTAMENTE essa URL.
-    - Nunca anexar '#sku=' nem inferir.
-    """
-    try:
-        u = (row or {}).get("url") or None
-        if not u:
-            return None
-        return str(u).strip()
-    except Exception:
-        return None
-# ===================== /HOTFIX — URL de variante =========================================
 
-# ===================== HOTFIX FINAL v2 (persistência + reparar urls + não inventar #sku) =====================
-import os, re, unicodedata, sqlite3
+
+# ===================== HOTFIX v3 (UPsert por REF + dedupe + não "slugify URL") =====================
+import os, sqlite3, re
 from urllib.parse import urlparse
 
-def _hotfix_slugify(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
-
-def _hotfix_is_sku_like(x: str) -> bool:
-    x = (x or "").strip()
-    if not x: return False
-    # ex: ORK.02.03 / LAM0100- / WOU-123 / etc
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\.\-_]{2,}", x) and (("." in x) or ("-" in x)):
-        return True
-    return False
-
-def _hotfix_is_bad_url(u: str) -> bool:
-    u = (u or "").strip()
-    if not u: return True
-    # números puros (ex: 8327) ou algo sku-like sem / e sem esquema
-    if re.fullmatch(r"\d{3,}", u): return True
-    if _hotfix_is_sku_like(u) and ("/" not in u) and (":" not in u): return True
-    # sem "/" e sem "http"
-    if ("/" not in u) and (not u.startswith("http")) and (":" not in u): return True
-    return False
-
-def _hotfix_canon_url(u: str, host: str) -> str:
-    u = (u or "").strip()
-    if not u: return u
-    # já absoluto
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    # relativo estilo "/zeal-laser"
-    if u.startswith("/"):
-        return f"https://{host}{u}"
-    # relativo sem "/" (raro) => prefixa
-    if ("/" not in u) and (":" not in u):
-        return f"https://{host}/{u}"
-    return u
-
-def _hotfix_catalog_persist_and_repair():
-    # 1) DB persistente (sem migração automática)
+def _hotfix_v3():
+    # --- 0) garantir path persistente (não mexe em dados) ---
     base_dir = os.getenv("CATALOG_DIR", "/data")
     os.makedirs(base_dir, exist_ok=True)
-
-    db_path = (os.getenv("CATALOG_DB_PATH") or "").strip()
-    if not db_path:
-        db_path = os.path.join(base_dir, "catalog.db")
-
+    db_path = (os.getenv("CATALOG_DB_PATH") or "").strip() or os.path.join(base_dir, "catalog.db")
     os.environ["CATALOG_DB_PATH"] = db_path
     globals()["CATALOG_DB_PATH"] = db_path
 
-    # 2) garantir _catalog_conn usa sempre o path atual
     def _catalog_conn_persist():
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn
     globals()["_catalog_conn"] = _catalog_conn_persist
 
-    # 3) garantir schema (se existir o helper)
+    # schema
     if "_ensure_cols" in globals():
         with _catalog_conn_persist() as c:
             globals()["_ensure_cols"](c)
 
-    # 4) corrigir typo do /status (se aplicável no teu main)
+    IG_HOST = globals().get("IG_HOST", os.getenv("IG_HOST", "interiorguider.com"))
+
+    def _canon_url_safe(u: str) -> str:
+        """Só canoniza URLs relativas simples. NÃO inventa slugs, NÃO toca em texto com espaços."""
+        u = (u or "").strip()
+        if not u:
+            return u
+        # se tiver espaços, é quase sempre lixo/coluna desalinhada -> não mexer
+        if " " in u:
+            return u
+        # absoluto: ok
+        if u.startswith("http://") or u.startswith("https://"):
+            return u
+        # relativo /slug
+        if u.startswith("/"):
+            return f"https://{IG_HOST}{u}"
+        # relativo sem / (raro) -> prefixar
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-_\/]*", u):
+            return f"https://{IG_HOST}/" + u.lstrip("/")
+        return u
+
+    # --- 1) patch: upsert por REF quando existir (senão por URL) ---
+    # assume que existe _upsert_catalog_row(ns, name=..., url=..., ref=..., etc.)
+    if "_upsert_catalog_row" in globals():
+        _orig_upsert = globals()["_upsert_catalog_row"]
+
+        def _upsert_catalog_row_ref_first(ns, **kwargs):
+            # canoniza url só de forma segura
+            if "url" in kwargs:
+                kwargs["url"] = _canon_url_safe(kwargs.get("url"))
+
+            ref = (kwargs.get("ref") or "").strip() or None
+            url = (kwargs.get("url") or "").strip() or None
+
+            with _catalog_conn_persist() as c:
+                # 1) se há REF, tenta atualizar por (namespace, ref)
+                if ref:
+                    row = c.execute(
+                        "SELECT id FROM catalog_items WHERE namespace=? AND ref=? ORDER BY updated_at DESC LIMIT 1",
+                        (ns, ref),
+                    ).fetchone()
+                    if row:
+                        # força update (reusa a lógica original mas garantindo que mantém o mesmo id via URL)
+                        # truque: se o original faz upsert por url, passamos o url existente dessa linha para não duplicar
+                        existing = c.execute("SELECT url FROM catalog_items WHERE id=?", (row["id"],)).fetchone()
+                        if existing and existing["url"]:
+                            kwargs["url"] = existing["url"]  # mantém url da linha canónica
+                        return _orig_upsert(ns, **kwargs)
+
+                # 2) fallback normal (por URL)
+                return _orig_upsert(ns, **kwargs)
+
+        globals()["_upsert_catalog_row"] = _upsert_catalog_row_ref_first
+
+    # --- 2) dedupe: manter 1 linha por (namespace, ref) e por (namespace, url) ---
+    def _dedupe():
+        with _catalog_conn_persist() as c:
+            # (A) dedupe por REF (mantém a mais recente por updated_at; fallback id)
+            c.execute("""
+                DELETE FROM catalog_items
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                 PARTITION BY namespace, ref
+                                 ORDER BY COALESCE(updated_at, 0) DESC, id DESC
+                               ) AS rn
+                        FROM catalog_items
+                        WHERE ref IS NOT NULL AND TRIM(ref) <> ''
+                    ) t
+                    WHERE t.rn > 1
+                )
+            """)
+
+            # (B) dedupe por URL (para casos sem ref)
+            c.execute("""
+                DELETE FROM catalog_items
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                 PARTITION BY namespace, url
+                                 ORDER BY COALESCE(updated_at, 0) DESC, id DESC
+                               ) AS rn
+                        FROM catalog_items
+                        WHERE url IS NOT NULL AND TRIM(url) <> ''
+                    ) t
+                    WHERE t.rn > 1
+                )
+            """)
+
+            c.commit()
+
+    try:
+        _dedupe()
+        print(f"[hotfix v3] db={db_path} OK (dedupe + upsert ref-first)")
+    except Exception as e:
+        print(f"[hotfix v3] dedupe failed: {e}")
+
+    # --- 3) typo /status (se aplicável) ---
     if "_status_catalog_sqlite" in globals():
         globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
 
-    # 5) reparar URLs estragadas já gravadas
-    IG_HOST = globals().get("IG_HOST", os.getenv("IG_HOST", "interiorguider.com"))
-    ns_default = globals().get("DEFAULT_NAMESPACE", os.getenv("DEFAULT_NAMESPACE", "boasafra"))
-
-    try:
-        with _catalog_conn_persist() as c:
-            rows = c.execute("""
-                SELECT id, namespace, name, ref, url, source
-                FROM catalog_items
-            """).fetchall()
-
-            fixed = 0
-            for r in rows:
-                rid = r["id"]
-                ns  = (r["namespace"] or "").strip() or ns_default
-                name = (r["name"] or "").strip()
-                ref  = (r["ref"] or "").strip()
-                url  = (r["url"] or "").strip()
-
-                # se url é claramente má, tentar reconstruir pelo nome (slug)
-                if _hotfix_is_bad_url(url) and name:
-                    slug = _hotfix_slugify(name)
-                    if slug:
-                        new_url = _hotfix_canon_url("/" + slug, IG_HOST)
-                        c.execute("UPDATE catalog_items SET url=? WHERE id=?", (new_url, rid))
-                        fixed += 1
-                        continue
-
-                # se url é relativo, canonizar
-                if url and (not url.startswith("http")):
-                    new_url = _hotfix_canon_url(url, IG_HOST)
-                    if new_url != url:
-                        c.execute("UPDATE catalog_items SET url=? WHERE id=?", (new_url, rid))
-                        fixed += 1
-
-            c.commit()
-            print(f"[hotfix] catalog db={db_path} repaired_urls={fixed}")
-    except Exception as e:
-        print(f"[hotfix] repair urls failed: {e}")
-
-    # 6) IMPORTANTE: não inventar links com #sku= no backend
-    #    (se tens lógica que adiciona #sku= nalgum lado, neutraliza aqui)
-    def _hotfix_safe_catalog_url(u: str) -> str:
-        u = (u or "").strip()
-        # não mexer em #sku= se já existir; mas também não criar
-        return u
-    globals()["_safe_catalog_url"] = _hotfix_safe_catalog_url  # para usares no teu gerador de respostas, se aplicável
-
     return True
 
-_hotfix_catalog_persist_and_repair()
-# ===================== /HOTFIX FINAL v2 =====================================================================
+_hotfix_v3()
+# ===================== /HOTFIX v3 =====================================================================
 
 
 
