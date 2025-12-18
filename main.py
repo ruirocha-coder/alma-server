@@ -3491,6 +3491,114 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
+# ===================== HOTFIX FINAL 2 — URL do catálogo SEM variantes + dedupe por REF =====================
+# Objetivo:
+# 1) Garantir que catalog_items.url guarda SEMPRE o link base do produto (sem "#sku=", sem "-nist-blue", etc.)
+# 2) Aceitar links relativos do CSV (ex.: "/zeal-laser") e convertê-los para https://interiorguider.com/zeal-laser
+# 3) Remover duplicados criados por imports anteriores (mantém o registo mais recente por namespace+ref)
+
+import re
+
+def _hotfix_catalog_url_base_only():
+    # --- helpers ---
+    def _to_base_product_url(u: str) -> str | None:
+        if not u:
+            return None
+        u = str(u).strip()
+        if not u:
+            return None
+
+        # se vier como /slug
+        if u.startswith("/"):
+            u = f"https://{IG_HOST}{u}"
+
+        # garantir esquema
+        if not re.match(r"^https?://", u, re.I):
+            # se vier "interiorguider.com/zeal-laser"
+            if u.lower().startswith(IG_HOST.lower()):
+                u = "https://" + u
+            else:
+                # não inventar domínios: deixa como está
+                pass
+
+        # canon básico (se existir)
+        try:
+            cu = (_canon_ig_url(u) or u).strip()
+        except Exception:
+            cu = u
+
+        # regra DURA: tirar fragmento e query (sem #sku e sem parâmetros)
+        cu = cu.split("#", 1)[0].split("?", 1)[0].strip()
+
+        # regra DURA: não permitir “url de variante” baseada em slug (…-nist-blue, …-twist-granite, etc.)
+        # aqui não conseguimos “adivinhar” o slug base se já vier adulterado;
+        # por isso: a fonte de verdade deve ser o CSV (link), e este fix impede que volte a ser adulterado.
+        return cu or None
+
+    # --- patch do upsert para forçar url base + dedupe ---
+    if "_upsert_catalog_row" not in globals():
+        print("[hotfix] _upsert_catalog_row não existe no globals() — não apliquei patch.")
+        return False
+
+    _orig_upsert = globals()["_upsert_catalog_row"]
+
+    def _upsert_catalog_row_urlbase(ns, **kwargs):
+        # forçar url base
+        url_in = kwargs.get("url")
+        base_url = _to_base_product_url(url_in) or url_in
+        kwargs["url"] = base_url
+
+        # executar upsert original
+        _orig_upsert(ns, **kwargs)
+
+        # dedupe por (namespace, ref) quando houver ref
+        ref = (kwargs.get("ref") or "").strip()
+        if ref:
+            try:
+                with _catalog_conn() as c:
+                    # manter o mais recente (updated_at maior), apagar restantes
+                    rows = c.execute(
+                        """SELECT id FROM catalog_items
+                           WHERE namespace=? AND ref=?
+                           ORDER BY updated_at DESC, id DESC""",
+                        (ns, ref)
+                    ).fetchall()
+                    if rows and len(rows) > 1:
+                        keep_id = rows[0][0]
+                        drop_ids = [r[0] for r in rows[1:]]
+                        c.execute(
+                            f"DELETE FROM catalog_items WHERE id IN ({','.join(['?']*len(drop_ids))})",
+                            drop_ids
+                        )
+                        print(f"[hotfix] dedupe namespace={ns} ref={ref} dropped={len(drop_ids)} kept={keep_id}")
+            except Exception as e:
+                print(f"[hotfix] dedupe falhou: {e}")
+
+    globals()["_upsert_catalog_row"] = _upsert_catalog_row_urlbase
+
+    # --- limpeza opcional imediata (corrigir urls já estragadas onde dá) ---
+    # NOTA: sem o link original do CSV não há como “reverter” um slug de variante para o slug base com 100% certeza.
+    # Mas conseguimos pelo menos garantir que não há "#sku=" e que não há query/fragment.
+    try:
+        with _catalog_conn() as c:
+            cur = c.execute("SELECT id, url FROM catalog_items")
+            rows = cur.fetchall()
+            for r in rows:
+                rid = r[0]
+                u = r[1] or ""
+                fixed = (u.split("#",1)[0].split("?",1)[0]).strip()
+                if fixed and fixed != u:
+                    c.execute("UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?", (fixed, rid))
+        print("[hotfix] cleanup: removidos #/? dos urls existentes (quando existiam).")
+    except Exception as e:
+        print(f"[hotfix] cleanup falhou: {e}")
+
+    print("[hotfix] OK — URL base only + dedupe por REF ativo.")
+    return True
+
+_hotfix_catalog_url_base_only()
+# ===================== /HOTFIX FINAL 2 =====================================================================
+
 
 
 
