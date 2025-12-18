@@ -2990,6 +2990,188 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
 # ======================= /HOTFIX ==============================================================
 
+# ===================== HOTFIX FINAL (persistência catálogo + migração + /status typo) =====================
+# Objetivo:
+# 1) Garantir que o SQLite do catálogo vive em /data (Railway Volume) e não em /tmp
+# 2) Migrar automaticamente /tmp/catalog.db -> /data/catalog.db (primeira vez)
+# 3) Re-inicializar o catálogo após mudar o path (para não depender da ordem do ficheiro)
+# 4) Corrigir o typo no /status sem editar a função (hack: criar a key com espaço no globals)
+
+import os, shutil
+
+def _hotfix_catalog_persist_final():
+    try:
+        # 1) escolher DB persistente
+        base_dir = os.getenv("CATALOG_DIR", "/data")
+        os.makedirs(base_dir, exist_ok=True)
+
+        persist_db = os.getenv("CATALOG_DB_PATH", "").strip()
+        if not persist_db:
+            persist_db = os.path.join(base_dir, "catalog.db")
+
+        # 2) se ainda estamos em /tmp, migrar (só se o persistente ainda não existir)
+        tmp_db = "/tmp/catalog.db"
+        if (persist_db.startswith("/tmp/")):
+            persist_db = os.path.join(base_dir, os.path.basename(persist_db))
+
+        if (not os.path.exists(persist_db)) and os.path.exists(tmp_db) and os.path.getsize(tmp_db) > 0:
+            try:
+                shutil.copy2(tmp_db, persist_db)
+                print(f"[hotfix] MIGRATE {tmp_db} -> {persist_db}")
+            except Exception as e:
+                print(f"[hotfix] migrate failed: {e}")
+
+        # 3) forçar env + globals para o novo caminho
+        os.environ["CATALOG_DB_PATH"] = persist_db
+        globals()["CATALOG_DB_PATH"] = persist_db
+
+        # 4) redefinir _catalog_conn para usar o novo path (mesmo que já existisse acima)
+        import sqlite3
+        def _catalog_conn_persist():
+            conn = sqlite3.connect(persist_db)
+            conn.row_factory = sqlite3.Row
+            return conn
+        globals()["_catalog_conn"] = _catalog_conn_persist
+
+        # 5) garantir schema/índices (reusa _ensure_cols/_catalog_init se existirem)
+        if "_ensure_cols" in globals():
+            with _catalog_conn_persist() as conn:
+                globals()["_ensure_cols"](conn)
+
+        # 6) corrigir o typo do /status:
+        #    a tua rota faz: if ' _status_catalog_sqlite' in globals()
+        #    então criamos essa key com espaço, apontando para a função real
+        if "_status_catalog_sqlite" in globals():
+            globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
+
+        print(f"[hotfix] catalog DB persistente em: {persist_db}")
+        return True
+    except Exception as e:
+        print(f"[hotfix] catalog persist FAILED: {e}")
+        return False
+
+_hotfix_catalog_persist_final()
+# ===================== /HOTFIX FINAL =====================================================================
+
+# ===================== HOTFIX FINAL — Forçar pesquisa tolerante ativa =====================
+# (só faz bind se as versões tolerantes já estiverem definidas no ficheiro)
+
+def _hotfix_force_tolerant_search_active():
+    try:
+        # Se já colaste antes as versões tolerantes (com _hf_tokens/_hf_like_pat),
+        # garante que são as que ficam ativas no fim do ficheiro.
+        if "_hf_tokens" in globals() and "_hf_like_pat" in globals():
+            # Se por acaso o ficheiro voltou a redefinir build_catalog_block depois,
+            # aqui “redefine” outra vez (última definição vence).
+            # Se ainda NÃO tens as versões tolerantes no ficheiro, isto não resolve (ver nota abaixo).
+
+            # --- RE-DECLARAÇÃO TOLERANTE (curta) ---
+            import re, sqlite3
+            from typing import Optional, List, Dict
+
+            def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+                ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
+                q_raw = (question or "").strip()
+                rows = []
+
+                # 0) match exato por ref
+                ref_toks = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", q_raw, flags=re.I)
+                try:
+                    with _catalog_conn() as c:
+                        if ref_toks:
+                            q_marks = ",".join("?" * len(ref_toks))
+                            cur = c.execute(
+                                f"""SELECT name,ref,price,url,brand,variant_attrs
+                                      FROM catalog_items
+                                     WHERE namespace=? AND ref IN ({q_marks})
+                                     ORDER BY updated_at DESC LIMIT ?""",
+                                tuple([ns, *ref_toks, limit])
+                            )
+                            rows = [dict(r) for r in cur.fetchall()]
+
+                        # 1) AND (tokens úteis)
+                        if not rows:
+                            terms = _hf_tokens(q_raw)
+                            if terms:
+                                conds = []
+                                like_args = []
+                                for t in terms:
+                                    pat = _hf_like_pat(t)
+                                    conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+                                    like_args.extend([pat, pat, pat])
+                                where = " AND ".join(conds)
+                                cur = c.execute(
+                                    f"""SELECT name,ref,price,url,brand,variant_attrs
+                                          FROM catalog_items
+                                         WHERE namespace=? AND {where}
+                                         ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                                         LIMIT ?""",
+                                    tuple([ns, *like_args, limit])
+                                )
+                                rows = [dict(r) for r in cur.fetchall()]
+
+                        # 2) OR fallback
+                        if not rows:
+                            terms = _hf_tokens(q_raw)
+                            if terms:
+                                conds = []
+                                like_args = []
+                                for t in terms:
+                                    pat = _hf_like_pat(t)
+                                    conds.append("(name LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR ref LIKE ? ESCAPE '\\')")
+                                    like_args.extend([pat, pat, pat])
+                                where = " OR ".join(conds)
+                                cur = c.execute(
+                                    f"""SELECT name,ref,price,url,brand,variant_attrs
+                                          FROM catalog_items
+                                         WHERE namespace=? AND ({where})
+                                         ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                                         LIMIT ?""",
+                                    tuple([ns, *like_args, limit])
+                                )
+                                rows = [dict(r) for r in cur.fetchall()]
+                except Exception as e:
+                    log.warning(f"[catalog/tolerant] search falhou: {e}")
+                    rows = []
+
+                if not rows:
+                    return ""
+
+                lines = ["CATÁLOGO INTERNO (tolerante; usar só estes dados p/ preços/orçamentos):"]
+                seen = set()
+                for r in rows[:limit]:
+                    key = (r.get("ref"), r.get("url"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    name = r.get("name") or "(sem nome)"
+                    ref  = r.get("ref") or "(sem ref)"
+                    price = r.get("price")
+                    price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
+                    url = r.get("url") or "(sem url)"
+                    brand = r.get("brand") or ""
+                    variant = (r.get("variant_attrs") or "").strip()
+                    name_show = f"{name} — Variante: {variant}" if variant else name
+                    lines.append(f"- {name_show} • SKU:{ref} • Preço:{price_txt} • Marca:{brand} • Link:{url}")
+                return "\n".join(lines)
+
+            # rebind no globals()
+            globals()["build_catalog_block"] = build_catalog_block
+
+            log.info("[hotfix] pesquisa tolerante: build_catalog_block forçado (última definição).")
+            return True
+
+        log.info("[hotfix] pesquisa tolerante: não encontrada (_hf_tokens/_hf_like_pat ausentes).")
+        return False
+
+    except Exception as e:
+        log.warning(f"[hotfix] force tolerante falhou: {e}")
+        return False
+
+_hotfix_force_tolerant_search_active()
+# ===================== /HOTFIX FINAL — Forçar pesquisa tolerante ativa =====================
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
