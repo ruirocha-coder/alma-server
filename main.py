@@ -3491,6 +3491,22 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
+# ===================== HOTFIX — URL de variante (NÃO fabricar #sku=) =====================
+def safe_catalog_url(row: dict) -> str | None:
+    """
+    Regra dura:
+    - Se há URL no catálogo, devolver EXACTAMENTE essa URL.
+    - Nunca anexar '#sku=' nem inferir.
+    """
+    try:
+        u = (row or {}).get("url") or None
+        if not u:
+            return None
+        return str(u).strip()
+    except Exception:
+        return None
+# ===================== /HOTFIX — URL de variante =========================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
