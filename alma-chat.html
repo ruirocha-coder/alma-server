@@ -383,104 +383,99 @@ document.getElementById('prompt').addEventListener('focus', () => {
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
-<!-- =========================
-     HOTFIX FINAL (Markdown + Safe Copy)
-     Cola ISTO no fim do ficheiro, mesmo antes de </body>
-     ========================= -->
-
-<!-- 1) Libs: Markdown renderer + sanitização -->
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-
-<style>
-/* 2) Estilos Markdown dentro do balão da Alma (sem mexer no teu tema) */
-.msg.alma .bubble h1, .msg.alma .bubble h2, .msg.alma .bubble h3{
-  margin: 0.4em 0 0.2em;
-  line-height: 1.25;
-}
-.msg.alma .bubble p{ margin: 0.35em 0; }
-.msg.alma .bubble ul, .msg.alma .bubble ol{ margin: 0.35em 0 0.35em 1.2em; }
-.msg.alma .bubble li{ margin: 0.15em 0; }
-.msg.alma .bubble blockquote{
-  margin: 0.5em 0; padding: 0.6em 0.9em;
-  border-left: 3px solid rgba(212,160,23,.7);
-  background: rgba(255,255,255,0.03);
-  border-radius: 10px;
-}
-.msg.alma .bubble code{
-  padding: 0.12em 0.35em; border-radius: 8px;
-  background: rgba(255,255,255,0.06);
-}
-.msg.alma .bubble pre{
-  overflow:auto; padding: 10px 12px; border-radius: 12px;
-  background: rgba(0,0,0,0.35);
-  border: 1px solid rgba(255,255,255,0.06);
-}
-.msg.alma .bubble a{ color: var(--accent); text-decoration: none; }
-.msg.alma .bubble a:hover{ text-decoration: underline; }
-</style>
-
+  <!-- ===================== HOTFIX MARKDOWN + LINKS + COPY (colar no fim) ===================== -->
 <script>
-/* 3) HOTFIX: substituir renderMsgs() por uma versão que:
-      - Renderiza Markdown completo (marked)
-      - Sanitiza HTML (DOMPurify) para evitar XSS
-      - Copia Markdown original sem perder formatação
-*/
 (function(){
-  // Se o teu script original não expõe estas funções/vars no global, isto não terá efeito.
-  // No teu caso, estão no global (function declarations + let sessions/activeId), por isso funciona.
-
-  // Melhor config do marked (GFM + quebras de linha)
-  function ensureMarkedConfig(){
-    if (window.marked && !window.__alma_marked_configured){
-      marked.setOptions({ gfm:true, breaks:true });
-      window.__alma_marked_configured = true;
-    }
+  // 1) escape seguro antes de converter markdown
+  function esc(s){
+    return (s ?? '').toString().replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
   }
 
-  // Função auxiliar segura
-  function safeMarkdownToHtml(md){
-    const raw = window.marked ? marked.parse(md || "") : (md || "");
-    return window.DOMPurify ? DOMPurify.sanitize(raw) : raw;
+  // 2) markdown leve -> HTML
+  function mdLiteToHtml(raw){
+    let t = esc(raw);
+
+    // code blocks ```...```
+    t = t.replace(/```([\s\S]*?)```/g, (m, code) => {
+      return `<pre style="margin:10px 0; padding:12px; border-radius:10px; background:#101014; border:1px solid rgba(255,255,255,0.08); overflow:auto;"><code>${code}</code></pre>`;
+    });
+
+    // headings
+    t = t.replace(/^\s*######\s+(.+)$/gm, '<div style="font-weight:800; font-size:1.00rem; margin:10px 0 6px;">$1</div>');
+    t = t.replace(/^\s*#####\s+(.+)$/gm,  '<div style="font-weight:800; font-size:1.05rem; margin:10px 0 6px;">$1</div>');
+    t = t.replace(/^\s*####\s+(.+)$/gm,   '<div style="font-weight:800; font-size:1.10rem; margin:10px 0 6px;">$1</div>');
+    t = t.replace(/^\s*###\s+(.+)$/gm,    '<div style="font-weight:800; font-size:1.15rem; margin:10px 0 6px;">$1</div>');
+    t = t.replace(/^\s*##\s+(.+)$/gm,     '<div style="font-weight:900; font-size:1.20rem; margin:12px 0 8px;">$1</div>');
+    t = t.replace(/^\s*#\s+(.+)$/gm,      '<div style="font-weight:900; font-size:1.30rem; margin:14px 0 10px;">$1</div>');
+
+    // bold + underline
+    t = t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+    t = t.replace(/__(.+?)__/g, '<u>$1</u>');
+
+    // links [texto](url)
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+    // auto-link URLs (http/https) - evita apanhar URLs já dentro de href
+    t = t.replace(/(^|[\s>])((https?:\/\/)[^\s<]+)(?=$|[\s<])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+
+    // listas simples "- item" ou "* item"
+    // (transforma blocos consecutivos em <ul>)
+    t = t.replace(/(?:^|\n)(?:\s*[-*]\s+.+(?:\n|$))+?/g, (block) => {
+      const lines = block.trim().split('\n').filter(Boolean);
+      const lis = lines.map(l => l.replace(/^\s*[-*]\s+/, '')).map(x => `<li>${x}</li>`).join('');
+      return `\n<ul style="margin:8px 0 8px 18px; padding:0;">${lis}</ul>\n`;
+    });
+
+    // quebras de linha normais
+    t = t.replace(/\n/g, '<br>');
+
+    return t;
   }
 
-  // Guardas simples
-  if (typeof window.renderMsgs !== "function") return;
-  if (typeof window.byId !== "function") return;
+  // 3) copiar HTML + texto (fallback para texto)
+  async function copyRich(rawText){
+    const html = mdLiteToHtml(rawText);
+    try{
+      if (navigator.clipboard && window.ClipboardItem){
+        const item = new ClipboardItem({
+          "text/plain": new Blob([rawText || ""], {type:"text/plain"}),
+          "text/html":  new Blob([html || ""],    {type:"text/html"})
+        });
+        await navigator.clipboard.write([item]);
+        return true;
+      }
+    }catch(e){}
+    // fallback
+    try{ await navigator.clipboard.writeText(rawText || ""); return true; }catch(e){ return false; }
+  }
 
-  // Override da renderMsgs
-  window.renderMsgs = function renderMsgs(){
-    ensureMarkedConfig();
-
-    const s = (window.sessions||[]).find(x=>x.id===window.activeId);
-    const box = window.byId("messages");
-    if(!box) return;
-
+  // 4) override do renderMsgs() (substitui o comportamento anterior)
+  window.renderMsgs = function(){
+    const s = (window.sessions || []).find(x=>x.id===window.activeId);
+    const box = document.getElementById("messages");
     box.innerHTML="";
     if(!s) return;
 
-    (s.msgs||[]).forEach(m=>{
+    (s.msgs || []).forEach(m=>{
       const row=document.createElement("div");
-      row.className="msg "+(m.role||"");
+      row.className="msg "+m.role;
 
       const bubble=document.createElement("div");
       bubble.className="bubble";
-
-      const content = (m.content||"");
+      bubble.innerHTML = mdLiteToHtml(m.content || "");
 
       if(m.role==="alma"){
-        // Markdown -> HTML seguro
-        bubble.innerHTML = safeMarkdownToHtml(content);
-
-        // Botão copiar (Markdown original)
         const copy=document.createElement("span");
         copy.className="copy-btn";
         copy.textContent="copiar";
-        copy.onclick=()=>navigator.clipboard.writeText(content);
+        copy.onclick=async ()=>{
+          const ok = await copyRich(m.content || "");
+          copy.textContent = ok ? "copiado" : "falhou";
+          setTimeout(()=>{ copy.textContent="copiar"; }, 900);
+        };
         bubble.appendChild(copy);
-      }else{
-        // User: texto puro (não interpretar HTML/Markdown)
-        bubble.textContent = content;
       }
 
       row.appendChild(bubble);
@@ -490,15 +485,13 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     box.scrollTop = box.scrollHeight;
   };
 
-  // Re-render imediato para aplicar ao histórico já carregado
-  try { window.renderMsgs(); } catch(e){}
-
+  // 5) re-render imediato (para veres logo)
+  try{ window.renderMsgs(); }catch(e){}
 })();
 </script>
+<!-- ===================== /HOTFIX MARKDOWN + LINKS + COPY ===================== -->
 
-<!-- =========================
-     FIM HOTFIX FINAL
-     ========================= -->
+
 
   
 </body>
