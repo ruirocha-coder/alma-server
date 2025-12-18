@@ -3507,6 +3507,131 @@ def safe_catalog_url(row: dict) -> str | None:
         return None
 # ===================== /HOTFIX — URL de variante =========================================
 
+# ===================== HOTFIX FINAL v2 (persistência + reparar urls + não inventar #sku) =====================
+import os, re, unicodedata, sqlite3
+from urllib.parse import urlparse
+
+def _hotfix_slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s
+
+def _hotfix_is_sku_like(x: str) -> bool:
+    x = (x or "").strip()
+    if not x: return False
+    # ex: ORK.02.03 / LAM0100- / WOU-123 / etc
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\.\-_]{2,}", x) and (("." in x) or ("-" in x)):
+        return True
+    return False
+
+def _hotfix_is_bad_url(u: str) -> bool:
+    u = (u or "").strip()
+    if not u: return True
+    # números puros (ex: 8327) ou algo sku-like sem / e sem esquema
+    if re.fullmatch(r"\d{3,}", u): return True
+    if _hotfix_is_sku_like(u) and ("/" not in u) and (":" not in u): return True
+    # sem "/" e sem "http"
+    if ("/" not in u) and (not u.startswith("http")) and (":" not in u): return True
+    return False
+
+def _hotfix_canon_url(u: str, host: str) -> str:
+    u = (u or "").strip()
+    if not u: return u
+    # já absoluto
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    # relativo estilo "/zeal-laser"
+    if u.startswith("/"):
+        return f"https://{host}{u}"
+    # relativo sem "/" (raro) => prefixa
+    if ("/" not in u) and (":" not in u):
+        return f"https://{host}/{u}"
+    return u
+
+def _hotfix_catalog_persist_and_repair():
+    # 1) DB persistente (sem migração automática)
+    base_dir = os.getenv("CATALOG_DIR", "/data")
+    os.makedirs(base_dir, exist_ok=True)
+
+    db_path = (os.getenv("CATALOG_DB_PATH") or "").strip()
+    if not db_path:
+        db_path = os.path.join(base_dir, "catalog.db")
+
+    os.environ["CATALOG_DB_PATH"] = db_path
+    globals()["CATALOG_DB_PATH"] = db_path
+
+    # 2) garantir _catalog_conn usa sempre o path atual
+    def _catalog_conn_persist():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    globals()["_catalog_conn"] = _catalog_conn_persist
+
+    # 3) garantir schema (se existir o helper)
+    if "_ensure_cols" in globals():
+        with _catalog_conn_persist() as c:
+            globals()["_ensure_cols"](c)
+
+    # 4) corrigir typo do /status (se aplicável no teu main)
+    if "_status_catalog_sqlite" in globals():
+        globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
+
+    # 5) reparar URLs estragadas já gravadas
+    IG_HOST = globals().get("IG_HOST", os.getenv("IG_HOST", "interiorguider.com"))
+    ns_default = globals().get("DEFAULT_NAMESPACE", os.getenv("DEFAULT_NAMESPACE", "boasafra"))
+
+    try:
+        with _catalog_conn_persist() as c:
+            rows = c.execute("""
+                SELECT id, namespace, name, ref, url, source
+                FROM catalog_items
+            """).fetchall()
+
+            fixed = 0
+            for r in rows:
+                rid = r["id"]
+                ns  = (r["namespace"] or "").strip() or ns_default
+                name = (r["name"] or "").strip()
+                ref  = (r["ref"] or "").strip()
+                url  = (r["url"] or "").strip()
+
+                # se url é claramente má, tentar reconstruir pelo nome (slug)
+                if _hotfix_is_bad_url(url) and name:
+                    slug = _hotfix_slugify(name)
+                    if slug:
+                        new_url = _hotfix_canon_url("/" + slug, IG_HOST)
+                        c.execute("UPDATE catalog_items SET url=? WHERE id=?", (new_url, rid))
+                        fixed += 1
+                        continue
+
+                # se url é relativo, canonizar
+                if url and (not url.startswith("http")):
+                    new_url = _hotfix_canon_url(url, IG_HOST)
+                    if new_url != url:
+                        c.execute("UPDATE catalog_items SET url=? WHERE id=?", (new_url, rid))
+                        fixed += 1
+
+            c.commit()
+            print(f"[hotfix] catalog db={db_path} repaired_urls={fixed}")
+    except Exception as e:
+        print(f"[hotfix] repair urls failed: {e}")
+
+    # 6) IMPORTANTE: não inventar links com #sku= no backend
+    #    (se tens lógica que adiciona #sku= nalgum lado, neutraliza aqui)
+    def _hotfix_safe_catalog_url(u: str) -> str:
+        u = (u or "").strip()
+        # não mexer em #sku= se já existir; mas também não criar
+        return u
+    globals()["_safe_catalog_url"] = _hotfix_safe_catalog_url  # para usares no teu gerador de respostas, se aplicável
+
+    return True
+
+_hotfix_catalog_persist_and_repair()
+# ===================== /HOTFIX FINAL v2 =====================================================================
+
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
