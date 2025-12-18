@@ -3096,42 +3096,35 @@ def _canon_ig_url(u: str) -> str:
         return u or ""
 # ======================= /HOTFIX ==============================================================
 
-# ===================== HOTFIX FINAL (persistência catálogo + migração + /status typo) =====================
+# ===================== HOTFIX FINAL (catálogo persistente em /data + /status typo) =====================
 # Objetivo:
-# 1) Garantir que o SQLite do catálogo vive em /data (Railway Volume) e não em /tmp
-# 2) Migrar automaticamente /tmp/catalog.db -> /data/catalog.db (primeira vez)
-# 3) Re-inicializar o catálogo após mudar o path (para não depender da ordem do ficheiro)
-# 4) Corrigir o typo no /status sem editar a função (hack: criar a key com espaço no globals)
+# 1) Forçar o SQLite do catálogo a viver em /data (Railway Volume), respeitando CATALOG_DB_PATH se existir
+# 2) Re-apontar _catalog_conn() para o path final (independente da ordem do ficheiro)
+# 3) Corrigir o typo no /status sem editar a função (hack: criar a key com espaço no globals)
+#
+# Nota: SEM migração /tmp -> /data (assume que /data/catalog.db já é a fonte correta)
 
-import os, shutil
+import os
 
-def _hotfix_catalog_persist_final():
+def _hotfix_catalog_persist_final_nomigrate():
     try:
-        # 1) escolher DB persistente
+        # 1) escolher DB persistente (Railway Volume)
         base_dir = os.getenv("CATALOG_DIR", "/data")
         os.makedirs(base_dir, exist_ok=True)
 
-        persist_db = os.getenv("CATALOG_DB_PATH", "").strip()
+        persist_db = (os.getenv("CATALOG_DB_PATH") or "").strip()
         if not persist_db:
             persist_db = os.path.join(base_dir, "catalog.db")
 
-        # 2) se ainda estamos em /tmp, migrar (só se o persistente ainda não existir)
-        tmp_db = "/tmp/catalog.db"
-        if (persist_db.startswith("/tmp/")):
+        # se alguém passar /tmp/... por engano, reencaminhar para /data/...
+        if persist_db.startswith("/tmp/"):
             persist_db = os.path.join(base_dir, os.path.basename(persist_db))
 
-        if (not os.path.exists(persist_db)) and os.path.exists(tmp_db) and os.path.getsize(tmp_db) > 0:
-            try:
-                shutil.copy2(tmp_db, persist_db)
-                print(f"[hotfix] MIGRATE {tmp_db} -> {persist_db}")
-            except Exception as e:
-                print(f"[hotfix] migrate failed: {e}")
-
-        # 3) forçar env + globals para o novo caminho
+        # 2) forçar env + globals para o novo caminho
         os.environ["CATALOG_DB_PATH"] = persist_db
         globals()["CATALOG_DB_PATH"] = persist_db
 
-        # 4) redefinir _catalog_conn para usar o novo path (mesmo que já existisse acima)
+        # 3) redefinir _catalog_conn para usar o novo path (mesmo que já existisse acima)
         import sqlite3
         def _catalog_conn_persist():
             conn = sqlite3.connect(persist_db)
@@ -3139,14 +3132,14 @@ def _hotfix_catalog_persist_final():
             return conn
         globals()["_catalog_conn"] = _catalog_conn_persist
 
-        # 5) garantir schema/índices (reusa _ensure_cols/_catalog_init se existirem)
+        # 4) garantir schema/índices (reusa _ensure_cols se existir)
         if "_ensure_cols" in globals():
             with _catalog_conn_persist() as conn:
                 globals()["_ensure_cols"](conn)
 
-        # 6) corrigir o typo do /status:
-        #    a tua rota faz: if ' _status_catalog_sqlite' in globals()
-        #    então criamos essa key com espaço, apontando para a função real
+        # 5) corrigir o typo do /status:
+        #    se a tua rota fizer: if ' _status_catalog_sqlite' in globals()
+        #    criamos essa key com espaço, apontando para a função real
         if "_status_catalog_sqlite" in globals():
             globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
 
@@ -3156,7 +3149,8 @@ def _hotfix_catalog_persist_final():
         print(f"[hotfix] catalog persist FAILED: {e}")
         return False
 
-_hotfix_catalog_persist_final()
+_hotfix_catalog_persist_final_nomigrate()
+
 # ===================== /HOTFIX FINAL =====================================================================
 
 # ===================== HOTFIX FINAL — Forçar pesquisa tolerante ativa =====================
