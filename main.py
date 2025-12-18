@@ -2421,31 +2421,73 @@ def _upsert_catalog_row(ns: Optional[str],
                  ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs, variant_key))
 
 
-
 @app.post("/catalog/import-csv")
-async def catalog_import_csv(file: UploadFile = File(...),
-                             namespace: str = Form(DEFAULT_NAMESPACE)):
+async def catalog_import_csv(
+    file: UploadFile = File(...),
+    namespace: str = Form(DEFAULT_NAMESPACE)
+):
     """
     Importa CSV (BigCommerce).
-    - Ignora 'Rule'
-    - 'Product' = base  | 'SKU' = variante (url = base + "#sku=<ref>")
-    - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (só no base)
-    - variant_attrs: VALORES puros (ex.: 'Soft Indigo, Tecido Areia 1m')
-    - variant_key: 'soft indigo|tecido areia 1m' (para matching determinístico)
-    - URLs canonizadas para IG
+
+    HOTFIX:
+    1) Limpeza prévia: remove rows do catálogo do mesmo namespace com source='csv'
+       (evita duplicados ao reimportar).
+    2) URL base: tenta primeiro campos de link/slug (ex.: /zeal-laser), só depois cai para Product URL.
+    3) Variantes (SKU): gravam SEMPRE o MESMO url do produto base (sem #sku e sem slug de variante).
     """
+
+    # ----------------- limpeza prévia (só source='csv') -----------------
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        with _catalog_conn() as c:
+            c.execute("DELETE FROM catalog_items WHERE namespace=? AND source='csv'", (ns,))
+            c.commit()
+    except Exception as e:
+        log.exception("[catalog/import-csv] limpeza prévia falhou")
+        # não aborta o import — mas regista no output
+        # (se quiseres abortar, faz raise)
+
+    # ----------------- leitura CSV -----------------
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
     reader = csv.DictReader(sio)
 
     imported, failed, skipped = 0, 0, 0
     items_out = []
-    current_product = None  # memoriza o último produto base
+    current_product = None  # memoriza o último produto base (para SKUs seguintes)
+
+    def _pick_base_url(row: dict) -> str:
+        # 1) tenta primeiro campos de link/slug comuns (inclui relativo "/slug")
+        candidates = [
+            row.get("Link"),
+            row.get("Product Custom URL"),
+            row.get("Custom URL"),
+            row.get("URL"),
+            row.get("Product URL"),  # fallback
+        ]
+        raw = ""
+        for c in candidates:
+            c = (c or "").strip()
+            if c:
+                raw = c
+                break
+
+        if not raw:
+            return ""
+
+        # relativo -> absoluto IG
+        if raw.startswith("/"):
+            raw = f"https://{IG_HOST}{raw}"
+
+        # canoniza
+        return _canon_ig_url(raw) or raw
 
     for row in reader:
         try:
-            row_type     = (row.get("Item Type") or "").strip()
-            if row_type.lower() == "rule":
+            row_type_raw = (row.get("Item Type") or "").strip()
+            row_type = row_type_raw.lower()
+
+            if row_type == "rule":
                 skipped += 1
                 items_out.append({"ok": True, "type": "rule", "skipped": True})
                 continue
@@ -2456,8 +2498,10 @@ async def catalog_import_csv(file: UploadFile = File(...),
             price        = _parse_price(row.get("Price") or "")
             brand        = (row.get("Brand Name") or "").strip() or None
             summary_raw  = (row.get("Product Description") or "").strip()
-            base_url     = _canon_ig_url((row.get("Product URL") or "").strip())
             availability = (row.get("Product Availability") or "").strip()
+
+            # URL base (corrigido)
+            base_url = _pick_base_url(row)
 
             summary_clean = _html_to_text(summary_raw)
 
@@ -2467,8 +2511,19 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     s1 = (s1 + ("\n" if s1 else "") + f"Disponibilidade: {availability}").strip()
                 return s1
 
-            # ----- produto base -----
-            if row_type == "Product":
+            # ----------------- produto base -----------------
+            if row_type == "product":
+                if not base_url:
+                    failed += 1
+                    items_out.append({
+                        "ok": False,
+                        "type": "product",
+                        "error": "URL base vazio (não encontrei Link/Custom URL/Product URL no CSV).",
+                        "name": name_raw
+                    })
+                    current_product = None
+                    continue
+
                 current_product = {
                     "name": name_raw,
                     "summary": _with_availability_base(summary_clean),
@@ -2477,8 +2532,9 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     "brand": brand,
                     "url": base_url,
                 }
+
                 _upsert_catalog_row(
-                    ns=namespace,
+                    ns=ns,
                     name=current_product["name"],
                     summary=current_product["summary"],
                     url=current_product["url"],
@@ -2498,8 +2554,8 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 imported += 1
                 continue
 
-            # ----- variante (SKU) -----
-            elif row_type == "SKU" and current_product:
+            # ----------------- variante (SKU) -----------------
+            elif row_type == "sku" and current_product:
                 variant_values = _variant_to_values_only(name_raw)  # "Soft Indigo, Tecido Areia 1m"
                 vkey = values_to_variant_key(variant_values)        # "soft indigo|tecido areia 1m"
 
@@ -2508,10 +2564,12 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {variant_values}").strip()
 
                 price_v = price if price is not None else current_product["price"]
-                url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
+
+                # REGRA: variantes usam SEMPRE o url base do produto (sem #sku e sem slug de variante)
+                url_variant = current_product["url"]
 
                 _upsert_catalog_row(
-                    ns=namespace,
+                    ns=ns,
                     name=f"{current_product['name']} — {variant_values}" if variant_values else current_product["name"],
                     summary=summary_v,
                     url=url_variant,
@@ -2538,10 +2596,10 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 imported += 1
                 continue
 
-            # ----- outros tipos (ignorar) -----
+            # ----------------- outros tipos -----------------
             else:
                 skipped += 1
-                items_out.append({"ok": True, "type": (row_type or "unknown").lower(), "skipped": True})
+                items_out.append({"ok": True, "type": (row_type or "unknown"), "skipped": True})
 
         except Exception as e:
             failed += 1
@@ -2549,13 +2607,13 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
     return {
         "ok": True,
-        "namespace": namespace,
+        "namespace": ns,
         "imported": imported,
         "failed": failed,
         "skipped": skipped,
         "items": items_out,
+        "note": "Foi feita limpeza prévia de source='csv' neste namespace para evitar duplicados."
     }
-
 # ---------------------------------------------------------------------------------------
 # Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
 # ---------------------------------------------------------------------------------------
