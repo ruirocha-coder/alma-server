@@ -3490,188 +3490,105 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
+# ===================== HOTFIX V5 (URL slug fix + não apagar URLs) =====================
+import os, re, sqlite3, time
 
-# ===================== HOTFIX V4 (URLs corretos + dedupe + não inventar variantes no link) =====================
-# Cola no fim do main.py (substitui o hotfix anterior)
-
-import re, os, sqlite3, time
-
-def _hotfix_v4_catalog_url_and_dedupe():
+def _hotfix_v5_urls():
     try:
         db_path = globals().get("CATALOG_DB_PATH") or os.getenv("CATALOG_DB_PATH") or "/data/catalog.db"
         globals()["CATALOG_DB_PATH"] = db_path
         os.environ["CATALOG_DB_PATH"] = db_path
 
-        # garantir que _catalog_conn usa o path certo
-        def _catalog_conn_v4():
+        def _catalog_conn_v5():
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             return conn
-        globals()["_catalog_conn"] = _catalog_conn_v4
+        globals()["_catalog_conn"] = _catalog_conn_v5
 
         IG_HOST = globals().get("IG_HOST", "interiorguider.com")
         BASE_IG = f"https://{IG_HOST}"
 
-        # ------------- Normalização de URL (NÃO inventar) -------------
         url_re = re.compile(r"(https?://[^\s]+)", re.I)
+        slug_re = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$", re.I)  # ex: zeal-laser
 
         def norm_url(u: str) -> str:
             if not u:
                 return ""
             u = str(u).strip()
 
-            # caso típico do teu CSV: "/zeal-laser" -> "https://interiorguider.com/zeal-laser"
-            if u.startswith("/"):
-                u = BASE_IG + u
-
-            # se alguém colou descrição no campo url: "https://.../zeal-laser Soft Indigo"
+            # Se vier “com lixo” (ex.: "https://.../zeal-laser Soft Indigo") guarda só o URL
             m = url_re.search(u)
             if m:
                 u = m.group(1).strip()
 
-            # remove qualquer "variação" colada no fim por separadores comuns
-            # (mantém só o URL)
-            u = u.split(" | ")[0].split(" — ")[0].split(" - ")[0].strip()
+            # Se vier relativo "/zeal-laser" -> absoluto
+            if u.startswith("/"):
+                return BASE_IG + u
 
-            # remove #sku= (porque no teu caso não existe no site)
+            # Se vier slug "zeal-laser" -> tratar como path relativo (ISTO era o teu caso)
+            if slug_re.match(u) and "http" not in u.lower():
+                return BASE_IG + "/" + u.lstrip("/")
+
+            # Se vier "interiorguider.com/zeal-laser" sem esquema
+            if u.lower().startswith(IG_HOST.lower()+"/"):
+                return "https://" + u
+
+            # Remove #sku= (no teu site não existe)
             u = re.sub(r"#sku=[^#\s]+", "", u, flags=re.I).strip()
-            # remove # no fim
             u = re.sub(r"#\s*$", "", u).strip()
 
             return u
 
-        def looks_like_sku(s: str) -> bool:
-            if not s:
-                return False
-            s = str(s).strip()
-            # heurística: muitos SKUs têm pontos/maiúsculas/números e não têm "/" nem "http"
-            if "http" in s.lower() or "/" in s:
-                return False
-            return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9\.\-_]{2,}$", s))
-
-        # ------------- Passo A: corrigir URLs “obviamente errados” -------------
-        with _catalog_conn_v4() as c:
+        # Retro-fix: normalizar URLs existentes + reconstruir URLs vazios se houver slug guardado noutro campo
+        fixed = 0
+        with _catalog_conn_v5() as c:
             rows = c.execute("""
-                SELECT id, namespace, ref, url
+                SELECT id, url, name
                 FROM catalog_items
                 ORDER BY updated_at DESC
             """).fetchall()
 
-            fixed = 0
             for r in rows:
                 rid = int(r["id"])
-                ns  = (r["namespace"] or "").strip()
-                ref = (r["ref"] or "").strip()
                 url = (r["url"] or "").strip()
+                name = (r["name"] or "").strip()
 
                 new_url = norm_url(url)
 
-                # se o campo url tiver um SKU (ou vazio), NÃO o substituímos por “inventado”.
-                # Mantemos vazio se não houver URL real.
-                if looks_like_sku(new_url):
-                    new_url = ""
+                # Se URL ficou vazio, tenta reconstruir a partir de um slug no próprio url antigo (já não existe),
+                # então aqui só repara casos em que o url atual é mesmo slug (ou relativo) — já coberto acima.
+                # NÃO inventamos a partir do nome (para evitar erros).
 
                 if new_url != url:
                     c.execute("UPDATE catalog_items SET url=?, updated_at=? WHERE id=?",
                               (new_url, int(time.time()), rid))
                     fixed += 1
 
-        # ------------- Passo B: dedupe por (namespace, ref) quando ref existe -------------
-        with _catalog_conn_v4() as c:
-            # manter o mais recente por updated_at (ou maior id como fallback)
-            dups = c.execute("""
-                SELECT namespace, ref, COUNT(*) as n
-                FROM catalog_items
-                WHERE ref IS NOT NULL AND TRIM(ref) != ''
-                GROUP BY namespace, ref
-                HAVING n > 1
-            """).fetchall()
-
-            removed = 0
-            for d in dups:
-                ns  = (d["namespace"] or "").strip()
-                ref = (d["ref"] or "").strip()
-
-                keep = c.execute("""
-                    SELECT id FROM catalog_items
-                    WHERE namespace=? AND ref=?
-                    ORDER BY COALESCE(updated_at,0) DESC, id DESC
-                    LIMIT 1
-                """, (ns, ref)).fetchone()
-
-                if not keep:
-                    continue
-                keep_id = int(keep["id"])
-
-                # apagar os outros
-                c.execute("""
-                    DELETE FROM catalog_items
-                    WHERE namespace=? AND ref=? AND id != ?
-                """, (ns, ref, keep_id))
-                removed += c.total_changes  # inclui deletes
-
-        # ------------- Passo C: dedupe por (namespace, url) quando url existe -------------
-        with _catalog_conn_v4() as c:
-            dups2 = c.execute("""
-                SELECT namespace, url, COUNT(*) as n
-                FROM catalog_items
-                WHERE url IS NOT NULL AND TRIM(url) != ''
-                GROUP BY namespace, url
-                HAVING n > 1
-            """).fetchall()
-
-            removed2 = 0
-            for d in dups2:
-                ns  = (d["namespace"] or "").strip()
-                url = (d["url"] or "").strip()
-
-                keep = c.execute("""
-                    SELECT id FROM catalog_items
-                    WHERE namespace=? AND url=?
-                    ORDER BY COALESCE(updated_at,0) DESC, id DESC
-                    LIMIT 1
-                """, (ns, url)).fetchone()
-                if not keep:
-                    continue
-                keep_id = int(keep["id"])
-
-                c.execute("""
-                    DELETE FROM catalog_items
-                    WHERE namespace=? AND url=? AND id != ?
-                """, (ns, url, keep_id))
-                removed2 += c.total_changes
-
-        # ------------- Passo D: travão — neutralizar “URL de variante” (não meter variação nem #sku) -------------
-        # Se tens alguma função canónica que estava a mexer nos links, neutralizamos aqui.
-        # A ideia: sempre que o backend produzir link de resposta, usar url “pura” do item.
+        # Fix no resolve-price: garantir que devolve url normalizada (sem acrescentar variante)
         if "catalog_resolve_price" in globals():
             orig = globals()["catalog_resolve_price"]
-
-            async def catalog_resolve_price_v4(request):
+            async def catalog_resolve_price_v5(request):
                 out = await orig(request)
                 try:
                     if isinstance(out, dict) and out.get("match") and isinstance(out["match"], dict):
-                        u = out["match"].get("url") or ""
-                        out["match"]["url"] = norm_url(u)
+                        out["match"]["url"] = norm_url(out["match"].get("url") or "")
                 except Exception:
                     pass
                 return out
+            globals()["catalog_resolve_price"] = catalog_resolve_price_v5
 
-            globals()["catalog_resolve_price"] = catalog_resolve_price_v4
-
-        # ------------- Passo E: typo no /status (se existir no teu main) -------------
+        # typo /status (se existir)
         if "_status_catalog_sqlite" in globals():
             globals()[" _status_catalog_sqlite"] = globals()["_status_catalog_sqlite"]
 
-        print(f"[hotfix v4] db={db_path} url_fixed={fixed} dedupe_ref_done={len(dups)} dedupe_url_done={len(dups2)}")
+        print(f"[hotfix v5] db={db_path} url_fixed={fixed}")
         return True
-
     except Exception as e:
-        print(f"[hotfix v4] FAILED: {e}")
+        print(f"[hotfix v5] FAILED: {e}")
         return False
 
-_hotfix_v4_catalog_url_and_dedupe()
-# ===================== /HOTFIX V4 =======================================================================
+_hotfix_v5_urls()
+# ===================== /HOTFIX V5 =======================================================================
 
 
 
