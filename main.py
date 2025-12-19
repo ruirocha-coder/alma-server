@@ -3647,6 +3647,68 @@ def _hotfix_clear_namespace_before_import_csv():
 _hotfix_clear_namespace_before_import_csv()
 # ===================== /HOTFIX ============================================================
 
+# ===================== HOTFIX — missing _upsert_catalog_row_by_ref =====================
+# Objetivo: impedir NameError no import CSV (sem mudar schema nem lógica).
+# Isto só cria a função em falta e encaminha para _upsert_catalog_row.
+
+def _hotfix_define_upsert_by_ref():
+    try:
+        if "_upsert_catalog_row_by_ref" in globals() and callable(globals()["_upsert_catalog_row_by_ref"]):
+            print("[hotfix] _upsert_catalog_row_by_ref já existe — skip")
+            return True
+
+        if "_upsert_catalog_row" not in globals() or not callable(globals()["_upsert_catalog_row"]):
+            print("[hotfix] _upsert_catalog_row não existe — não consigo criar alias")
+            return False
+
+        def _upsert_catalog_row_by_ref(
+            ns,
+            name=None,
+            summary=None,
+            url=None,
+            source="manual",
+            ref=None,
+            price=None,
+            currency=None,
+            iva_pct=None,
+            brand=None,
+            dimensions=None,
+            material=None,
+            image_url=None,
+            variant_attrs=None,
+            variant_key=None,
+            **kwargs
+        ):
+            # Mantém comportamento anterior: delega tudo no upsert existente.
+            return globals()["_upsert_catalog_row"](
+                ns=ns,
+                name=name,
+                summary=summary,
+                url=url,
+                source=source,
+                ref=ref,
+                price=price,
+                currency=currency,
+                iva_pct=iva_pct,
+                brand=brand,
+                dimensions=dimensions,
+                material=material,
+                image_url=image_url,
+                variant_attrs=variant_attrs,
+                variant_key=variant_key
+            )
+
+        globals()["_upsert_catalog_row_by_ref"] = _upsert_catalog_row_by_ref
+        print("[hotfix] OK: definido _upsert_catalog_row_by_ref -> _upsert_catalog_row")
+        return True
+
+    except Exception as e:
+        print(f"[hotfix] FAILED define _upsert_catalog_row_by_ref: {e}")
+        return False
+
+_hotfix_define_upsert_by_ref()
+# ===================== /HOTFIX =========================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
