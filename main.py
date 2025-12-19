@@ -3492,58 +3492,113 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
-# ===================== HOTFIX MIN v3 — FORÇAR URL BASE NO CATÁLOGO (nunca guardar #sku) =====================
-def _hotfix_force_base_url_on_upsert():
+# ===================== HOTFIX v4 — Display URL base (não mexe na BD) =====================
+def _hotfix_display_base_url_everywhere():
     try:
-        # precisa do upsert original
-        _orig = globals().get("_upsert_catalog_row")
-        if not callable(_orig):
-            print("[hotfix] _upsert_catalog_row não encontrado — abort")
-            return False
-
-        def _strip_fragment(u: str) -> str:
+        def _base_url(u: str) -> str:
             u = (u or "").strip()
             if not u:
                 return u
-            # remove tudo após '#'
             return u.split("#", 1)[0]
 
-        def _upsert_catalog_row_forced_base_url(*args, **kwargs):
-            # kwargs pode vir como ns=..., url=...
-            if "url" in kwargs:
-                kwargs["url"] = _strip_fragment(kwargs["url"])
-            # alguns chamadores podem passar url por posição (depende da tua assinatura)
-            # como não sabemos, mantemos só o caso kwargs (é o teu caso no import)
-            return _orig(*args, **kwargs)
+        # ----------------- (A) Patch do texto que o LLM vê (chat) -----------------
+        # Se existir build_catalog_block, reempacota para mostrar Link sem #sku
+        if "build_catalog_block" in globals() and callable(globals()["build_catalog_block"]):
+            _orig_build = globals()["build_catalog_block"]
 
-        # 1) rebind do upsert (ponto único)
-        globals()["_upsert_catalog_row"] = _upsert_catalog_row_forced_base_url
+            def build_catalog_block(question: str, namespace=None, limit: int = 30) -> str:
+                txt = _orig_build(question, namespace=namespace, limit=limit)
+                if not txt:
+                    return txt
+                # substituição simples linha a linha: "Link: <url>" -> base
+                out_lines = []
+                for line in txt.splitlines():
+                    if "Link:" in line:
+                        # tenta apanhar o último token como url
+                        parts = line.rsplit("Link:", 1)
+                        if len(parts) == 2:
+                            left, right = parts[0], parts[1].strip()
+                            out_lines.append(left + "Link: " + _base_url(right))
+                            continue
+                    out_lines.append(line)
+                return "\n".join(out_lines)
 
-        # 2) limpeza imediata do lixo já existente na BD (todas as rows com #...)
-        try:
-            with _catalog_conn() as c:
-                rows = c.execute("SELECT id, url FROM catalog_items WHERE url LIKE '%#%'").fetchall()
-                for r in rows:
-                    u2 = _strip_fragment(r["url"])
-                    if u2 and u2 != r["url"]:
-                        c.execute(
-                            "UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?",
-                            (u2, r["id"])
-                        )
-                c.commit()
-            print(f"[hotfix] cleanup: removidos fragments em {len(rows)} registos")
-        except Exception as e:
-            print(f"[hotfix] cleanup falhou: {e}")
+            globals()["build_catalog_block"] = build_catalog_block
 
-        print("[hotfix] OK: catálogo agora guarda sempre URL base (sem #sku)")
+        # Variantes block: idem
+        if "build_catalog_variants_block" in globals() and callable(globals()["build_catalog_variants_block"]):
+            _orig_var = globals()["build_catalog_variants_block"]
+
+            def build_catalog_variants_block(question: str, namespace=None) -> str:
+                txt = _orig_var(question, namespace=namespace)
+                if not txt:
+                    return txt
+                out_lines = []
+                for line in txt.splitlines():
+                    # linhas do tipo "... | <url>"
+                    if " | " in line and ("http://" in line or "https://" in line):
+                        segs = line.split(" | ")
+                        segs[-1] = _base_url(segs[-1].strip())
+                        out_lines.append(" | ".join(segs))
+                    else:
+                        out_lines.append(line)
+                return "\n".join(out_lines)
+
+            globals()["build_catalog_variants_block"] = build_catalog_variants_block
+
+        # ----------------- (B) Patch do /catalog/list e /catalog/get (UI consola) -----------------
+        # Troca o endpoint da rota para devolver url já sem #sku (sem tocar na BD)
+        def _wrap_route(path: str, methods: set, wrapper_fn):
+            replaced = False
+            for r in getattr(app.router, "routes", []):
+                if getattr(r, "path", None) == path:
+                    m = set(getattr(r, "methods", []) or [])
+                    if m & methods:
+                        r.endpoint = wrapper_fn
+                        if hasattr(r, "dependant") and hasattr(r.dependant, "call"):
+                            r.dependant.call = wrapper_fn
+                        replaced = True
+            return replaced
+
+        # wrap catalog_list
+        if "catalog_list" in globals() and callable(globals()["catalog_list"]):
+            _orig_list = globals()["catalog_list"]
+
+            def _catalog_list_wrapped(*args, **kwargs):
+                res = _orig_list(*args, **kwargs)
+                if isinstance(res, dict) and res.get("ok") and isinstance(res.get("items"), list):
+                    for it in res["items"]:
+                        if isinstance(it, dict) and "url" in it:
+                            it["url"] = _base_url(it.get("url"))
+                    return res
+                return res
+
+            globals()["catalog_list"] = _catalog_list_wrapped
+            _wrap_route("/catalog/list", {"GET"}, _catalog_list_wrapped)
+
+        # wrap catalog_get
+        if "catalog_get" in globals() and callable(globals()["catalog_get"]):
+            _orig_get = globals()["catalog_get"]
+
+            def _catalog_get_wrapped(*args, **kwargs):
+                res = _orig_get(*args, **kwargs)
+                if isinstance(res, dict) and res.get("ok") and isinstance(res.get("item"), dict):
+                    if "url" in res["item"]:
+                        res["item"]["url"] = _base_url(res["item"].get("url"))
+                return res
+
+            globals()["catalog_get"] = _catalog_get_wrapped
+            _wrap_route("/catalog/get", {"GET"}, _catalog_get_wrapped)
+
+        print("[hotfix v4] OK: BD mantém URLs únicas; chat + /catalog/list mostram URL base (sem #sku).")
         return True
 
     except Exception as e:
-        print(f"[hotfix] FAILED: {e}")
+        print(f"[hotfix v4] FAILED: {e}")
         return False
 
-_hotfix_force_base_url_on_upsert()
-# ===================== /HOTFIX =====================================================================
+_hotfix_display_base_url_everywhere()
+# ===================== /HOTFIX v4 ========================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
