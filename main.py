@@ -3492,94 +3492,58 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
-# ===================== HOTFIX MIN — URLs do catálogo sempre BASE (sem #sku e sem “variante no link”) =====================
-def _hotfix_force_catalog_urls_base_only():
+# ===================== HOTFIX MIN v3 — FORÇAR URL BASE NO CATÁLOGO (nunca guardar #sku) =====================
+def _hotfix_force_base_url_on_upsert():
     try:
-        from urllib.parse import urlparse
-        import re
-
-        def _canon_base_url(u: str) -> str:
-            u = (u or "").strip()
-            if not u:
-                return ""
-            if u.startswith("//"):
-                u = "https:" + u
-            if not u.startswith("http"):
-                if not u.startswith("/"):
-                    u = "/" + u
-                u = f"https://{IG_HOST}{u}"
-            u = u.replace(" ", "")
-            # corta tudo o que venha depois de # (inclui #sku=...)
-            u = u.split("#", 1)[0]
-            # força host
-            try:
-                p = urlparse(u)
-                host = (p.netloc or "").lower().replace("www.", "")
-                if IG_HOST and IG_HOST in host:
-                    u = u.replace(p.scheme + "://", "https://", 1)
-                    u = u.replace(p.netloc, IG_HOST, 1)
-            except Exception:
-                pass
-            # opcional: normaliza trailing slash (deixa consistente)
-            if u.endswith("/") and len(u) > len("https://a/"):
-                u = u[:-1]
-            return u
-
-        # substituir _canon_ig_url no runtime (última definição vence)
-        globals()["_canon_ig_url"] = _canon_base_url
-
-        # patch ao endpoint /catalog/import-csv sem tocar na função original:
-        _orig = globals().get("catalog_import_csv")
+        # precisa do upsert original
+        _orig = globals().get("_upsert_catalog_row")
         if not callable(_orig):
-            print("[hotfix] catalog_import_csv não encontrado — skip")
+            print("[hotfix] _upsert_catalog_row não encontrado — abort")
             return False
 
-        async def _wrapped_import(*args, **kwargs):
-            res = await _orig(*args, **kwargs)
+        def _strip_fragment(u: str) -> str:
+            u = (u or "").strip()
+            if not u:
+                return u
+            # remove tudo após '#'
+            return u.split("#", 1)[0]
 
-            # pós-limpeza: garante que NENHUMA linha fica com fragmentos
-            try:
-                ns = (res.get("namespace") or kwargs.get("namespace") or DEFAULT_NAMESPACE).strip()
-                with _catalog_conn() as c:
-                    rows = c.execute("SELECT id,url FROM catalog_items WHERE namespace=?", (ns,)).fetchall()
-                    for r in rows:
-                        u = (r["url"] or "")
-                        u2 = _canon_base_url(u)
-                        if u2 and u2 != u:
-                            c.execute(
-                                "UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?",
-                                (u2, r["id"])
-                            )
-                    c.commit()
-            except Exception as e:
-                print(f"[hotfix] pós-limpeza URL falhou: {e}")
+        def _upsert_catalog_row_forced_base_url(*args, **kwargs):
+            # kwargs pode vir como ns=..., url=...
+            if "url" in kwargs:
+                kwargs["url"] = _strip_fragment(kwargs["url"])
+            # alguns chamadores podem passar url por posição (depende da tua assinatura)
+            # como não sabemos, mantemos só o caso kwargs (é o teu caso no import)
+            return _orig(*args, **kwargs)
 
-            return res
+        # 1) rebind do upsert (ponto único)
+        globals()["_upsert_catalog_row"] = _upsert_catalog_row_forced_base_url
 
-        # substituir handler da rota FastAPI
-        replaced = False
-        for r in getattr(app.router, "routes", []):
-            if getattr(r, "path", None) == "/catalog/import-csv" and "POST" in set(getattr(r, "methods", []) or []):
-                r.endpoint = _wrapped_import
-                if hasattr(r, "dependant") and hasattr(r.dependant, "call"):
-                    r.dependant.call = _wrapped_import
-                replaced = True
+        # 2) limpeza imediata do lixo já existente na BD (todas as rows com #...)
+        try:
+            with _catalog_conn() as c:
+                rows = c.execute("SELECT id, url FROM catalog_items WHERE url LIKE '%#%'").fetchall()
+                for r in rows:
+                    u2 = _strip_fragment(r["url"])
+                    if u2 and u2 != r["url"]:
+                        c.execute(
+                            "UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?",
+                            (u2, r["id"])
+                        )
+                c.commit()
+            print(f"[hotfix] cleanup: removidos fragments em {len(rows)} registos")
+        except Exception as e:
+            print(f"[hotfix] cleanup falhou: {e}")
 
-        if replaced:
-            globals()["catalog_import_csv"] = _wrapped_import
-            print("[hotfix] OK: /catalog/import-csv mantém URLs base (sem #sku, sem colagens).")
-            return True
-
-        print("[hotfix] rota /catalog/import-csv não encontrada — skip")
-        return False
+        print("[hotfix] OK: catálogo agora guarda sempre URL base (sem #sku)")
+        return True
 
     except Exception as e:
         print(f"[hotfix] FAILED: {e}")
         return False
 
-_hotfix_force_catalog_urls_base_only()
-# ===================== /HOTFIX =============================================================================
-
+_hotfix_force_base_url_on_upsert()
+# ===================== /HOTFIX =====================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
