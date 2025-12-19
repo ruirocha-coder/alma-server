@@ -2420,17 +2420,18 @@ def _upsert_catalog_row(ns: Optional[str],
                 (ns, name, summary, url, source, _now(), _now(),
                  ref, price, currency, iva_pct, brand, dimensions, material, image_url, variant_attrs, variant_key))
 
+
 @app.post("/catalog/import-csv")
 async def catalog_import_csv(file: UploadFile = File(...),
                              namespace: str = Form(DEFAULT_NAMESPACE)):
     """
-    Importa CSV (BigCommerce) — versão conservadora:
+    Importa CSV (BigCommerce).
     - Ignora 'Rule'
+    - 'Product' = base  | 'SKU' = variante (url = base + "#sku=<ref>")
     - summary: HTML -> texto limpo; injeta 'Disponibilidade: ...' (só no base)
     - variant_attrs: VALORES puros (ex.: 'Soft Indigo, Tecido Areia 1m')
-    - variant_key: 'soft indigo|tecido areia 1m'
-    - URL: fica SEMPRE o base_url (não anexar #sku nem descrição da variante)
-    - CHAVE: ref (SKU) obrigatório (se faltar -> failed)
+    - variant_key: 'soft indigo|tecido areia 1m' (para matching determinístico)
+    - URLs canonizadas para IG
     """
     text = (await file.read()).decode("utf-8", errors="ignore")
     sio = StringIO(text, newline="")
@@ -2442,7 +2443,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
 
     for row in reader:
         try:
-            row_type = (row.get("Item Type") or "").strip()
+            row_type     = (row.get("Item Type") or "").strip()
             if row_type.lower() == "rule":
                 skipped += 1
                 items_out.append({"ok": True, "type": "rule", "skipped": True})
@@ -2457,12 +2458,6 @@ async def catalog_import_csv(file: UploadFile = File(...),
             base_url     = _canon_ig_url((row.get("Product URL") or "").strip())
             availability = (row.get("Product Availability") or "").strip()
 
-            # ref é chave — se faltar, falha (útil para corrigires no BC/DB)
-            if not ref:
-                failed += 1
-                items_out.append({"ok": False, "error": "Falta ref/SKU (chave obrigatória)", "row_type": row_type, "name": name_raw})
-                continue
-
             summary_clean = _html_to_text(summary_raw)
 
             def _with_availability_base(s: str) -> str:
@@ -2476,17 +2471,16 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 current_product = {
                     "name": name_raw,
                     "summary": _with_availability_base(summary_clean),
-                    "ref": ref,
+                    "ref": ref or None,
                     "price": price,
                     "brand": brand,
                     "url": base_url,
                 }
-
-                _upsert_catalog_row_by_ref(
+                _upsert_catalog_row(
                     ns=namespace,
                     name=current_product["name"],
                     summary=current_product["summary"],
-                    url=current_product["url"],   # <-- não inventar
+                    url=current_product["url"],
                     source="csv",
                     ref=current_product["ref"],
                     price=current_product["price"],
@@ -2499,8 +2493,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     variant_attrs=None,
                     variant_key=None
                 )
-
-                items_out.append({"ok": True, "type": "product", "name": name_raw, "ref": ref, "url": base_url})
+                items_out.append({"ok": True, "type": "product", "name": name_raw, "url": base_url})
                 imported += 1
                 continue
 
@@ -2514,17 +2507,15 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     summary_v = (summary_v + ("\n" if summary_v else "") + f"Variante: {variant_values}").strip()
 
                 price_v = price if price is not None else current_product["price"]
+                url_variant = f"{current_product['url']}#sku={ref}" if ref else current_product["url"]
 
-                # URL para variantes: fica igual ao base_url (não #sku, não descrição)
-                url_variant = current_product["url"]
-
-                _upsert_catalog_row_by_ref(
+                _upsert_catalog_row(
                     ns=namespace,
                     name=f"{current_product['name']} — {variant_values}" if variant_values else current_product["name"],
                     summary=summary_v,
                     url=url_variant,
                     source="csv",
-                    ref=ref,                 # <-- chave única (SKU)
+                    ref=ref or None,
                     price=price_v,
                     currency=None,
                     iva_pct=None,
@@ -2535,7 +2526,6 @@ async def catalog_import_csv(file: UploadFile = File(...),
                     variant_attrs=(variant_values or None),
                     variant_key=(vkey or None)
                 )
-
                 items_out.append({
                     "ok": True,
                     "type": "variant",
@@ -2547,6 +2537,7 @@ async def catalog_import_csv(file: UploadFile = File(...),
                 imported += 1
                 continue
 
+            # ----- outros tipos (ignorar) -----
             else:
                 skipped += 1
                 items_out.append({"ok": True, "type": (row_type or "unknown").lower(), "skipped": True})
@@ -2563,6 +2554,8 @@ async def catalog_import_csv(file: UploadFile = File(...),
         "skipped": skipped,
         "items": items_out,
     }
+
+# 
 
 # ---------------------------------------------------------------------------------------
 # Catálogo – limpeza seletiva (por namespace inteiro, por marca, ou por prefixo de URL)
@@ -3498,216 +3491,94 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
-# ===================== HOTFIX — usar SKU/ref como chave (UNIQUE(ref)) =====================
-def _hotfix_catalog_ref_unique_and_upsert():
+
+# ===================== HOTFIX MIN — URLs do catálogo sempre BASE (sem #sku e sem “variante no link”) =====================
+def _hotfix_force_catalog_urls_base_only():
     try:
-        import sqlite3
+        from urllib.parse import urlparse
+        import re
 
-        with _catalog_conn() as c:
-            # 1) limpar duplicados por ref (mantém o mais "recente")
-            #    (se não houver duplicados, não faz nada)
-            c.execute("""
-                DELETE FROM catalog_items
-                WHERE id NOT IN (
-                    SELECT id FROM (
-                        SELECT id
-                        FROM catalog_items
-                        WHERE ref IS NOT NULL AND TRIM(ref) <> ''
-                        ORDER BY
-                          ref,
-                          COALESCE(updated_at, created_at, 0) DESC,
-                          id DESC
-                    )
-                    GROUP BY ref
-                )
-                AND ref IS NOT NULL AND TRIM(ref) <> ''
-            """)
-            c.commit()
+        def _canon_base_url(u: str) -> str:
+            u = (u or "").strip()
+            if not u:
+                return ""
+            if u.startswith("//"):
+                u = "https:" + u
+            if not u.startswith("http"):
+                if not u.startswith("/"):
+                    u = "/" + u
+                u = f"https://{IG_HOST}{u}"
+            u = u.replace(" ", "")
+            # corta tudo o que venha depois de # (inclui #sku=...)
+            u = u.split("#", 1)[0]
+            # força host
+            try:
+                p = urlparse(u)
+                host = (p.netloc or "").lower().replace("www.", "")
+                if IG_HOST and IG_HOST in host:
+                    u = u.replace(p.scheme + "://", "https://", 1)
+                    u = u.replace(p.netloc, IG_HOST, 1)
+            except Exception:
+                pass
+            # opcional: normaliza trailing slash (deixa consistente)
+            if u.endswith("/") and len(u) > len("https://a/"):
+                u = u[:-1]
+            return u
 
-            # 2) criar UNIQUE(ref) (precisa de não haver duplicados)
-            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_catalog_ref ON catalog_items(ref)")
-            c.commit()
+        # substituir _canon_ig_url no runtime (última definição vence)
+        globals()["_canon_ig_url"] = _canon_base_url
 
-        # 3) helper: UPSERT por ref (a chave é ref; url é só campo)
-        def _upsert_catalog_row_by_ref(
-            ns,
-            name,
-            summary,
-            url,
-            source,
-            ref,
-            price=None,
-            currency=None,
-            iva_pct=None,
-            brand=None,
-            dimensions=None,
-            material=None,
-            image_url=None,
-            variant_attrs=None,
-            variant_key=None
-        ):
-            if not ref or not str(ref).strip():
-                raise ValueError("Falta ref/SKU (chave obrigatória)")
-
-            with _catalog_conn() as c:
-                c.execute("""
-                    INSERT INTO catalog_items
-                      (namespace, name, summary, url, source, ref, price, currency, iva_pct,
-                       brand, dimensions, material, image_url, variant_attrs, variant_key,
-                       created_at, updated_at)
-                    VALUES
-                      (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?,
-                       strftime('%s','now'), strftime('%s','now'))
-                    ON CONFLICT(ref) DO UPDATE SET
-                      namespace=excluded.namespace,
-                      name=excluded.name,
-                      summary=excluded.summary,
-                      url=excluded.url,
-                      source=excluded.source,
-                      price=excluded.price,
-                      currency=excluded.currency,
-                      iva_pct=excluded.iva_pct,
-                      brand=excluded.brand,
-                      dimensions=excluded.dimensions,
-                      material=excluded.material,
-                      image_url=excluded.image_url,
-                      variant_attrs=excluded.variant_attrs,
-                      variant_key=excluded.variant_key,
-                      updated_at=strftime('%s','now')
-                """, (
-                    ns, name, summary, url, source, ref, price, currency, iva_pct,
-                    brand, dimensions, material, image_url, variant_attrs, variant_key
-                ))
-                c.commit()
-
-        globals()["_upsert_catalog_row_by_ref"] = _upsert_catalog_row_by_ref
-        print("[hotfix] catalog: UNIQUE(ref) ativo + upsert_by_ref pronto")
-        return True
-
-    except Exception as e:
-        print(f"[hotfix] catalog: FAILED ref-unique/upsert: {e}")
-        return False
-
-_hotfix_catalog_ref_unique_and_upsert()
-# ===================== /HOTFIX ===========================================================
-
-# ===================== HOTFIX TEMP — limpar BD antes de cada import CSV =====================
-# Faz: ao chamar POST /catalog/import-csv, apaga TUDO desse namespace e só depois importa.
-# Remove quando estiver estabilizado.
-
-def _hotfix_clear_namespace_before_import_csv():
-    try:
-        from fastapi import UploadFile, File, Form
-        import inspect
-
-        # 1) guardar referência ao handler atual (função Python)
-        _orig = globals().get("catalog_import_csv", None)
-        if not _orig or not callable(_orig):
-            print("[hotfix] não encontrei função catalog_import_csv em globals()")
+        # patch ao endpoint /catalog/import-csv sem tocar na função original:
+        _orig = globals().get("catalog_import_csv")
+        if not callable(_orig):
+            print("[hotfix] catalog_import_csv não encontrado — skip")
             return False
 
-        # 2) wrapper que limpa e depois chama o original
-        async def _wrapped_catalog_import_csv(
-            file: UploadFile = File(...),
-            namespace: str = Form(DEFAULT_NAMESPACE),
-        ):
-            ns = (namespace or DEFAULT_NAMESPACE).strip()
-            # limpar tudo do namespace
-            with _catalog_conn() as c:
-                c.execute("DELETE FROM catalog_items WHERE namespace=?", (ns,))
-                c.commit()
-            # chamar import original
-            return await _orig(file=file, namespace=namespace)
+        async def _wrapped_import(*args, **kwargs):
+            res = await _orig(*args, **kwargs)
 
-        # 3) substituir endpoint na rota já existente (sem mexer no decorator antigo)
+            # pós-limpeza: garante que NENHUMA linha fica com fragmentos
+            try:
+                ns = (res.get("namespace") or kwargs.get("namespace") or DEFAULT_NAMESPACE).strip()
+                with _catalog_conn() as c:
+                    rows = c.execute("SELECT id,url FROM catalog_items WHERE namespace=?", (ns,)).fetchall()
+                    for r in rows:
+                        u = (r["url"] or "")
+                        u2 = _canon_base_url(u)
+                        if u2 and u2 != u:
+                            c.execute(
+                                "UPDATE catalog_items SET url=?, updated_at=strftime('%s','now') WHERE id=?",
+                                (u2, r["id"])
+                            )
+                    c.commit()
+            except Exception as e:
+                print(f"[hotfix] pós-limpeza URL falhou: {e}")
+
+            return res
+
+        # substituir handler da rota FastAPI
         replaced = False
         for r in getattr(app.router, "routes", []):
-            if getattr(r, "path", None) == "/catalog/import-csv":
-                methods = set(getattr(r, "methods", []) or [])
-                if "POST" in methods:
-                    r.endpoint = _wrapped_catalog_import_csv
-                    # alguns routers usam "dependant.call" internamente; tenta ajustar também
-                    if hasattr(r, "dependant") and hasattr(r.dependant, "call"):
-                        r.dependant.call = _wrapped_catalog_import_csv
-                    replaced = True
+            if getattr(r, "path", None) == "/catalog/import-csv" and "POST" in set(getattr(r, "methods", []) or []):
+                r.endpoint = _wrapped_import
+                if hasattr(r, "dependant") and hasattr(r.dependant, "call"):
+                    r.dependant.call = _wrapped_import
+                replaced = True
 
-        if not replaced:
-            print("[hotfix] não encontrei rota POST /catalog/import-csv para substituir")
-            return False
-
-        globals()["catalog_import_csv"] = _wrapped_catalog_import_csv
-        print("[hotfix] OK: /catalog/import-csv agora limpa o namespace antes de importar")
-        return True
-
-    except Exception as e:
-        print(f"[hotfix] FAILED clear-before-import: {e}")
-        return False
-
-_hotfix_clear_namespace_before_import_csv()
-# ===================== /HOTFIX ============================================================
-
-# ===================== HOTFIX — missing _upsert_catalog_row_by_ref =====================
-# Objetivo: impedir NameError no import CSV (sem mudar schema nem lógica).
-# Isto só cria a função em falta e encaminha para _upsert_catalog_row.
-
-def _hotfix_define_upsert_by_ref():
-    try:
-        if "_upsert_catalog_row_by_ref" in globals() and callable(globals()["_upsert_catalog_row_by_ref"]):
-            print("[hotfix] _upsert_catalog_row_by_ref já existe — skip")
+        if replaced:
+            globals()["catalog_import_csv"] = _wrapped_import
+            print("[hotfix] OK: /catalog/import-csv mantém URLs base (sem #sku, sem colagens).")
             return True
 
-        if "_upsert_catalog_row" not in globals() or not callable(globals()["_upsert_catalog_row"]):
-            print("[hotfix] _upsert_catalog_row não existe — não consigo criar alias")
-            return False
-
-        def _upsert_catalog_row_by_ref(
-            ns,
-            name=None,
-            summary=None,
-            url=None,
-            source="manual",
-            ref=None,
-            price=None,
-            currency=None,
-            iva_pct=None,
-            brand=None,
-            dimensions=None,
-            material=None,
-            image_url=None,
-            variant_attrs=None,
-            variant_key=None,
-            **kwargs
-        ):
-            # Mantém comportamento anterior: delega tudo no upsert existente.
-            return globals()["_upsert_catalog_row"](
-                ns=ns,
-                name=name,
-                summary=summary,
-                url=url,
-                source=source,
-                ref=ref,
-                price=price,
-                currency=currency,
-                iva_pct=iva_pct,
-                brand=brand,
-                dimensions=dimensions,
-                material=material,
-                image_url=image_url,
-                variant_attrs=variant_attrs,
-                variant_key=variant_key
-            )
-
-        globals()["_upsert_catalog_row_by_ref"] = _upsert_catalog_row_by_ref
-        print("[hotfix] OK: definido _upsert_catalog_row_by_ref -> _upsert_catalog_row")
-        return True
-
-    except Exception as e:
-        print(f"[hotfix] FAILED define _upsert_catalog_row_by_ref: {e}")
+        print("[hotfix] rota /catalog/import-csv não encontrada — skip")
         return False
 
-_hotfix_define_upsert_by_ref()
-# ===================== /HOTFIX =========================================================
+    except Exception as e:
+        print(f"[hotfix] FAILED: {e}")
+        return False
+
+_hotfix_force_catalog_urls_base_only()
+# ===================== /HOTFIX =============================================================================
 
 
 # ---------------------------------------------------------------------------------------
