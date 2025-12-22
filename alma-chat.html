@@ -495,78 +495,8 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
   </script>
 
-<script>
-/* =========================================================
-   HOTFIX SAFE: tornar links clicáveis sem mexer no estado
-   - Não override renderMsgs/sendMsg
-   - Só pós-processa bubbles já renderizadas
-   ========================================================= */
-(function () {
-  function trimTrailingPunct(u){
-    return (u ?? "").toString().replace(/[)\]\}.,;:!?]+$/g, "");
-  }
 
-  function isAllowedUrl(url){
-    try{
-      const u = new URL(url);
-      const h = (u.hostname||"").toLowerCase();
-      return h.endsWith("interiorguider.com") || h.endsWith("boasafra.pt");
-    }catch{ return false; }
-  }
 
-  function linkifyBubble(bubble){
-    if (!bubble) return;
-
-    // já tem links? manter no máximo 1 (não cria mais)
-    // mas como agora não há <a>, vamos construir só 1
-    let html = bubble.innerHTML;
-
-    let linkMade = false;
-
-    // 1) [texto](url)
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) => {
-      url = trimTrailingPunct(url);
-      if (linkMade || !isAllowedUrl(url)) return `${label} (${url})`;
-      linkMade = true;
-      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-    });
-
-    // 2) "texto (url)" -> só quando o texto parece label
-    // exemplo: ver produto (https://...)
-    html = html.replace(/(^|<br>|\n)\s*([^<\n]+?)\s*\(\s*(https?:\/\/[^\s<)]+)\s*\)/g, (m, pfx, label, url) => {
-      url = trimTrailingPunct(url);
-      if (linkMade || !isAllowedUrl(url)) return m; // não mexe
-      linkMade = true;
-      const safeLabel = label.trim();
-      return `${pfx}${safeLabel} (<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>)`;
-    });
-
-    // 3) URL solta (último recurso)
-    html = html.replace(/(https?:\/\/[^\s<]+)/g, (m, url) => {
-      url = trimTrailingPunct(url);
-      if (linkMade || !isAllowedUrl(url)) return m;
-      linkMade = true;
-      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
-    });
-
-    bubble.innerHTML = html;
-  }
-
-  function run(){
-    // só mensagens da Alma
-    document.querySelectorAll(".msg.alma .bubble").forEach(linkifyBubble);
-  }
-
-  // correr agora e sempre que o chat muda
-  const messages = document.getElementById("messages");
-  if (!messages) return;
-
-  run();
-
-  const obs = new MutationObserver(() => run());
-  obs.observe(messages, { childList:true, subtree:true });
-})();
-</script>
   
 </body>
 </html>
