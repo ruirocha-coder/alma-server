@@ -383,109 +383,9 @@ document.getElementById('prompt').addEventListener('focus', () => {
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
-<script>  
+
 <style>
-  /* HOTFIX: links clicáveis e consistentes */
-  .bubble a{
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-  }
-  .bubble a:hover{ filter: brightness(1.08); }
-</style>
-
-<script>
-/* HOTFIX FINAL: render seguro + links clicáveis (sem bug do último ")") */
-(function(){
-  // Se as funções/estado base não existirem, não faz nada.
-  if (typeof window.renderMsgs !== "function") return;
-  if (!window.byId || typeof window.byId !== "function") return;
-
-  function escapeHtml(s){
-    return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-      "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;"
-    }[c]));
-  }
-
-  // Remove pontuação final que costuma "colar" ao link (inclui ')', ']', '.', ',', etc.)
-  function trimUrl(u){
-    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
-  }
-
-  function formatMessage(raw){
-    let s = escapeHtml(raw || "");
-
-    // 1) Markdown link: [texto](https://url)
-    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, label, url){
-      url = trimUrl(url);
-      label = escapeHtml(label);
-      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+label+'</a>';
-    });
-
-    // 2) "texto (https://url)" -> remove parêntesis e cria link
-    //    Ex.: "ver produto (https://...)" ou "(https://...)"
-    s = s.replace(/(^|[\s>])\((https?:\/\/[^\s)]+)\)/g, function(_, pre, url){
-      url = trimUrl(url);
-      return pre + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
-    });
-
-    // 3) URL solta -> link
-    s = s.replace(/(https?:\/\/[^\s<]+)/g, function(m){
-      const url = trimUrl(m);
-      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
-    });
-
-    // 4) Bold / underline / headings (mantém o teu estilo)
-    s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-         .replace(/__(.+?)__/g, "<u>$1</u>")
-         .replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-
-    // 5) Quebras de linha
-    s = s.replace(/\n/g, "<br>");
-
-    return s;
-  }
-
-  // Override do renderMsgs (não mexe no resto do fluxo)
-  window.renderMsgs = function(){
-    const s = (window.sessions || []).find(x => x.id === window.activeId);
-    const box = window.byId("messages");
-    if (!box) return;
-    box.innerHTML = "";
-    if (!s) return;
-
-    (s.msgs || []).forEach(m => {
-      const row = document.createElement("div");
-      row.className = "msg " + (m.role || "alma");
-
-      const bubble = document.createElement("div");
-      bubble.className = "bubble";
-      bubble.innerHTML = formatMessage(m.content || "");
-
-      if (m.role === "alma"){
-        const copy = document.createElement("span");
-        copy.className = "copy-btn";
-        copy.textContent = "copiar";
-        copy.onclick = () => navigator.clipboard.writeText(m.content || "");
-        bubble.appendChild(copy);
-      }
-
-      row.appendChild(bubble);
-      box.appendChild(row);
-    });
-
-    box.scrollTop = box.scrollHeight;
-  };
-
-  // Re-render imediato (para aplicar aos históricos já carregados)
-  try { window.renderMsgs(); } catch(e) {}
-})();
-</script>
-
-<script>
-
-  <style>
-  /* links clicáveis visíveis */
+  /* Links clicáveis e consistentes */
   .bubble a{
     color: var(--accent);
     text-decoration: underline;
@@ -495,88 +395,122 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </style>
 
 <script>
-/**
- * HOTFIX: linkify pós-render (não mexe no estado nem no sendMsg)
- * - remove parêntesis à volta de URLs: (https://...) -> https://... (clicável)
- * - transforma [texto](url) em <a>
- * - transforma URLs soltas em <a>
- * - corta ')' e pontuação no fim do URL
- */
-(function(){
-  const originalRender = window.renderMsgs;
-  if (typeof originalRender !== "function") return;
+(function () {
+  if (window.__alma_linkify_v3) return;
+  window.__alma_linkify_v3 = true;
 
   function trimUrl(u){
+    // remove pontuação final que o Safari “agarra” (inclui ')')
     return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
   }
 
-  function linkifyHtml(html){
-    if (!html) return html;
+  function linkifyTextNode(textNode){
+    const text = textNode.nodeValue || "";
+    if (!/https?:\/\/|\]\(https?:\/\/|\(https?:\/\//.test(text)) return;
 
-    // 0) protege anchors já existentes (não mexer duas vezes)
-    // (se já tiver <a ...>, não faz nada no seu interior)
-    // vamos operar só em partes fora de <a>.
-    const parts = html.split(/(<a\b[^>]*>[\s\S]*?<\/a>)/gi);
-    for (let i=0; i<parts.length; i++){
-      if (/^<a\b/i.test(parts[i])) continue; // já é anchor
+    const frag = document.createDocumentFragment();
+    const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<]+)/g;
 
-      let s = parts[i];
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
 
-      // 1) Markdown: [texto](https://url)
-      s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
-        url = trimUrl(url);
-        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-      });
+      // [texto](url)
+      if (m[1] && m[2]) {
+        const a = document.createElement("a");
+        a.href = trimUrl(m[2]);
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = m[1];
+        frag.appendChild(a);
+        last = re.lastIndex;
+        continue;
+      }
 
-      // 2) Parêntesis: (https://url)  -->  <a>https://url</a>   (SEM parêntesis)
-      // apanha também "ver produto (https://...)" e afins
-      s = s.replace(/\((https?:\/\/[^\s)]+)\)/g, (_, url) => {
-        url = trimUrl(url);
-        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
-      });
+      // (url) -> sem parêntesis
+      if (m[3]) {
+        const url = trimUrl(m[3]);
+        const a = document.createElement("a");
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = url;
+        frag.appendChild(a);
+        last = re.lastIndex;
+        continue;
+      }
 
-      // 3) URL solta -> anchor
-      s = s.replace(/(https?:\/\/[^\s<]+)/g, (m) => {
-        const url = trimUrl(m);
-        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
-      });
+      // url solta (pode vir com "…/)" no fim)
+      if (m[4]) {
+        const raw = m[4];
+        const url = trimUrl(raw);
+        const tail = raw.slice(url.length); // devolve o que foi cortado (ex.: ')')
+        const a = document.createElement("a");
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = url;
+        frag.appendChild(a);
+        if (tail) frag.appendChild(document.createTextNode(tail));
+        last = re.lastIndex;
+        continue;
+      }
 
-      parts[i] = s;
+      last = re.lastIndex;
     }
-    return parts.join("");
+
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    textNode.parentNode.replaceChild(frag, textNode);
   }
 
-  function postProcessBubbles(){
-    // Só nos balões da Alma, para não mexer no input nem no sidebar
-    document.querySelectorAll(".msg.alma .bubble").forEach(b => {
-      // Ignora se já foi processado nesta render
-      if (b.dataset.linkified === "1") return;
+  function walkAndLinkify(root){
+    if (!root) return;
 
-      // remove o botão copiar antes de mexer no HTML (para não o linkificar)
-      const copy = b.querySelector(".copy-btn");
-      if (copy) copy.remove();
-
-      b.innerHTML = linkifyHtml(b.innerHTML);
-
-      // repõe o botão copiar (se existir no teu render original)
-      if (copy) b.appendChild(copy);
-
-      b.dataset.linkified = "1";
+    const skip = new Set(["A","CODE","PRE","SCRIPT","STYLE","TEXTAREA","INPUT","BUTTON"]);
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node){
+        const p = node.parentNode;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (skip.has(p.nodeName)) return NodeFilter.FILTER_REJECT;
+        if (p.classList && p.classList.contains("copy-btn")) return NodeFilter.FILTER_REJECT;
+        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
     });
+
+    const nodes = [];
+    while (w.nextNode()) nodes.push(w.currentNode);
+    nodes.forEach(n => { try { linkifyTextNode(n); } catch(e) {} });
   }
 
-  // Override leve: chama o render original e depois aplica linkify
-  window.renderMsgs = function(){
-    originalRender();
-    postProcessBubbles();
-  };
+  function run(){
+    document.querySelectorAll(".msg .bubble").forEach(b => walkAndLinkify(b));
+  }
 
-  // aplica já ao histórico carregado
-  try { window.renderMsgs(); } catch(e) {}
+  // aplica já ao histórico existente
+  run();
+
+  // aplica a novas mensagens
+  const messages = document.getElementById("messages");
+  if (!messages) return;
+
+  const obs = new MutationObserver(muts => {
+    for (const mut of muts) {
+      for (const n of mut.addedNodes) {
+        if (!(n instanceof HTMLElement)) continue;
+        if (n.classList && n.classList.contains("msg")) {
+          const b = n.querySelector(".bubble");
+          if (b) walkAndLinkify(b);
+        } else {
+          walkAndLinkify(n);
+        }
+      }
+    }
+  });
+
+  obs.observe(messages, { childList: true, subtree: true });
 })();
 </script>
-
-
   
 
 
