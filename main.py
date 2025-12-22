@@ -139,7 +139,11 @@ B) Consulta catálogo:
 
 6) LINKS (política rígida)
 - Só incluir **1 link** quando estiveres a falar de um **produto/variante** do catálogo interno (**interiorguider.com** / **boasafra.pt**).
-- Para variantes, usa **sempre** o link com “#sku=” dessa variante (se existir).
+
+- Para variantes, usa exatamente o URL guardado em catalog_items.url (não acrescentar #sku nem outros sufixos).
+- O SKU deve ser mostrado no texto, mas nunca embutido no URL.
+
+
 - Qualquer URL escrito em texto (ex.: "https://…") conta como link.
 - PROIBIDO repetir URLs fora do formato Markdown.
 - **Proibido** acrescentar blocos de “Links úteis”.
