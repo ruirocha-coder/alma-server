@@ -384,101 +384,89 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
 <script>  
-/* ===== HOTFIX v3: Markdown + (texto)(url) -> links clicáveis (sem rebentar o chat) ===== */
-(function(){
-  if (window.__alma_render_fix_v3) return;
-  window.__alma_render_fix_v3 = true;
+<style>
+  /* HOTFIX: links clicáveis e consistentes */
+  .bubble a{
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .bubble a:hover{ filter: brightness(1.08); }
+</style>
 
-  const ALLOWED_HOSTS = new Set(["interiorguider.com","www.interiorguider.com","boasafra.pt","www.boasafra.pt"]);
+<script>
+/* HOTFIX FINAL: render seguro + links clicáveis (sem bug do último ")") */
+(function(){
+  // Se as funções/estado base não existirem, não faz nada.
+  if (typeof window.renderMsgs !== "function") return;
+  if (!window.byId || typeof window.byId !== "function") return;
 
   function escapeHtml(s){
     return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;"
     }[c]));
   }
-  function isAllowedUrl(urlStr){
-    try{
-      const u = new URL(urlStr);
-      return (u.protocol==="https:" || u.protocol==="http:") && ALLOWED_HOSTS.has(u.hostname);
-    }catch{ return false; }
+
+  // Remove pontuação final que costuma "colar" ao link (inclui ')', ']', '.', ',', etc.)
+  function trimUrl(u){
+    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
   }
 
-  function renderTextToHtml(text, role){
-    const raw = (text ?? "").toString();
-    let html = escapeHtml(raw);
+  function formatMessage(raw){
+    let s = escapeHtml(raw || "");
 
-    // headings (#) -> bold
-    html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-    // **bold** e __underline__
-    html = html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-    html = html.replace(/__(.+?)__/g, "<u>$1</u>");
-
-    // 1) [texto](url)
-    html = html.replace(/\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) =>
-      `@@LINK@@${label}@@URL@@${url}@@END@@`
-    );
-
-    // 2) (texto)(url)  <-- o teu output atual
-    html = html.replace(/\(([^)]+?)\)\((https?:\/\/[^\s)]+)\)/g, (m, label, url) =>
-      `@@LINK@@${label}@@URL@@${url}@@END@@`
-    );
-
-    // 3) URL solta
-    html = html.replace(/(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, (m, url) =>
-      `@@URLONLY@@${url}@@END@@`
-    );
-
-    // política: na Alma, 1 link máx e só domínios permitidos
-    let linkCount = 0;
-
-    html = html.replace(/@@LINK@@([\s\S]*?)@@URL@@([\s\S]*?)@@END@@/g, (m, label, url) => {
-      if (role === "alma"){
-        if (!isAllowedUrl(url) || linkCount >= 1) return `${label} (${url})`;
-        linkCount++;
-      }
-      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    // 1) Markdown link: [texto](https://url)
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, label, url){
+      url = trimUrl(url);
+      label = escapeHtml(label);
+      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+label+'</a>';
     });
 
-    html = html.replace(/@@URLONLY@@([\s\S]*?)@@END@@/g, (m, url) => {
-      if (role === "alma"){
-        if (!isAllowedUrl(url) || linkCount >= 1) return url;
-        linkCount++;
-      }
-      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+    // 2) "texto (https://url)" -> remove parêntesis e cria link
+    //    Ex.: "ver produto (https://...)" ou "(https://...)"
+    s = s.replace(/(^|[\s>])\((https?:\/\/[^\s)]+)\)/g, function(_, pre, url){
+      url = trimUrl(url);
+      return pre + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
     });
 
-    return html;
+    // 3) URL solta -> link
+    s = s.replace(/(https?:\/\/[^\s<]+)/g, function(m){
+      const url = trimUrl(m);
+      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
+    });
+
+    // 4) Bold / underline / headings (mantém o teu estilo)
+    s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+         .replace(/__(.+?)__/g, "<u>$1</u>")
+         .replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+    // 5) Quebras de linha
+    s = s.replace(/\n/g, "<br>");
+
+    return s;
   }
 
-  // estilo links
-  if (!document.getElementById("alma-link-style-v3")){
-    const st = document.createElement("style");
-    st.id = "alma-link-style-v3";
-    st.textContent = `.bubble a{color:#fff;text-decoration:underline;text-underline-offset:3px}
-                      .bubble a:hover{color:var(--accent)}`;
-    document.head.appendChild(st);
-  }
-
-  // redefinir renderMsgs (a função que o sendMsg chama)
-  renderMsgs = function(){
-    const s = sessions.find(x=>x.id===activeId);
-    const box = byId("messages");
+  // Override do renderMsgs (não mexe no resto do fluxo)
+  window.renderMsgs = function(){
+    const s = (window.sessions || []).find(x => x.id === window.activeId);
+    const box = window.byId("messages");
+    if (!box) return;
     box.innerHTML = "";
-    if(!s) return;
+    if (!s) return;
 
-    s.msgs.forEach(m=>{
+    (s.msgs || []).forEach(m => {
       const row = document.createElement("div");
-      row.className = "msg " + m.role;
+      row.className = "msg " + (m.role || "alma");
 
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.innerHTML = renderTextToHtml(m.content || "", m.role);
+      bubble.innerHTML = formatMessage(m.content || "");
 
-      if(m.role === "alma"){
+      if (m.role === "alma"){
         const copy = document.createElement("span");
         copy.className = "copy-btn";
         copy.textContent = "copiar";
-        copy.onclick = ()=>navigator.clipboard.writeText(m.content||"");
+        copy.onclick = () => navigator.clipboard.writeText(m.content || "");
         bubble.appendChild(copy);
       }
 
@@ -489,11 +477,10 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     box.scrollTop = box.scrollHeight;
   };
 
-  // re-render imediato
-  try{ renderMsgs(); }catch(e){}
+  // Re-render imediato (para aplicar aos históricos já carregados)
+  try { window.renderMsgs(); } catch(e) {}
 })();
-
-  </script>
+</script>
 
 
 
