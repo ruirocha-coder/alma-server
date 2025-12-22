@@ -384,150 +384,88 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
 <script>
-<script>
+
 /**
  * HOTFIX RENDER: Markdown seguro + links clicáveis + fallback.
  * Não altera sendMsg(). Só substitui renderMsgs() e helpers.
  */
-(function(){
-  // --- util: escape HTML para nunca partir o DOM ---
+<script>
+(function () {
   function escapeHtml(s){
     return (s ?? "").toString().replace(/[&<>"']/g, c => ({
       "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
     }[c]));
   }
 
-  // --- markdown -> html (mínimo, robusto) ---
-  function mdToHtml(md){
-    // 1) normaliza e ESCAPA primeiro (crítico)
-    let t = escapeHtml(md);
+  function mdToHtml(raw){
+    let s = escapeHtml(raw);
 
-    // 2) code blocks ```...``` (mantém conteúdo literal)
-    // troca por placeholders para não levar replace de links/bold
-    const blocks = [];
-    t = t.replace(/```([\s\S]*?)```/g, (_, code) => {
-      const i = blocks.push(code) - 1;
-      return `@@CODEBLOCK_${i}@@`;
+    // headings (mantém a tua ideia)
+    s = s.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+    // bold / underline
+    s = s.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+    s = s.replace(/__(.*?)__/g, "<u>$1</u>");
+
+    // links markdown: [texto](url)
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+    );
+
+    // auto-link URLs soltas (que não estejam já dentro de href)
+    s = s.replace(/(^|[\s(])((https?:\/\/)[^\s<]+)/g, (m, pre, url) => {
+      // se já veio de um link markdown convertido, isto não apanha porque já tem <a ...>
+      return `${pre}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
     });
 
-    // 3) inline code `...`
-    t = t.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
-
-    // 4) headings (#, ##, ###...) -> <div class="hX">
-    t = t.replace(/^\s{0,3}(#{1,6})\s+(.+)$/gm, (_, hs, txt) => {
-      const lvl = hs.length;
-      return `<div class="md-h md-h${lvl}"><b>${txt}</b></div>`;
-    });
-
-    // 5) bold **...**
-    t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-
-    // 6) underline __...__
-    t = t.replace(/__([^_]+)__/g, "<u>$1</u>");
-
-    // 7) links [texto](url)
-    // (URL já está escapada; aqui só validamos esquema e transformamos)
-    t = t.replace(/$begin:math:display$\(\[\^$end:math:display$]+)\]$begin:math:text$\(\[\^\)\]\+\)$end:math:text$/g, (m, label, url) => {
-      const u = url.trim();
-      // só torna clicável http(s)
-      if (!/^https?:\/\//i.test(u)) return m;
-      const safeUrl = u.replace(/"/g, "%22"); // extra safety
-      return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-    });
-
-    // 8) listas simples "- item" (muito básico; não aninha)
-    // transforma blocos consecutivos em <ul>
-    t = t.replace(/(?:^|\n)(-\s+.+(?:\n-\s+.+)*)/g, (m, block) => {
-      const items = block.split("\n").map(x => x.replace(/^-+\s+/, "").trim()).filter(Boolean);
-      if (!items.length) return m;
-      return "\n<ul>" + items.map(it => `<li>${it}</li>`).join("") + "</ul>";
-    });
-
-    // 9) quebras de linha
-    t = t.replace(/\n/g, "<br>");
-
-    // 10) repõe codeblocks
-    t = t.replace(/@@CODEBLOCK_(\d+)@@/g, (_, idx) => {
-      const code = blocks[Number(idx)] ?? "";
-      return `<pre class="md-pre"><code>${escapeHtml(code)}</code></pre>`;
-    });
-
-    return t;
+    // manter quebras de linha (a tua bubble já tem white-space:pre-wrap)
+    return s;
   }
 
-  // --- injeta estilos mínimos para ficar mais "Grok-like" ---
-  function injectStylesOnce(){
-    if (document.getElementById("alma-md-hotfix-style")) return;
-    const css = `
-      .bubble a{ color:#fff; text-decoration:underline; text-underline-offset:3px; }
-      .bubble a:hover{ opacity:.9; }
-      .bubble code{ font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-        font-size:.95em; padding:2px 6px; border:1px solid rgba(255,255,255,.10);
-        border-radius:8px; background:rgba(0,0,0,.25); }
-      .bubble .md-pre{ margin:10px 0 0; padding:12px; border-radius:12px;
-        background:rgba(0,0,0,.30); border:1px solid rgba(255,255,255,.10);
-        overflow:auto; }
-      .bubble .md-pre code{ padding:0; border:none; background:transparent; }
-      .bubble ul{ margin:10px 0 0 18px; padding:0; }
-      .bubble li{ margin:4px 0; }
-      .bubble .md-h{ margin:6px 0 2px; }
-    `;
-    const st = document.createElement("style");
-    st.id = "alma-md-hotfix-style";
-    st.textContent = css;
-    document.head.appendChild(st);
-  }
+  // override renderMsgs mantendo o estado global existente
+  window.renderMsgs = function renderMsgs(){
+    const s = sessions.find(x=>x.id===activeId);
+    const box = byId("messages");
+    box.innerHTML="";
+    if(!s) return;
 
-  // --- substitui renderMsgs() de forma segura ---
-  const oldRender = window.renderMsgs;
-  window.renderMsgs = function(){
-    try{
-      injectStylesOnce();
+    s.msgs.forEach(m=>{
+      const row=document.createElement("div");
+      row.className="msg "+m.role;
 
-      const s = (window.sessions || []).find(x => x.id === window.activeId);
-      const box = document.getElementById("messages");
-      box.innerHTML = "";
-      if(!s) return;
+      const bubble=document.createElement("div");
+      bubble.className="bubble";
+      bubble.innerHTML = mdToHtml(m.content || "");
 
-      (s.msgs || []).forEach(m=>{
-        const row = document.createElement("div");
-        row.className = "msg " + m.role;
+      if(m.role==="alma"){
+        const copy=document.createElement("span");
+        copy.className="copy-btn";
+        copy.textContent="copiar";
+        copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
+        bubble.appendChild(copy);
+      }
 
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
+      row.appendChild(bubble);
+      box.appendChild(row);
+    });
 
-        // markdown -> html seguro
-        bubble.innerHTML = mdToHtml(m.content || "");
-
-        if(m.role === "alma"){
-          const copy = document.createElement("span");
-          copy.className = "copy-btn";
-          copy.textContent = "copiar";
-          copy.onclick = () => navigator.clipboard.writeText(m.content || "");
-          bubble.appendChild(copy);
-        }
-
-        row.appendChild(bubble);
-        box.appendChild(row);
-      });
-
-      box.scrollTop = box.scrollHeight;
-    }catch(err){
-      console.error("renderMsgs hotfix failed:", err);
-      // fallback: tenta o render original; se também falhar, não bloqueia o chat
-      try{ if (typeof oldRender === "function") oldRender(); }catch(e2){ console.error("old renderMsgs failed:", e2); }
-    }
+    box.scrollTop = box.scrollHeight;
   };
 
-  // reforço: se o UI já está aberto, re-render imediato
-  try{ window.renderMsgs(); }catch(e){}
+  // opcional: dar “look” aos links
+  const style = document.createElement("style");
+  style.textContent = `
+    .bubble a { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
+    .bubble a:hover { color: var(--accent); }
+  `;
+  document.head.appendChild(style);
 
+  // re-render imediato
+  try { renderMsgs(); } catch(e) {}
 })();
 </script>
 
-
-
-
+  
   
 </body>
 </html>
