@@ -495,148 +495,78 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
   </script>
 
-  <script>
+<script>
 /* =========================================================
-   HOTFIX (colar no fim) — Links clicáveis + remove ')' final
-   - Não mexe no backend.
-   - Mantém o teu render actual, mas substitui renderMsgs()
+   HOTFIX SAFE: tornar links clicáveis sem mexer no estado
+   - Não override renderMsgs/sendMsg
+   - Só pós-processa bubbles já renderizadas
    ========================================================= */
-
-(function(){
-  // util: evita ) ] } e pontuação no fim do URL
+(function () {
   function trimTrailingPunct(u){
     return (u ?? "").toString().replace(/[)\]\}.,;:!?]+$/g, "");
   }
 
-  // escape básico (não confundir com o teu; aqui é self-contained)
-  function escapeHtml(s){
-    return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-    }[c]));
-  }
-
-  // whitelist simples (ajusta se precisares)
   function isAllowedUrl(url){
     try{
       const u = new URL(url);
-      const host = (u.hostname || '').toLowerCase();
-      return host.endsWith('interiorguider.com') || host.endsWith('boasafra.pt');
+      const h = (u.hostname||"").toLowerCase();
+      return h.endsWith("interiorguider.com") || h.endsWith("boasafra.pt");
     }catch{ return false; }
   }
 
-  // Converte markdown básico + 1 link clicável (policy Alma)
-  function formatMsgToHtml(raw, role){
-    let s = (raw ?? "").toString();
+  function linkifyBubble(bubble){
+    if (!bubble) return;
 
-    // Normalizações rápidas
-    s = s.replace(/\r\n/g, "\n");
+    // já tem links? manter no máximo 1 (não cria mais)
+    // mas como agora não há <a>, vamos construir só 1
+    let html = bubble.innerHTML;
 
-    // 1) headings (#) -> bold
-    s = s.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+    let linkMade = false;
 
-    // 2) bold **x**
-    s = s.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
-
-    // 3) underline __x__
-    s = s.replace(/__(.*?)__/g, "<u>$1</u>");
-
-    // 4) Markdown link [txt](url) -> placeholder
-    //    (para controlar 1 link e limpar pontuação final)
-    const LINK_TOKEN = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
-    let linkCount = 0;
-
-    s = s.replace(LINK_TOKEN, (m, all, label, url) => {
+    // 1) [texto](url)
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) => {
       url = trimTrailingPunct(url);
-
-      if (role === "alma"){
-        if (!isAllowedUrl(url) || linkCount >= 1){
-          return `${label} (${url})`;
-        }
-        linkCount++;
-      }
-      return `@@LINK@@${label}@@URL@@${url}@@END@@`;
+      if (linkMade || !isAllowedUrl(url)) return `${label} (${url})`;
+      linkMade = true;
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
     });
 
-    // 5) URL solta (inclui dentro de parêntesis) -> placeholder
-    //    Nota: remove ) ] } etc no fim.
-    const URL_TOKEN = /(https?:\/\/[^\s<>"']+)/g;
-    s = s.replace(URL_TOKEN, (m, url) => {
+    // 2) "texto (url)" -> só quando o texto parece label
+    // exemplo: ver produto (https://...)
+    html = html.replace(/(^|<br>|\n)\s*([^<\n]+?)\s*\(\s*(https?:\/\/[^\s<)]+)\s*\)/g, (m, pfx, label, url) => {
       url = trimTrailingPunct(url);
-
-      if (role === "alma"){
-        if (!isAllowedUrl(url) || linkCount >= 1) return url;
-        linkCount++;
-      }
-      return `@@URLONLY@@${url}@@END@@`;
+      if (linkMade || !isAllowedUrl(url)) return m; // não mexe
+      linkMade = true;
+      const safeLabel = label.trim();
+      return `${pfx}${safeLabel} (<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>)`;
     });
 
-    // escape geral (para evitar injeção), mas preserva tokens
-    // estratégia: escape tudo e depois reintroduzir tokens
-    const tokens = [];
-    const tokenized = s.replace(/@@(LINK|URLONLY)@@[\s\S]*?@@END@@/g, (t) => {
-      tokens.push(t);
-      return `@@TOK_${tokens.length-1}@@`;
-    });
-
-    let html = escapeHtml(tokenized);
-
-    // restaurar tokens para HTML real
-    html = html.replace(/@@TOK_(\d+)@@/g, (m, idx) => tokens[parseInt(idx,10)]);
-
-    // transformar tokens em <a>
-    html = html.replace(/@@LINK@@([\s\S]*?)@@URL@@([\s\S]*?)@@END@@/g, (m, label, url) => {
+    // 3) URL solta (último recurso)
+    html = html.replace(/(https?:\/\/[^\s<]+)/g, (m, url) => {
       url = trimTrailingPunct(url);
-      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+      if (linkMade || !isAllowedUrl(url)) return m;
+      linkMade = true;
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
     });
 
-    html = html.replace(/@@URLONLY@@([\s\S]*?)@@END@@/g, (m, url) => {
-      url = trimTrailingPunct(url);
-      const safe = escapeHtml(url);
-      return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>`;
-    });
-
-    // manter quebras de linha
-    // (tens white-space:pre-wrap, mas isto ajuda quando há tags)
-    html = html.replace(/\n/g, "<br>");
-
-    return html;
+    bubble.innerHTML = html;
   }
 
-  // ---- Override seguro do renderMsgs() ----
-  // Mantém o resto do teu sistema (sessions/localStorage/etc).
-  if (typeof window.renderMsgs === "function"){
-    window.renderMsgs = function(){
-      const s = (window.sessions || []).find(x=>x.id===window.activeId);
-      const box = document.getElementById("messages");
-      box.innerHTML = "";
-      if(!s) return;
-
-      (s.msgs || []).forEach(m=>{
-        const row = document.createElement("div");
-        row.className = "msg " + m.role;
-
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        bubble.innerHTML = formatMsgToHtml(m.content || "", m.role);
-
-        if(m.role === "alma"){
-          const copy = document.createElement("span");
-          copy.className = "copy-btn";
-          copy.textContent = "copiar";
-          copy.onclick = ()=>navigator.clipboard.writeText(m.content||"");
-          bubble.appendChild(copy);
-        }
-
-        row.appendChild(bubble);
-        box.appendChild(row);
-      });
-
-      box.scrollTop = box.scrollHeight;
-    };
+  function run(){
+    // só mensagens da Alma
+    document.querySelectorAll(".msg.alma .bubble").forEach(linkifyBubble);
   }
+
+  // correr agora e sempre que o chat muda
+  const messages = document.getElementById("messages");
+  if (!messages) return;
+
+  run();
+
+  const obs = new MutationObserver(() => run());
+  obs.observe(messages, { childList:true, subtree:true });
 })();
 </script>
-
   
 </body>
 </html>
