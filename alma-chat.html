@@ -383,6 +383,178 @@ document.getElementById('prompt').addEventListener('focus', () => {
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
+  <script>
+    
+/* ===========================
+   HOTFIX ÚNICO — Markdown + Links + Tabelas (safe)
+   Colar no fim do alma-chat.html (antes de </body>)
+   =========================== */
+(function(){
+  function injectCss(css){
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  function loadScript(src){
+    return new Promise((resolve,reject)=>{
+      const s = document.createElement('script');
+      s.src = src;
+      s.async = true;
+      s.onload = ()=>resolve(true);
+      s.onerror = ()=>reject(new Error('Falha a carregar: ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  injectCss(`
+    /* Markdown dentro das bubbles */
+    .bubble .md { white-space: normal; }
+    .bubble .md p { margin: 0 0 10px 0; }
+    .bubble .md p:last-child { margin-bottom: 0; }
+
+    .bubble .md a { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
+    .bubble .md code {
+      font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+      font-size: .95em;
+    }
+    .bubble .md pre {
+      margin: 10px 0;
+      background: #101014;
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 10px;
+      padding: 10px 12px;
+      overflow: auto;
+    }
+    .bubble .md pre code { display:block; white-space: pre; }
+
+    .bubble .md table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: .95rem; }
+    .bubble .md th, .bubble .md td {
+      border: 1px solid rgba(255,255,255,0.10);
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    .bubble .md th { background: rgba(255,255,255,0.04); }
+
+    .bubble .md ul, .bubble .md ol { margin: 8px 0 8px 20px; }
+    .bubble .md blockquote {
+      margin: 8px 0;
+      padding: 6px 10px;
+      border-left: 3px solid rgba(212,160,23,.6);
+      color: var(--fg-dim);
+    }
+
+    /* Se tabelas forem largas, deixa scroll horizontal dentro do balão */
+    .bubble .md { overflow-x: auto; }
+  `);
+
+  async function ensureLibs(){
+    const needsMarked = !window.marked;
+    const needsPurify = !window.DOMPurify;
+
+    const jobs = [];
+    if (needsMarked)  jobs.push(loadScript('https://cdn.jsdelivr.net/npm/marked/marked.min.js'));
+    if (needsPurify) jobs.push(loadScript('https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js'));
+
+    if (jobs.length) await Promise.all(jobs);
+
+    if (window.marked && window.marked.setOptions){
+      window.marked.setOptions({
+        gfm: true,
+        breaks: true,
+        mangle: false,
+        headerIds: false
+      });
+    }
+  }
+
+  function renderMarkdownSafe(mdText){
+    const raw = (mdText || '').toString();
+
+    // markdown -> html
+    const html = window.marked ? window.marked.parse(raw) : raw;
+
+    // sanitizar
+    const clean = window.DOMPurify
+      ? window.DOMPurify.sanitize(html, {
+          USE_PROFILES: { html: true },
+          ADD_ATTR: ['target','rel']
+        })
+      : html;
+
+    // links seguros + clicáveis
+    const tmp = document.createElement('div');
+    tmp.innerHTML = clean;
+
+    tmp.querySelectorAll('a').forEach(a=>{
+      const href = (a.getAttribute('href') || '').trim();
+
+      // bloqueia esquemas perigosos (javascript:, data:, etc.)
+      const isHttp = /^https?:\/\//i.test(href);
+      const isRel  = href.startsWith('/') || href.startsWith('#');
+
+      if (!href || (!isHttp && !isRel)){
+        a.removeAttribute('href');
+        return;
+      }
+      a.setAttribute('target','_blank');
+      a.setAttribute('rel','noopener noreferrer');
+    });
+
+    return tmp.innerHTML;
+  }
+
+  function overrideRenderMsgs(){
+    if (typeof window.renderMsgs !== 'function') return;
+
+    window.renderMsgs = function(){
+      const s = (window.sessions||[]).find(x=>x.id===window.activeId);
+      const box = document.getElementById('messages');
+      box.innerHTML = '';
+      if(!s) return;
+
+      (s.msgs||[]).forEach(m=>{
+        const row = document.createElement('div');
+        row.className = 'msg ' + m.role;
+
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+
+        const mdWrap = document.createElement('div');
+        mdWrap.className = 'md';
+        mdWrap.innerHTML = renderMarkdownSafe(m.content || '');
+        bubble.appendChild(mdWrap);
+
+        if(m.role === 'alma'){
+          const copy = document.createElement('span');
+          copy.className = 'copy-btn';
+          copy.textContent = 'copiar';
+          copy.onclick = ()=>navigator.clipboard.writeText(m.content||'');
+          bubble.appendChild(copy);
+        }
+
+        row.appendChild(bubble);
+        box.appendChild(row);
+      });
+
+      box.scrollTop = box.scrollHeight;
+    };
+  }
+
+  (async ()=>{
+    try{
+      await ensureLibs();
+      overrideRenderMsgs();
+
+      // re-render imediato
+      if (typeof window.renderMsgs === 'function') window.renderMsgs();
+    }catch(e){
+      console.warn('[Alma chat hotfix markdown] falhou:', e);
+      // se falhar, não quebra o chat — fica como estava
+    }
+  })();
+})();
+</script>
 
 
 
