@@ -385,63 +385,123 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
 <script>
 
-/**
- * HOTFIX RENDER: Markdown seguro + links clicáveis + fallback.
- * Não altera sendMsg(). Só substitui renderMsgs() e helpers.
- */
 <script>
+/* ===========================
+   HOTFIX: Markdown links + filtros de links (Alma)
+   - Torna [texto](url) clicável
+   - Torna URLs soltas clicáveis
+   - Para mensagens da Alma: mantém só 1 link e só para interiorguider.com/boasafra.pt
+   =========================== */
 (function () {
+  // evita aplicar duas vezes
+  if (window.__alma_md_hotfix_v1) return;
+  window.__alma_md_hotfix_v1 = true;
+
+  const ALLOWED_HOSTS = new Set(["interiorguider.com", "www.interiorguider.com", "boasafra.pt", "www.boasafra.pt"]);
+
   function escapeHtml(s){
     return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
     }[c]));
   }
 
-  function mdToHtml(raw){
-    let s = escapeHtml(raw);
-
-    // headings (mantém a tua ideia)
-    s = s.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-
-    // bold / underline
-    s = s.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
-    s = s.replace(/__(.*?)__/g, "<u>$1</u>");
-
-    // links markdown: [texto](url)
-    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
-    );
-
-    // auto-link URLs soltas (que não estejam já dentro de href)
-    s = s.replace(/(^|[\s(])((https?:\/\/)[^\s<]+)/g, (m, pre, url) => {
-      // se já veio de um link markdown convertido, isto não apanha porque já tem <a ...>
-      return `${pre}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
-    });
-
-    // manter quebras de linha (a tua bubble já tem white-space:pre-wrap)
-    return s;
+  function isAllowedUrl(urlStr){
+    try{
+      const u = new URL(urlStr);
+      return (u.protocol === "https:" || u.protocol === "http:") && ALLOWED_HOSTS.has(u.hostname);
+    }catch{ return false; }
   }
 
-  // override renderMsgs mantendo o estado global existente
-  window.renderMsgs = function renderMsgs(){
+  // converte markdown/urls para HTML (sem permitir HTML do modelo)
+  function renderMarkdownSafe(text, { role } = { role: "alma" }){
+    const raw = (text ?? "").toString();
+    let html = escapeHtml(raw);
+
+    // headings simples (# Título) -> <b>... </b>
+    html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+    // **bold** e __underline__
+    html = html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+    html = html.replace(/__(.+?)__/g, "<u>$1</u>");
+
+    // markdown links: [texto](url)
+    // Nota: aqui ainda não filtramos; só convertemos para um placeholder que depois validamos
+    html = html.replace(/\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) => {
+      const safeLabel = label; // já escapado acima
+      const safeUrl = url;     // vem de texto, mas validamos depois
+      return `@@MDLINK_START@@${safeLabel}@@MDLINK_MID@@${safeUrl}@@MDLINK_END@@`;
+    });
+
+    // URLs soltas -> placeholder também
+    html = html.replace(/(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, (m, url) => {
+      return `@@URL_START@@${url}@@URL_END@@`;
+    });
+
+    // Agora aplicamos política de links (especialmente para a Alma)
+    let linkCount = 0;
+
+    // markdown placeholders
+    html = html.replace(/@@MDLINK_START@@([\s\S]*?)@@MDLINK_MID@@([\s\S]*?)@@MDLINK_END@@/g, (m, label, url) => {
+      const allowed = (role === "alma") ? isAllowedUrl(url) : true;
+      if (role === "alma") {
+        if (!allowed) return `${label} (${url})`;           // vira texto
+        if (linkCount >= 1) return `${label} (${url})`;     // só 1 link
+        linkCount++;
+      }
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+
+    // url placeholders
+    html = html.replace(/@@URL_START@@([\s\S]*?)@@URL_END@@/g, (m, url) => {
+      const allowed = (role === "alma") ? isAllowedUrl(url) : true;
+      if (role === "alma") {
+        if (!allowed) return url;
+        if (linkCount >= 1) return url;
+        linkCount++;
+      }
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+    });
+
+    // manter quebras de linha (já tens white-space:pre-wrap, isto é só para segurança)
+    return html;
+  }
+
+  // reforço de estilo para links dentro do balão (se não existir já)
+  (function ensureLinkCss(){
+    const id = "alma-link-style-hotfix";
+    if (document.getElementById(id)) return;
+    const st = document.createElement("style");
+    st.id = id;
+    st.textContent = `
+      .bubble a { color: #ffffff; text-decoration: underline; text-underline-offset: 3px; }
+      .bubble a:hover { color: var(--accent); }
+    `;
+    document.head.appendChild(st);
+  })();
+
+  // Substitui renderMsgs com versão que usa renderMarkdownSafe
+  const _oldRenderMsgs = window.renderMsgs;
+  window.renderMsgs = function renderMsgsPatched(){
     const s = sessions.find(x=>x.id===activeId);
     const box = byId("messages");
-    box.innerHTML="";
+    box.innerHTML = "";
     if(!s) return;
 
     s.msgs.forEach(m=>{
-      const row=document.createElement("div");
-      row.className="msg "+m.role;
+      const row = document.createElement("div");
+      row.className = "msg " + m.role;
 
-      const bubble=document.createElement("div");
-      bubble.className="bubble";
-      bubble.innerHTML = mdToHtml(m.content || "");
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
 
-      if(m.role==="alma"){
-        const copy=document.createElement("span");
-        copy.className="copy-btn";
-        copy.textContent="copiar";
-        copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
+      // ✅ aqui está a diferença: markdown -> html com links clicáveis + filtro
+      bubble.innerHTML = renderMarkdownSafe(m.content || "", { role: m.role });
+
+      if(m.role === "alma"){
+        const copy = document.createElement("span");
+        copy.className = "copy-btn";
+        copy.textContent = "copiar";
+        copy.onclick = ()=>navigator.clipboard.writeText(m.content || "");
         bubble.appendChild(copy);
       }
 
@@ -452,19 +512,10 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     box.scrollTop = box.scrollHeight;
   };
 
-  // opcional: dar “look” aos links
-  const style = document.createElement("style");
-  style.textContent = `
-    .bubble a { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
-    .bubble a:hover { color: var(--accent); }
-  `;
-  document.head.appendChild(style);
-
-  // re-render imediato
-  try { renderMsgs(); } catch(e) {}
+  // re-render imediato para aplicar ao histórico já existente
+  try { window.renderMsgs(); } catch(e) { /* não bloquear */ }
 })();
 </script>
-
   
   
 </body>
