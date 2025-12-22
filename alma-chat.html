@@ -383,12 +383,11 @@ document.getElementById('prompt').addEventListener('focus', () => {
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
 
-<script>
-
-/* ===== HOTFIX renderMsgs: Markdown -> HTML com links clicáveis ===== */
+<script>  
+/* ===== HOTFIX v3: Markdown + (texto)(url) -> links clicáveis (sem rebentar o chat) ===== */
 (function(){
-  if (window.__alma_render_fix_v2) return;
-  window.__alma_render_fix_v2 = true;
+  if (window.__alma_render_fix_v3) return;
+  window.__alma_render_fix_v3 = true;
 
   const ALLOWED_HOSTS = new Set(["interiorguider.com","www.interiorguider.com","boasafra.pt","www.boasafra.pt"]);
 
@@ -404,20 +403,27 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     }catch{ return false; }
   }
 
-  function renderMarkdownSafe(text, role){
+  function renderTextToHtml(text, role){
     const raw = (text ?? "").toString();
     let html = escapeHtml(raw);
 
-    // títulos # -> bold
+    // headings (#) -> bold
     html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
     // **bold** e __underline__
     html = html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
     html = html.replace(/__(.+?)__/g, "<u>$1</u>");
 
-    // placeholders para links
+    // 1) [texto](url)
     html = html.replace(/\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) =>
-      `@@MDLINK@@${label}@@URL@@${url}@@END@@`
+      `@@LINK@@${label}@@URL@@${url}@@END@@`
     );
+
+    // 2) (texto)(url)  <-- o teu output atual
+    html = html.replace(/\(([^)]+?)\)\((https?:\/\/[^\s)]+)\)/g, (m, label, url) =>
+      `@@LINK@@${label}@@URL@@${url}@@END@@`
+    );
+
+    // 3) URL solta
     html = html.replace(/(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, (m, url) =>
       `@@URLONLY@@${url}@@END@@`
     );
@@ -425,7 +431,7 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     // política: na Alma, 1 link máx e só domínios permitidos
     let linkCount = 0;
 
-    html = html.replace(/@@MDLINK@@([\s\S]*?)@@URL@@([\s\S]*?)@@END@@/g, (m, label, url) => {
+    html = html.replace(/@@LINK@@([\s\S]*?)@@URL@@([\s\S]*?)@@END@@/g, (m, label, url) => {
       if (role === "alma"){
         if (!isAllowedUrl(url) || linkCount >= 1) return `${label} (${url})`;
         linkCount++;
@@ -444,16 +450,16 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     return html;
   }
 
-  // garante estilo de links
-  if (!document.getElementById("alma-link-style-v2")){
+  // estilo links
+  if (!document.getElementById("alma-link-style-v3")){
     const st = document.createElement("style");
-    st.id = "alma-link-style-v2";
+    st.id = "alma-link-style-v3";
     st.textContent = `.bubble a{color:#fff;text-decoration:underline;text-underline-offset:3px}
                       .bubble a:hover{color:var(--accent)}`;
     document.head.appendChild(st);
   }
 
-  // ✅ IMPORTANTÍSSIMO: redefinir a função local que o sendMsg() chama
+  // redefinir renderMsgs (a função que o sendMsg chama)
   renderMsgs = function(){
     const s = sessions.find(x=>x.id===activeId);
     const box = byId("messages");
@@ -466,7 +472,7 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.innerHTML = renderMarkdownSafe(m.content || "", m.role);
+      bubble.innerHTML = renderTextToHtml(m.content || "", m.role);
 
       if(m.role === "alma"){
         const copy = document.createElement("span");
@@ -486,6 +492,8 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
   // re-render imediato
   try{ renderMsgs(); }catch(e){}
 })();
+
+  </script>
 
   
 </body>
