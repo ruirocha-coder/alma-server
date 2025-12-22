@@ -3491,6 +3491,68 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
+# ===================== HOTFIX — normalizar URL para o LLM =====================
+# Objetivo:
+# - A BD pode conter URLs com #sku=...
+# - O LLM NUNCA deve ver o fragmento #sku
+# - Não altera DB, import, schema ou UI
+
+from urllib.parse import urlsplit, urlunsplit
+
+def _hf_clean_url(u: str) -> str:
+    if not u:
+        return u
+    try:
+        parts = urlsplit(u)
+        # remove fragment (#sku=...)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+    except Exception:
+        return u
+
+# patch no build_catalog_block
+if "build_catalog_block" in globals():
+    _orig_build_catalog_block = build_catalog_block
+
+    def build_catalog_block(*args, **kwargs):
+        text = _orig_build_catalog_block(*args, **kwargs)
+        if not text:
+            return text
+
+        lines = []
+        for line in text.splitlines():
+            if "http" in line:
+                parts = line.split("Link:", 1)
+                if len(parts) == 2:
+                    clean = _hf_clean_url(parts[1].strip())
+                    line = parts[0] + "Link: " + clean
+            lines.append(line)
+        return "\n".join(lines)
+
+    globals()["build_catalog_block"] = build_catalog_block
+
+# patch no build_catalog_variants_block
+if "build_catalog_variants_block" in globals():
+    _orig_build_catalog_variants_block = build_catalog_variants_block
+
+    def build_catalog_variants_block(*args, **kwargs):
+        text = _orig_build_catalog_variants_block(*args, **kwargs)
+        if not text:
+            return text
+
+        lines = []
+        for line in text.splitlines():
+            if "http" in line:
+                parts = line.rsplit("|", 1)
+                if len(parts) == 2:
+                    clean = _hf_clean_url(parts[1].strip())
+                    line = parts[0] + "| " + clean
+            lines.append(line)
+        return "\n".join(lines)
+
+    globals()["build_catalog_variants_block"] = build_catalog_variants_block
+
+# ===================== /HOTFIX =====================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
