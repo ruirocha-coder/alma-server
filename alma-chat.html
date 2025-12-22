@@ -385,103 +385,76 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
 <script>
 
-<script>
-/* ===========================
-   HOTFIX: Markdown links + filtros de links (Alma)
-   - Torna [texto](url) clicável
-   - Torna URLs soltas clicáveis
-   - Para mensagens da Alma: mantém só 1 link e só para interiorguider.com/boasafra.pt
-   =========================== */
-(function () {
-  // evita aplicar duas vezes
-  if (window.__alma_md_hotfix_v1) return;
-  window.__alma_md_hotfix_v1 = true;
+/* ===== HOTFIX renderMsgs: Markdown -> HTML com links clicáveis ===== */
+(function(){
+  if (window.__alma_render_fix_v2) return;
+  window.__alma_render_fix_v2 = true;
 
-  const ALLOWED_HOSTS = new Set(["interiorguider.com", "www.interiorguider.com", "boasafra.pt", "www.boasafra.pt"]);
+  const ALLOWED_HOSTS = new Set(["interiorguider.com","www.interiorguider.com","boasafra.pt","www.boasafra.pt"]);
 
   function escapeHtml(s){
     return (s ?? "").toString().replace(/[&<>"']/g, c => ({
-      "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
     }[c]));
   }
-
   function isAllowedUrl(urlStr){
     try{
       const u = new URL(urlStr);
-      return (u.protocol === "https:" || u.protocol === "http:") && ALLOWED_HOSTS.has(u.hostname);
+      return (u.protocol==="https:" || u.protocol==="http:") && ALLOWED_HOSTS.has(u.hostname);
     }catch{ return false; }
   }
 
-  // converte markdown/urls para HTML (sem permitir HTML do modelo)
-  function renderMarkdownSafe(text, { role } = { role: "alma" }){
+  function renderMarkdownSafe(text, role){
     const raw = (text ?? "").toString();
     let html = escapeHtml(raw);
 
-    // headings simples (# Título) -> <b>... </b>
+    // títulos # -> bold
     html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");
-
     // **bold** e __underline__
     html = html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
     html = html.replace(/__(.+?)__/g, "<u>$1</u>");
 
-    // markdown links: [texto](url)
-    // Nota: aqui ainda não filtramos; só convertemos para um placeholder que depois validamos
-    html = html.replace(/\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) => {
-      const safeLabel = label; // já escapado acima
-      const safeUrl = url;     // vem de texto, mas validamos depois
-      return `@@MDLINK_START@@${safeLabel}@@MDLINK_MID@@${safeUrl}@@MDLINK_END@@`;
-    });
+    // placeholders para links
+    html = html.replace(/\[([^\]]+?)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url) =>
+      `@@MDLINK@@${label}@@URL@@${url}@@END@@`
+    );
+    html = html.replace(/(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, (m, url) =>
+      `@@URLONLY@@${url}@@END@@`
+    );
 
-    // URLs soltas -> placeholder também
-    html = html.replace(/(https?:\/\/[^\s<]+[^<.,:;"')\]\s])/g, (m, url) => {
-      return `@@URL_START@@${url}@@URL_END@@`;
-    });
-
-    // Agora aplicamos política de links (especialmente para a Alma)
+    // política: na Alma, 1 link máx e só domínios permitidos
     let linkCount = 0;
 
-    // markdown placeholders
-    html = html.replace(/@@MDLINK_START@@([\s\S]*?)@@MDLINK_MID@@([\s\S]*?)@@MDLINK_END@@/g, (m, label, url) => {
-      const allowed = (role === "alma") ? isAllowedUrl(url) : true;
-      if (role === "alma") {
-        if (!allowed) return `${label} (${url})`;           // vira texto
-        if (linkCount >= 1) return `${label} (${url})`;     // só 1 link
+    html = html.replace(/@@MDLINK@@([\s\S]*?)@@URL@@([\s\S]*?)@@END@@/g, (m, label, url) => {
+      if (role === "alma"){
+        if (!isAllowedUrl(url) || linkCount >= 1) return `${label} (${url})`;
         linkCount++;
       }
       return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
     });
 
-    // url placeholders
-    html = html.replace(/@@URL_START@@([\s\S]*?)@@URL_END@@/g, (m, url) => {
-      const allowed = (role === "alma") ? isAllowedUrl(url) : true;
-      if (role === "alma") {
-        if (!allowed) return url;
-        if (linkCount >= 1) return url;
+    html = html.replace(/@@URLONLY@@([\s\S]*?)@@END@@/g, (m, url) => {
+      if (role === "alma"){
+        if (!isAllowedUrl(url) || linkCount >= 1) return url;
         linkCount++;
       }
       return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
     });
 
-    // manter quebras de linha (já tens white-space:pre-wrap, isto é só para segurança)
     return html;
   }
 
-  // reforço de estilo para links dentro do balão (se não existir já)
-  (function ensureLinkCss(){
-    const id = "alma-link-style-hotfix";
-    if (document.getElementById(id)) return;
+  // garante estilo de links
+  if (!document.getElementById("alma-link-style-v2")){
     const st = document.createElement("style");
-    st.id = id;
-    st.textContent = `
-      .bubble a { color: #ffffff; text-decoration: underline; text-underline-offset: 3px; }
-      .bubble a:hover { color: var(--accent); }
-    `;
+    st.id = "alma-link-style-v2";
+    st.textContent = `.bubble a{color:#fff;text-decoration:underline;text-underline-offset:3px}
+                      .bubble a:hover{color:var(--accent)}`;
     document.head.appendChild(st);
-  })();
+  }
 
-  // Substitui renderMsgs com versão que usa renderMarkdownSafe
-  const _oldRenderMsgs = window.renderMsgs;
-  window.renderMsgs = function renderMsgsPatched(){
+  // ✅ IMPORTANTÍSSIMO: redefinir a função local que o sendMsg() chama
+  renderMsgs = function(){
     const s = sessions.find(x=>x.id===activeId);
     const box = byId("messages");
     box.innerHTML = "";
@@ -493,15 +466,13 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-
-      // ✅ aqui está a diferença: markdown -> html com links clicáveis + filtro
-      bubble.innerHTML = renderMarkdownSafe(m.content || "", { role: m.role });
+      bubble.innerHTML = renderMarkdownSafe(m.content || "", m.role);
 
       if(m.role === "alma"){
         const copy = document.createElement("span");
         copy.className = "copy-btn";
         copy.textContent = "copiar";
-        copy.onclick = ()=>navigator.clipboard.writeText(m.content || "");
+        copy.onclick = ()=>navigator.clipboard.writeText(m.content||"");
         bubble.appendChild(copy);
       }
 
@@ -512,11 +483,10 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
     box.scrollTop = box.scrollHeight;
   };
 
-  // re-render imediato para aplicar ao histórico já existente
-  try { window.renderMsgs(); } catch(e) { /* não bloquear */ }
+  // re-render imediato
+  try{ renderMsgs(); }catch(e){}
 })();
-</script>
-  
+
   
 </body>
 </html>
