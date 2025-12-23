@@ -3570,298 +3570,261 @@ if "build_catalog_variants_block" in globals():
 
     globals()["build_catalog_variants_block"] = build_catalog_variants_block
 # ======================================================================
+# ============================================================
+# HOTFIX: CATALOG CONTEXT STRONG (v2)
+# - Faz lookup direto em /data/catalog.db
+# - Injeta contexto com TODAS as variantes encontradas
+# - Ajuda multi-produto (4 itens na mesma pergunta)
+# ============================================================
 
+import re
+import sqlite3
+from typing import List, Dict, Any, Tuple
 
-# ======================================================================
-# HOTFIX: listar 100% das variantes (agrupamento híbrido: URL + nome + ref)
-# Colar NO FINAL do main.py
-# Requer: CATALOG_DB_PATH = "/data/catalog.db"
-# ======================================================================
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-import sqlite3, re
-from fastapi.routing import APIRoute
-from typing import Optional, List, Dict, Any, Tuple
+def _extract_slugs(text: str) -> List[str]:
+    # apanha /zeal-laser ou zeal-laser (se vier com /)
+    slugs = re.findall(r"\/([a-z0-9][a-z0-9\-]{2,})\/?", text.lower())
+    # remove coisas óbvias que não são slugs de produto
+    blacklist = {"ask", "catalog", "import", "search", "static"}
+    slugs = [s for s in slugs if s not in blacklist]
+    # dedup mantendo ordem
+    out = []
+    seen = set()
+    for s in slugs:
+        if s not in seen:
+            out.append(s); seen.add(s)
+    return out
 
-def _hf_db_path() -> str:
-    return CATALOG_DB_PATH
+def _extract_skus(text: str) -> List[str]:
+    # SKU “tipo BigCommerce”: letras/números + . _ -
+    # Ex.: ORK.02.03  | KOR0440--ME-AS | LAM0100
+    raw = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", text.upper())
+    # dedup mantendo ordem
+    out = []
+    seen = set()
+    for x in raw:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out[:30]
 
-def _hf_is_quote_like(q: str) -> bool:
-    s = (q or "").lower()
-    return any(k in s for k in ["orçamento","orcamento","cotação","cotacao","proforma","preço","preco","subtotal","iva"])
+def _extract_keywords(text: str) -> List[str]:
+    # palavras “grandes” que ajudam no LIKE (ex.: zeal, orikomi, dublexo)
+    words = re.findall(r"[A-Za-zÀ-ÿ0-9\-]{3,}", text)
+    words = [w.lower() for w in words]
+    stop = {
+        "para","com","sem","que","isto","isso","uma","uns","umas","dos","das","por",
+        "preco","preço","iva","incluido","incluído","portes","entrega","prazo",
+        "quero","preciso","faz","diz","lista","mostra","acrescenta","adiciona",
+        "produto","produtos","variante","variantes","catalogo","catálogo"
+    }
+    keep = [w for w in words if w not in stop and len(w) >= 3]
+    # dedup ordem
+    out = []
+    seen=set()
+    for w in keep:
+        if w not in seen:
+            out.append(w); seen.add(w)
+    return out[:12]
 
-def _hf_extract_slug_or_urls(text: str) -> List[str]:
-    s = (text or "").strip()
-    urls = re.findall(r"https?://[^\s)]+", s, flags=re.I)
-    slugs = re.findall(r"(?:/|^)([a-z0-9][a-z0-9\-]{2,})(?:/|$)", s.lower())
-    out: List[str] = []
-    out.extend(urls)
-    out.extend(slugs)
-    seen=set(); r=[]
-    for x in out:
-        if x in seen: continue
-        seen.add(x); r.append(x)
-    return r
+def _db_connect():
+    # usa a tua variável global já existente, senão fallback
+    path = globals().get("CATALOG_DB_PATH") or "/data/catalog.db"
+    return sqlite3.connect(path)
 
-def _hf_base_url_from_any(x: str) -> Optional[str]:
-    x = (x or "").strip()
-    if not x:
-        return None
-    if x.startswith("http://") or x.startswith("https://"):
-        return x.split("#sku=")[0].rstrip("/")
-    if re.fullmatch(r"[a-z0-9][a-z0-9\-]{2,}", x.lower()):
-        return f"https://interiorguider.com/{x.lower()}"
-    return None
-
-def _hf_norm_name_base(name: str) -> str:
-    # tira sufixo " — variante"
-    n = (name or "").strip()
-    return n.split(" — ")[0].strip()
-
-def _hf_ref_prefix(ref: str) -> str:
+def _db_rows_by_ref(ns: str, refs: List[str]) -> List[Dict[str, Any]]:
+    if not refs:
+        return []
+    ns = ns or globals().get("DEFAULT_NAMESPACE") or "boasafra"
+    qmarks = ",".join(["?"] * len(refs))
+    sql = f"""
+      SELECT id, namespace, ref, name, summary, price, brand, url
+      FROM catalog_items
+      WHERE namespace = ?
+        AND ref IN ({qmarks})
+      ORDER BY CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END, ref
+      LIMIT 200
     """
-    extrai um prefixo estável do SKU/ref para agrupar:
-    - "ZEA0100" -> "ZEA"
-    - "KOR0440--ME-AS" -> "KOR0440"
-    - "ORK.02.03" -> "ORK"
+    conn = _db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, [ns, *refs])
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def _db_rows_by_like(ns: str, slugs: List[str], keywords: List[str]) -> List[Dict[str, Any]]:
+    ns = ns or globals().get("DEFAULT_NAMESPACE") or "boasafra"
+    # montamos cláusulas OR com LIKE em name e url
+    like_terms = []
+    params: List[Any] = [ns]
+
+    for s in (slugs or []):
+        like_terms.append("(url LIKE ? OR name LIKE ?)")
+        params.append(f"%/{s}%")
+        params.append(f"%{s}%")
+
+    for k in (keywords or []):
+        like_terms.append("(name LIKE ? OR summary LIKE ?)")
+        params.append(f"%{k}%")
+        params.append(f"%{k}%")
+
+    if not like_terms:
+        return []
+
+    sql = f"""
+      SELECT id, namespace, ref, name, summary, price, brand, url
+      FROM catalog_items
+      WHERE namespace = ?
+        AND ({' OR '.join(like_terms)})
+      ORDER BY
+        CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END,
+        CASE WHEN ref IS NULL OR ref='' THEN 1 ELSE 0 END,
+        ref
+      LIMIT 300
     """
-    r = (ref or "").strip()
-    if not r:
-        return ""
-    r = r.replace("#sku=","")
-    # corta em separadores comuns
-    head = re.split(r"(--|_|-|\s|\.)", r, maxsplit=1)[0]
-    # se for tipo ABC1234, devolve ABC ou ABC1234 conforme existir dígitos cedo
-    m = re.match(r"^([A-Z]{2,6})", head, flags=re.I)
-    if m:
-        return m.group(1).upper()
-    return head[:6].upper()
+    conn = _db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
-def _hf_fetch_seed_by_url(con, namespace: str, base_url: str, limit: int = 800) -> List[sqlite3.Row]:
-    base = base_url.rstrip("/")
-    like1 = base + "%"
-    like2 = base + "/%"
-    q = """
-    SELECT id, namespace, ref, name, price, brand, url, summary
-    FROM catalog_items
-    WHERE namespace = ?
-      AND url IS NOT NULL
-      AND (url LIKE ? OR url LIKE ?)
-    ORDER BY
-      CASE WHEN instr(url, '#sku=') > 0 THEN 0 ELSE 1 END,
-      url ASC
-    LIMIT ?
+def _parent_url(url: str) -> str:
+    u = (url or "").strip()
+    if "#sku=" in u:
+        return u.split("#sku=", 1)[0]
+    return u
+
+def _group_variants(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
     """
-    return con.execute(q, (namespace, like1, like2, limit)).fetchall()
-
-def _hf_fetch_expand_by_name_brand_ref(
-    con,
-    namespace: str,
-    base_name: str,
-    brand: Optional[str],
-    ref_prefix: str,
-    limit: int = 1200
-) -> List[sqlite3.Row]:
-    # base_name pode aparecer como "Produto" ou "Produto — Variante"
-    name_like1 = base_name + "%"
-    # ref_prefix: agrupa variantes com o mesmo prefixo
-    ref_like = (ref_prefix + "%") if ref_prefix else None
-
-    params: List[Any] = [namespace, name_like1]
-    brand_clause = ""
-    if brand:
-        brand_clause = " AND (brand = ? OR brand IS NULL OR brand = '') "
-        params.append(brand)
-
-    ref_clause = ""
-    if ref_like:
-        ref_clause = " OR (ref IS NOT NULL AND ref LIKE ?) "
-        params.append(ref_like)
-
-    q = f"""
-    SELECT id, namespace, ref, name, price, brand, url, summary
-    FROM catalog_items
-    WHERE namespace = ?
-      AND (
-        (name IS NOT NULL AND name LIKE ?){brand_clause}
-        {ref_clause}
-      )
-    ORDER BY
-      CASE WHEN url IS NOT NULL AND instr(url, '#sku=') > 0 THEN 0 ELSE 1 END,
-      CASE WHEN ref IS NOT NULL THEN 0 ELSE 1 END,
-      name ASC
-    LIMIT ?
+    Agrupa por (parent_url, name_base aproximado):
+    - parent_url = antes de #sku=
+    - name_base = parte antes de " — " se existir
     """
-    params.append(limit)
-    return con.execute(q, tuple(params)).fetchall()
-
-def _hf_rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
-    out=[]
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for r in rows:
-        out.append({
-            "id": r["id"],
-            "namespace": r["namespace"],
-            "ref": r["ref"],
-            "name": r["name"],
-            "price": r["price"],
-            "brand": r["brand"],
-            "url": r["url"],
-            "summary": r["summary"],
-        })
-    return out
+        url = r.get("url") or ""
+        parent = _parent_url(url)
+        name = r.get("name") or ""
+        base = name.split(" — ", 1)[0].strip()
+        key = (parent, base.lower())
+        groups.setdefault(key, []).append(r)
+    # ordenar dentro de cada grupo
+    for k, lst in groups.items():
+        lst.sort(key=lambda x: (0 if "#sku=" in (x.get("url") or "") else 1, (x.get("ref") or "")))
+    return groups
 
-def _hf_dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen=set(); out=[]
-    for it in items:
-        # preferir ref; se não houver, usar url+name
-        key = (it.get("ref") or "") or f"{it.get('url') or ''}||{it.get('name') or ''}"
-        if key in seen: 
+def _catalog_context_block(ns: str, question: str) -> str:
+    skus = _extract_skus(question)
+    slugs = _extract_slugs(question)
+    keys  = _extract_keywords(question)
+
+    rows = []
+    rows += _db_rows_by_ref(ns, skus)
+    rows += _db_rows_by_like(ns, slugs, keys)
+
+    # dedup por id
+    seen = set()
+    uniq = []
+    for r in rows:
+        rid = r.get("id")
+        if rid in seen:
             continue
-        seen.add(key)
-        out.append(it)
-    return out
+        seen.add(rid)
+        uniq.append(r)
 
-def _hf_group_key(it: Dict[str, Any]) -> Tuple[str,str]:
-    # agrupar por nome-base + marca (mais estável do que URL no teu caso)
-    base_name = _hf_norm_name_base(it.get("name") or "")
-    brand = (it.get("brand") or "").strip().lower()
-    return (base_name.lower(), brand)
-
-def _hf_build_variants_block(items: List[Dict[str, Any]]) -> str:
-    if not items:
+    if not uniq:
         return ""
-    groups: Dict[Tuple[str,str], List[Dict[str, Any]]] = {}
-    for it in items:
-        groups.setdefault(_hf_group_key(it), []).append(it)
 
-    def is_variant(u: str) -> bool:
-        return ("#sku=" in (u or ""))
+    groups = _group_variants(uniq)
 
-    lines = ["CATÁLOGO — VARIANTES (COMPLETO)"]
-    for (bn, br), rows in groups.items():
-        # ordena variantes primeiro
-        rows = sorted(rows, key=lambda x: (0 if is_variant(x.get("url") or "") else 1, (x.get("url") or ""), (x.get("ref") or "")))
-        title = bn or "(sem nome)"
-        if br:
-            title += f" • marca: {br}"
-        lines.append(f"\nProduto: {title}")
-        for r in rows:
-            ref = r.get("ref") or "(sem ref)"
-            name = r.get("name") or "(sem nome)"
+    lines = []
+    lines.append("CATALOGO_INTERNO (catalog_items) — DADOS BRUTOS PARA USAR (SEM INVENTAR)")
+    lines.append(f"namespace={ns or globals().get('DEFAULT_NAMESPACE') or 'boasafra'}")
+    lines.append("Regras: se houver variantes (#sku=), dar prioridade a essas linhas.")
+
+    # lista por grupos, e dentro do grupo todas as linhas (isto é o que te faltava)
+    for (parent, base), lst in groups.items():
+        lines.append("")
+        lines.append(f"PRODUTO_BASE: {base} | parent_url: {parent}")
+        for r in lst:
+            ref = r.get("ref") or ""
             price = r.get("price")
-            price_s = f"{price}" if price is not None else "(sem preço)"
-            url = r.get("url") or "(sem url)"
-            lines.append(f"- {name} | SKU: {ref} | Preço: {price_s} | URL: {url}")
-    return "\n".join(lines).strip()
+            brand = r.get("brand") or ""
+            url = r.get("url") or ""
+            # tenta extrair Variante: do summary se existir, senão vazio
+            summary = (r.get("summary") or "")
+            m = re.search(r"(?:^|\n)\s*Variante:\s*(.+)", summary, flags=re.IGNORECASE)
+            variant = (m.group(1).strip() if m else "")
+            # linha curta mas completa
+            lines.append(f"- VAR | ref={ref} | price={price} | brand={brand} | variant={variant} | url={url}")
 
-def _apply_hotfix_variants_injection_hybrid():
-    target: Optional[APIRoute] = None
-    for r in app.routes:
-        if isinstance(r, APIRoute) and r.path == "/ask" and "POST" in (r.methods or set()):
-            target = r
-            break
-    if not target:
-        try: log.warning("[HOTFIX] /ask não encontrado (variants hybrid).")
-        except Exception: pass
-        return
+    return "\n".join(lines)
 
-    async def patched(request: Request):
-        data = await request.json()
-        question = (data.get("question") or "").strip()
-        user_id = (data.get("user_id") or "").strip() or "anon"
-        namespace = (data.get("namespace") or "").strip() or None
-        ns_eff = namespace or DEFAULT_NAMESPACE
+# ---- Monkey-patch do /ask ----
+# Guardar a função original, se existir
+_ASK_ORIGINAL = globals().get("ask")
 
-        req_top_k = data.get("top_k")
-        decided_top_k = _decide_top_k(question, req_top_k)
+@app.post("/ask")
+async def ask(request: Request):
+    data = await request.json()
+    question = (data.get("question") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or "anon"
+    namespace = (data.get("namespace") or "").strip() or None
+    req_top_k = data.get("top_k")
+    decided_top_k = _decide_top_k(question, req_top_k)
 
-        if not question:
-            return {"answer": "Coloca a tua pergunta em 'question'."}
+    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
+    if not question:
+        return {"answer": "Coloca a tua pergunta em 'question'."}
 
-        _ = build_rag_products_block(question)
-        messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, ns_eff)
+    # mantém o teu fluxo atual
+    _ = build_rag_products_block(question)
+    messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, namespace)
 
-        # >>> injeta TODAS as variantes (agrupamento híbrido)
-        if _hf_is_quote_like(question):
-            db_path = _hf_db_path()
-            hits = _hf_extract_slug_or_urls(question)
-            bases = []
-            for h in hits:
-                b = _hf_base_url_from_any(h)
-                if b: bases.append(b)
+    # 🔥 HOTFIX: injeta contexto do catálogo (forte)
+    try:
+        cat_block = _catalog_context_block(namespace or DEFAULT_NAMESPACE, question)
+        if cat_block:
+            messages.append({"role": "system", "content": cat_block})
+    except Exception as e:
+        log.exception(f"[hotfix catalog context] falhou: {e}")
 
-            # fallback leve: tenta apanhar um slug no texto
-            if not bases:
-                m = re.search(r"\b([a-z0-9][a-z0-9\-]{2,})\b", question.lower())
-                if m:
-                    bases.append(f"https://interiorguider.com/{m.group(1)}")
+    try:
+        answer = grok_chat(messages)
+    except Exception as e:
+        log.exception("Erro ao chamar a x.ai")
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
-            all_items: List[Dict[str, Any]] = []
+    answer = _postprocess_answer(answer, question, namespace, decided_top_k)
 
-            con = sqlite3.connect(db_path)
-            con.row_factory = sqlite3.Row
-            try:
-                for b in list(dict.fromkeys(bases))[:6]:
-                    seed = _hf_fetch_seed_by_url(con, ns_eff, b, limit=1200)
-                    seed_items = _hf_rows_to_dicts(seed)
-                    all_items.extend(seed_items)
+    # ⚠️ se tens isto a forçar links do RAG, mantém, mas aqui é onde costuma estragar a “pureza catálogo-only”
+    # Se estiveres a ver links do RAG em orçamentos, o problema é este force_links_block.
+    answer = _force_links_block(answer, rag_hits, min_links=3)
 
-                    # expandir por nome-base + marca + prefixo ref (se seed parece “incompleto”)
-                    if seed_items:
-                        base_name = _hf_norm_name_base(seed_items[0].get("name") or "")
-                        brand = seed_items[0].get("brand") or None
-                        ref_prefix = _hf_ref_prefix(seed_items[0].get("ref") or "")
-                        exp = _hf_fetch_expand_by_name_brand_ref(con, ns_eff, base_name, brand, ref_prefix, limit=2000)
-                        all_items.extend(_hf_rows_to_dicts(exp))
-            finally:
-                try: con.close()
-                except Exception: pass
+    local_append_dialog(user_id, question, answer)
+    _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
 
-            all_items = _hf_dedupe_items(all_items)
-            block = _hf_build_variants_block(all_items)
-
-            if block:
-                messages = messages[:-1] + [
-                    {"role":"system","content":"Se houver variantes no bloco seguinte, tens de listar TODAS (não omitir)."},
-                    {"role":"system","content": block},
-                ] + messages[-1:]
-
-        try:
-            answer = grok_chat(messages)
-        except Exception as e:
-            try: log.exception("Erro ao chamar a x.ai (HOTFIX variants hybrid)")
-            except Exception: pass
-            return {"answer": f"Erro ao chamar o Grok-4: {e}"}
-
-        answer = _postprocess_answer(answer, question, ns_eff, decided_top_k)
-
-        # em orçamentos, não forçar links do RAG
-        if not _hf_is_quote_like(question):
-            answer = _force_links_block(answer, rag_hits, min_links=3)
-
-        try:
-            local_append_dialog(user_id, question, answer)
-            _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-            _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-        except Exception:
-            pass
-
-        return {
-            "answer": answer,
-            "new_facts_detected": new_facts,
-            "rag": {
-                "used": rag_used,
-                "top_k_default": RAG_TOP_K_DEFAULT,
-                "top_k_effective": decided_top_k,
-                "namespace": ns_eff
-            }
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
         }
+    }
 
-    target.endpoint = patched
-    target.dependant.call = patched
-    try: log.info("[HOTFIX] /ask: variantes completas com agrupamento híbrido (URL+nome+ref) aplicado.")
-    except Exception: pass
-
-_apply_hotfix_variants_injection_hybrid()
 # ======================================================================
 
 
