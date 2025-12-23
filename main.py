@@ -3572,6 +3572,189 @@ if "build_catalog_variants_block" in globals():
 
 # ===================== /HOTFIX =====================
 
+# ======================================================================
+# HOTFIX: listar 100% das variantes (grupo por URL-pai/slug) em orçamentos
+# Colar NO FINAL do main.py
+# Requer: CATALOG_DB_PATH = "/data/catalog.db"
+# ======================================================================
+
+import sqlite3, re
+from fastapi.routing import APIRoute
+from typing import Optional, List, Dict, Any
+
+def _hf_db_path() -> str:
+    return CATALOG_DB_PATH
+
+def _hf_extract_slug_or_urls(text: str) -> List[str]:
+    s = (text or "").strip()
+    urls = re.findall(r"https?://[^\s)]+", s, flags=re.I)
+    slugs = re.findall(r"(?:/|^)([a-z0-9][a-z0-9\-]{2,})(?:/|$)", s.lower())
+    out: List[str] = []
+    out.extend(urls)
+    out.extend(slugs)
+    seen=set(); r=[]
+    for x in out:
+        if x in seen: continue
+        seen.add(x); r.append(x)
+    return r
+
+def _hf_base_url_from_any(x: str) -> Optional[str]:
+    x = (x or "").strip()
+    if not x:
+        return None
+    if x.startswith("http://") or x.startswith("https://"):
+        return x.split("#sku=")[0].rstrip("/")
+    if re.fullmatch(r"[a-z0-9][a-z0-9\-]{2,}", x.lower()):
+        return f"https://interiorguider.com/{x.lower()}"
+    return None
+
+def _hf_fetch_all_by_base_url(db_path: str, namespace: str, base_url: str, limit: int = 400) -> List[Dict[str, Any]]:
+    base = base_url.rstrip("/")
+    like1 = base + "%"
+    like2 = base + "/%"
+
+    q = """
+    SELECT id, namespace, ref, name, price, brand, url, summary
+    FROM catalog_items
+    WHERE namespace = ?
+      AND (url LIKE ? OR url LIKE ?)
+    ORDER BY
+      CASE WHEN instr(url, '#sku=') > 0 THEN 0 ELSE 1 END,
+      url ASC
+    LIMIT ?
+    """
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        cur = con.execute(q, (namespace, like1, like2, limit))
+        return [{
+            "id": r["id"], "namespace": r["namespace"], "ref": r["ref"],
+            "name": r["name"], "price": r["price"], "brand": r["brand"],
+            "url": r["url"], "summary": r["summary"]
+        } for r in cur.fetchall()]
+    finally:
+        con.close()
+
+def _hf_build_variants_block(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        u = (r.get("url") or "")
+        base = u.split("#sku=")[0].rstrip("/")
+        groups.setdefault(base, []).append(r)
+
+    lines = ["CATÁLOGO — VARIANTES (COMPLETO)"]
+    for base, items in groups.items():
+        lines.append(f"\nProduto (URL-pai): {base}")
+        for it in items:
+            ref = it.get("ref") or "(sem ref)"
+            name = it.get("name") or "(sem nome)"
+            price = it.get("price")
+            price_s = f"{price}" if price is not None else "(sem preço)"
+            url = it.get("url") or "(sem url)"
+            lines.append(f"- {name} | SKU: {ref} | Preço: {price_s} | URL: {url}")
+    return "\n".join(lines).strip()
+
+def _hf_is_quote_like(q: str) -> bool:
+    s = (q or "").lower()
+    return any(k in s for k in ["orçamento","orcamento","cotação","cotacao","proforma","preço","preco","subtotal","iva"])
+
+def _apply_hotfix_variants_injection():
+    target: Optional[APIRoute] = None
+    for r in app.routes:
+        if isinstance(r, APIRoute) and r.path == "/ask" and "POST" in (r.methods or set()):
+            target = r
+            break
+    if not target:
+        try: log.warning("[HOTFIX] /ask não encontrado (variants injection).")
+        except Exception: pass
+        return
+
+    async def patched(request: Request):
+        data = await request.json()
+        question = (data.get("question") or "").strip()
+        user_id = (data.get("user_id") or "").strip() or "anon"
+        namespace = (data.get("namespace") or "").strip() or None
+        ns_eff = namespace or DEFAULT_NAMESPACE
+
+        req_top_k = data.get("top_k")
+        decided_top_k = _decide_top_k(question, req_top_k)
+
+        if not question:
+            return {"answer": "Coloca a tua pergunta em 'question'."}
+
+        _ = build_rag_products_block(question)
+        messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, ns_eff)
+
+        # >>> injeta TODAS as variantes do(s) produto(s) por URL-pai
+        if _hf_is_quote_like(question):
+            db_path = _hf_db_path()
+            hits = _hf_extract_slug_or_urls(question)
+            bases = []
+            for h in hits:
+                b = _hf_base_url_from_any(h)
+                if b: bases.append(b)
+
+            # fallback leve: primeira palavra estilo slug
+            if not bases:
+                m = re.search(r"\b([a-z0-9][a-z0-9\-]{2,})\b", question.lower())
+                if m:
+                    bases.append(f"https://interiorguider.com/{m.group(1)}")
+
+            all_rows: List[Dict[str, Any]] = []
+            for b in list(dict.fromkeys(bases))[:6]:
+                try:
+                    all_rows.extend(_hf_fetch_all_by_base_url(db_path, ns_eff, b, limit=800))
+                except Exception:
+                    pass
+
+            block = _hf_build_variants_block(all_rows)
+            if block:
+                messages = messages[:-1] + [
+                    {"role":"system","content":"Se houver variantes no bloco seguinte, tens de listar TODAS (não omitir)."},
+                    {"role":"system","content": block},
+                ] + messages[-1:]
+
+        try:
+            answer = grok_chat(messages)
+        except Exception as e:
+            try: log.exception("Erro ao chamar a x.ai (HOTFIX variants)")
+            except Exception: pass
+            return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+        answer = _postprocess_answer(answer, question, ns_eff, decided_top_k)
+
+        # em orçamentos, não forçar links do RAG
+        if not _hf_is_quote_like(question):
+            answer = _force_links_block(answer, rag_hits, min_links=3)
+
+        try:
+            local_append_dialog(user_id, question, answer)
+            _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+            _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+        except Exception:
+            pass
+
+        return {
+            "answer": answer,
+            "new_facts_detected": new_facts,
+            "rag": {
+                "used": rag_used,
+                "top_k_default": RAG_TOP_K_DEFAULT,
+                "top_k_effective": decided_top_k,
+                "namespace": ns_eff
+            }
+        }
+
+    target.endpoint = patched
+    target.dependant.call = patched
+    try: log.info("[HOTFIX] /ask: injeção de variantes completas por URL-pai aplicada (DB fixa).")
+    except Exception: pass
+
+_apply_hotfix_variants_injection()
+
+# ======================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
