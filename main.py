@@ -3509,7 +3509,165 @@ def _final_fix_incoherences():
 
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
+# ==== HOTFIX: variantes por url_canonical + continuidade de orçamento por sessão ====
+import re
+import sqlite3
+from typing import Optional, List, Dict, Any, Tuple
 
+def _db() -> sqlite3.Connection:
+    con = sqlite3.connect(CATALOG_DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def _is_quote_intent(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(k in ql for k in ["orçamento", "orcamento", "cotação", "cotacao", "proforma", "preço", "preco"])
+
+def _pick_ref_or_name(q: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Heurística simples:
+    - ref/SKU: coisas do tipo 740021316-2.-NI ou ORK.02.03 (adaptar se necessário)
+    - nome: fallback = frase sem números longos
+    """
+    if not q:
+        return None, None
+    # SKU/ref típico com dígitos+traços/pontos
+    m = re.search(r'\b[A-Z]{2,}\.\d{2}\.\d{2}\b', q)
+    if m:
+        return m.group(0), None
+    m = re.search(r'\b\d{6,}[-.\w]*\b', q)
+    if m:
+        return m.group(0), None
+    # nome: remove quantidades simples
+    name = re.sub(r'\b\d+\s*(x|un|uni|unidade|unidades)\b', '', q, flags=re.I).strip()
+    return None, name or None
+
+def _get_item_by_ref(namespace: str, ref: str) -> Optional[Dict[str, Any]]:
+    with _db() as con:
+        row = con.execute(
+            "SELECT * FROM catalog_items WHERE namespace=? AND ref=? LIMIT 1",
+            (namespace, ref)
+        ).fetchone()
+        return dict(row) if row else None
+
+def _get_item_by_name_like(namespace: str, name: str) -> Optional[Dict[str, Any]]:
+    with _db() as con:
+        row = con.execute(
+            "SELECT * FROM catalog_items WHERE namespace=? AND name LIKE ? ORDER BY id DESC LIMIT 1",
+            (namespace, f"%{name}%")
+        ).fetchone()
+        return dict(row) if row else None
+
+def _get_variants_by_canonical(namespace: str, url_canonical: str) -> List[Dict[str, Any]]:
+    with _db() as con:
+        rows = con.execute(
+            """
+            SELECT * FROM catalog_items
+            WHERE namespace=? AND url_canonical=?
+            ORDER BY ref ASC
+            """,
+            (namespace, url_canonical)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def _build_variants_block(variants: List[Dict[str, Any]]) -> str:
+    """
+    Bloco compacto para a LLM: Variante + ref + price + url (usa url_canonical para link base)
+    NOTA: assumes que tens url_canonical e variant_attrs/name/price/ref.
+    """
+    if not variants:
+        return ""
+    lines = []
+    for v in variants:
+        variant_txt = (v.get("variant_attrs") or "").strip()
+        if not variant_txt:
+            # fallback: tenta extrair "Variante:" do summary já limpo no vosso pipeline
+            summary = (v.get("summary") or "")
+            m = re.search(r'(?im)^\s*Variante:\s*(.+?)\s*$', summary)
+            variant_txt = m.group(1).strip() if m else ""
+        if not variant_txt:
+            # último fallback: tentar ler o sufixo do nome
+            variant_txt = (v.get("name") or "").split("—")[-1].strip() if "—" in (v.get("name") or "") else ""
+        price = v.get("price")
+        ref = v.get("ref")
+        link = (v.get("url_canonical") or v.get("url") or "").strip()
+        lines.append(f"- {variant_txt or '(sem dado)'} | SKU: {ref or '(sem dado)'} | {price if price is not None else '(sem dado)'}€ | {link}")
+    return "VARIANTES (catálogo interno; listar só isto):\n" + "\n".join(lines)
+
+def _extract_last_selected_refs_from_local_history(user_id: str) -> List[str]:
+    """
+    Usa o vosso histórico local (o que o local_append_dialog guarda).
+    Implementação placeholder: tens de ligar à tua função real de leitura do histórico.
+    Se já tens algo como local_get_dialog(user_id), usa isso.
+    """
+    try:
+        hist = local_get_dialog(user_id)  # <-- precisa existir no teu projeto
+    except Exception:
+        return []
+    if not hist:
+        return []
+    # Procura SKUs no texto da Alma que tenham sido apresentados/confirmados
+    text = "\n".join([h.get("content","") for h in hist if isinstance(h, dict)])
+    refs = re.findall(r'\bSKU[:\s]*([A-Za-z0-9.\-]+)\b', text, flags=re.I)
+    # dedup mantendo ordem
+    out = []
+    seen = set()
+    for r in refs:
+        if r not in seen:
+            seen.add(r); out.append(r)
+    return out[-10:]  # não inchar
+
+def _inject_quote_state(messages: List[Dict[str, str]], user_id: str, namespace: str) -> List[Dict[str, str]]:
+    """
+    Acrescenta ao system/context uma lista dos SKUs já escolhidos nesta sessão (se houver).
+    Ajuda a não “perder” quando o user diz "junta mais um produto".
+    """
+    refs = _extract_last_selected_refs_from_local_history(user_id)
+    if not refs:
+        return messages
+    state_lines = []
+    for ref in refs:
+        item = _get_item_by_ref(namespace, ref)
+        if item:
+            state_lines.append(f"- {item.get('name','')} | SKU: {item.get('ref')} | {item.get('price')}€ | {item.get('url_canonical') or item.get('url','')}")
+    if not state_lines:
+        return messages
+
+    state_block = "ESTADO DE ORÇAMENTO (sessão atual; itens já selecionados):\n" + "\n".join(state_lines)
+    # mete como mensagem system extra no início (sem mexer no vosso mission)
+    return ([{"role":"system","content": state_block}] + messages)
+
+def hotfix_variants_and_memory(messages: List[Dict[str,str]], user_id: str, question: str, namespace: str) -> List[Dict[str,str]]:
+    """
+    - Se for orçamento: tenta identificar o produto alvo e injeta TODAS as variantes pelo url_canonical.
+    - Injeta estado do orçamento da sessão (continuidade).
+    """
+    messages2 = _inject_quote_state(messages, user_id, namespace)
+
+    if not _is_quote_intent(question):
+        return messages2
+
+    ref, name = _pick_ref_or_name(question)
+    item = None
+    if ref:
+        item = _get_item_by_ref(namespace, ref)
+    if not item and name:
+        item = _get_item_by_name_like(namespace, name)
+
+    if not item:
+        return messages2
+
+    url_canon = (item.get("url_canonical") or "").strip()
+    if not url_canon:
+        return messages2
+
+    variants = _get_variants_by_canonical(namespace, url_canon)
+    block = _build_variants_block(variants)
+    if not block:
+        return messages2
+
+    messages2 = ([{"role":"system","content": block}] + messages2)
+    return messages2
 
 
 # ======================================================================
