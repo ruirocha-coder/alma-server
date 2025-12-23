@@ -3510,166 +3510,201 @@ def _final_fix_incoherences():
 _final_fix_incoherences()
 # ===================== /HOTFIX FINAL =============================================================
 
+# =====================================================================================
+# HOTFIX (fim do ficheiro): variantes 100% do catálogo + bloquear links RAG em orçamentos
+# =====================================================================================
 
-# ==== HOTFIX: variantes por url_canonical + continuidade de orçamento por sessão ====
 import re
 import sqlite3
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-def _db() -> sqlite3.Connection:
-    con = sqlite3.connect(CATALOG_DB_PATH)
+def _hf_is_budget_question(q: str) -> bool:
+    ql = (q or "").lower()
+    keys = ["orçamento", "orcamento", "cotação", "cotacao", "proforma", "preço", "precos", "preços", "quantidade", "subtotal"]
+    return any(k in ql for k in keys)
+
+def _hf_wants_variants(q: str) -> bool:
+    ql = (q or "").lower()
+    keys = ["variantes", "variante", "opções", "opcoes", "opcao", "cores", "tecidos", "acabamentos"]
+    return any(k in ql for k in keys)
+
+def _hf_db_connect() -> sqlite3.Connection:
+    # usa o teu path
+    path = CATALOG_DB_PATH if 'CATALOG_DB_PATH' in globals() and CATALOG_DB_PATH else "/data/catalog.db"
+    con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     return con
 
-def _is_quote_intent(q: str) -> bool:
-    ql = (q or "").lower()
-    return any(k in ql for k in ["orçamento", "orcamento", "cotação", "cotacao", "proforma", "preço", "preco"])
+def _hf_norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def _pick_ref_or_name(q: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Heurística simples:
-    - ref/SKU: coisas do tipo 740021316-2.-NI ou ORK.02.03 (adaptar se necessário)
-    - nome: fallback = frase sem números longos
-    """
-    if not q:
-        return None, None
-    # SKU/ref típico com dígitos+traços/pontos
-    m = re.search(r'\b[A-Z]{2,}\.\d{2}\.\d{2}\b', q)
-    if m:
-        return m.group(0), None
-    m = re.search(r'\b\d{6,}[-.\w]*\b', q)
-    if m:
-        return m.group(0), None
-    # nome: remove quantidades simples
-    name = re.sub(r'\b\d+\s*(x|un|uni|unidade|unidades)\b', '', q, flags=re.I).strip()
-    return None, name or None
+def _hf_strip_hash(url: str) -> str:
+    u = (url or "").strip()
+    if "#sku=" in u:
+        u = u.split("#sku=", 1)[0]
+    return u
 
-def _get_item_by_ref(namespace: str, ref: str) -> Optional[Dict[str, Any]]:
-    with _db() as con:
-        row = con.execute(
-            "SELECT * FROM catalog_items WHERE namespace=? AND ref=? LIMIT 1",
-            (namespace, ref)
-        ).fetchone()
-        return dict(row) if row else None
-
-def _get_item_by_name_like(namespace: str, name: str) -> Optional[Dict[str, Any]]:
-    with _db() as con:
-        row = con.execute(
-            "SELECT * FROM catalog_items WHERE namespace=? AND name LIKE ? ORDER BY id DESC LIMIT 1",
-            (namespace, f"%{name}%")
-        ).fetchone()
-        return dict(row) if row else None
-
-def _get_variants_by_canonical(namespace: str, url_canonical: str) -> List[Dict[str, Any]]:
-    with _db() as con:
+def _hf_get_variants_by_canonical(ns: str, url_canonical: str) -> List[Dict[str, Any]]:
+    if not url_canonical:
+        return []
+    con = _hf_db_connect()
+    try:
         rows = con.execute(
             """
-            SELECT * FROM catalog_items
-            WHERE namespace=? AND url_canonical=?
+            SELECT id, namespace, ref, name, price, brand, url, url_canonical, variant_attrs, summary
+            FROM catalog_items
+            WHERE namespace = ?
+              AND url_canonical = ?
             ORDER BY ref ASC
             """,
-            (namespace, url_canonical)
+            (ns, url_canonical),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        con.close()
 
-def _build_variants_block(variants: List[Dict[str, Any]]) -> str:
+def _hf_pick_canonical_for_product_name(ns: str, product_name: str) -> Optional[str]:
     """
-    Bloco compacto para a LLM: Variante + ref + price + url (usa url_canonical para link base)
-    NOTA: assumes que tens url_canonical e variant_attrs/name/price/ref.
+    Encontra o url_canonical com mais variantes para um nome (LIKE).
+    Isto evita depender do LLM.
     """
-    if not variants:
-        return ""
-    lines = []
-    for v in variants:
-        variant_txt = (v.get("variant_attrs") or "").strip()
-        if not variant_txt:
-            # fallback: tenta extrair "Variante:" do summary já limpo no vosso pipeline
-            summary = (v.get("summary") or "")
-            m = re.search(r'(?im)^\s*Variante:\s*(.+?)\s*$', summary)
-            variant_txt = m.group(1).strip() if m else ""
-        if not variant_txt:
-            # último fallback: tentar ler o sufixo do nome
-            variant_txt = (v.get("name") or "").split("—")[-1].strip() if "—" in (v.get("name") or "") else ""
-        price = v.get("price")
-        ref = v.get("ref")
-        link = (v.get("url_canonical") or v.get("url") or "").strip()
-        lines.append(f"- {variant_txt or '(sem dado)'} | SKU: {ref or '(sem dado)'} | {price if price is not None else '(sem dado)'}€ | {link}")
-    return "VARIANTES (catálogo interno; listar só isto):\n" + "\n".join(lines)
+    pn = _hf_norm(product_name)
+    if not pn:
+        return None
 
-def _extract_last_selected_refs_from_local_history(user_id: str) -> List[str]:
-    """
-    Usa o vosso histórico local (o que o local_append_dialog guarda).
-    Implementação placeholder: tens de ligar à tua função real de leitura do histórico.
-    Se já tens algo como local_get_dialog(user_id), usa isso.
-    """
+    con = _hf_db_connect()
     try:
-        hist = local_get_dialog(user_id)  # <-- precisa existir no teu projeto
-    except Exception:
-        return []
-    if not hist:
-        return []
-    # Procura SKUs no texto da Alma que tenham sido apresentados/confirmados
-    text = "\n".join([h.get("content","") for h in hist if isinstance(h, dict)])
-    refs = re.findall(r'\bSKU[:\s]*([A-Za-z0-9.\-]+)\b', text, flags=re.I)
-    # dedup mantendo ordem
-    out = []
-    seen = set()
-    for r in refs:
-        if r not in seen:
-            seen.add(r); out.append(r)
-    return out[-10:]  # não inchar
+        # procura por name que contenha o termo (base ou "— variante")
+        rows = con.execute(
+            """
+            SELECT url_canonical, COUNT(*) as c
+            FROM catalog_items
+            WHERE namespace = ?
+              AND lower(name) LIKE ?
+              AND url_canonical IS NOT NULL
+              AND trim(url_canonical) <> ''
+            GROUP BY url_canonical
+            ORDER BY c DESC
+            LIMIT 5
+            """,
+            (ns, f"%{pn}%"),
+        ).fetchall()
+        if not rows:
+            return None
+        return rows[0]["url_canonical"]
+    finally:
+        con.close()
 
-def _inject_quote_state(messages: List[Dict[str, str]], user_id: str, namespace: str) -> List[Dict[str, str]]:
+def _hf_extract_product_hint(question: str) -> str:
     """
-    Acrescenta ao system/context uma lista dos SKUs já escolhidos nesta sessão (se houver).
-    Ajuda a não “perder” quando o user diz "junta mais um produto".
+    Heurística simples: tenta apanhar um nome tipo "Zeal Laser" no texto.
+    Não é perfeito, mas funciona bem no teu caso.
     """
-    refs = _extract_last_selected_refs_from_local_history(user_id)
-    if not refs:
-        return messages
-    state_lines = []
-    for ref in refs:
-        item = _get_item_by_ref(namespace, ref)
-        if item:
-            state_lines.append(f"- {item.get('name','')} | SKU: {item.get('ref')} | {item.get('price')}€ | {item.get('url_canonical') or item.get('url','')}")
-    if not state_lines:
-        return messages
+    q = (question or "").strip()
+    # tenta apanhar algo entre aspas
+    m = re.search(r"[“\"']([^”\"']{3,80})[”\"']", q)
+    if m:
+        return m.group(1).strip()
+    # senão, tenta capturar duas palavras com maiúscula (ex.: Zeal Laser)
+    m = re.search(r"\b([A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇ]+(?:\s+[A-ZÁÂÃÀÉÊÍÓÔÕÚÇ][\wÁÂÃÀÉÊÍÓÔÕÚÇ]+){1,3})\b", q)
+    return (m.group(1).strip() if m else "")
 
-    state_block = "ESTADO DE ORÇAMENTO (sessão atual; itens já selecionados):\n" + "\n".join(state_lines)
-    # mete como mensagem system extra no início (sem mexer no vosso mission)
-    return ([{"role":"system","content": state_block}] + messages)
-
-def hotfix_variants_and_memory(messages: List[Dict[str,str]], user_id: str, question: str, namespace: str) -> List[Dict[str,str]]:
+def _hf_format_variants_block(items: List[Dict[str, Any]]) -> str:
     """
-    - Se for orçamento: tenta identificar o produto alvo e injeta TODAS as variantes pelo url_canonical.
-    - Injeta estado do orçamento da sessão (continuidade).
+    Markdown com tabela (o teu chat HTML já faz linkify).
     """
-    messages2 = _inject_quote_state(messages, user_id, namespace)
+    if not items:
+        return ""
 
-    if not _is_quote_intent(question):
-        return messages2
+    # tenta inferir o "nome base" a partir do primeiro item
+    first_name = (items[0].get("name") or "").strip()
+    title = first_name.split("—")[0].strip() if "—" in first_name else first_name
 
-    ref, name = _pick_ref_or_name(question)
-    item = None
-    if ref:
-        item = _get_item_by_ref(namespace, ref)
-    if not item and name:
-        item = _get_item_by_name_like(namespace, name)
+    lines = []
+    lines.append(f"**Variantes no catálogo interno — {title}**")
+    lines.append("")
+    lines.append("| Variante | SKU | Preço (IVA incl.) | Link |")
+    lines.append("|---|---:|---:|---|")
 
-    if not item:
-        return messages2
+    for r in items:
+        v = (r.get("variant_attrs") or "").strip()
+        if not v:
+            # fallback: tenta extrair de summary "Variante: ..."
+            s = (r.get("summary") or "")
+            m = re.search(r"(?:^|\n)\s*Variante:\s*(.+)", s, flags=re.I)
+            v = (m.group(1).strip() if m else "(sem dado)")
 
-    url_canon = (item.get("url_canonical") or "").strip()
-    if not url_canon:
-        return messages2
+        ref = (r.get("ref") or "").strip() or "(sem dado)"
+        price = r.get("price", None)
+        price_txt = (f"{float(price):.2f} €" if price is not None and str(price).strip() != "" else "(sem dado)")
 
-    variants = _get_variants_by_canonical(namespace, url_canon)
-    block = _build_variants_block(variants)
-    if not block:
-        return messages2
+        url = (r.get("url") or "").strip()
+        # se a tua tabela tiver lixo slug+sku, o url_canonical é o “bom”
+        # aqui: mostra SEMPRE o link canónico se existir
+        urlc = (r.get("url_canonical") or "").strip()
+        link = urlc or _hf_strip_hash(url) or "(sem dado)"
 
-    messages2 = ([{"role":"system","content": block}] + messages2)
-    return messages2
+        lines.append(f"| {v} | {ref} | {price_txt} | [ver produto]({link}) |")
+
+    lines.append("")
+    lines.append("Preço com IVA incluído; portes não incluídos.")
+    return "\n".join(lines)
+
+# --- override do _force_links_block para não injetar links do RAG em orçamentos ---
+if "_force_links_block" in globals() and callable(globals()["_force_links_block"]):
+    _orig_force_links_block = globals()["_force_links_block"]
+
+    def _force_links_block(answer: str, rag_hits: Any, min_links: int = 3):  # type: ignore
+        # Se for orçamento/preço, não acrescentar links do RAG.
+        # (mantém a política do teu mission)
+        try:
+            if _hf_is_budget_question(answer):
+                return answer
+        except Exception:
+            pass
+        return _orig_force_links_block(answer, rag_hits, min_links=min_links)
+
+    globals()["_force_links_block"] = _force_links_block
+
+# --- override do _postprocess_answer: injeta TODAS as variantes por url_canonical ---
+if "_postprocess_answer" in globals() and callable(globals()["_postprocess_answer"]):
+    _orig_postprocess = globals()["_postprocess_answer"]
+
+    def _postprocess_answer(answer: str, question: str, namespace: Optional[str], decided_top_k: Optional[int] = None):  # type: ignore
+        ns = namespace or (DEFAULT_NAMESPACE if "DEFAULT_NAMESPACE" in globals() else "boasafra")
+
+        # 1) corre o teu pós-process original (para não perderes outras regras)
+        out = _orig_postprocess(answer, question, namespace, decided_top_k)
+
+        # 2) se o pedido for variantes/opções (ou orçamento), força bloco completo do catálogo
+        if _hf_wants_variants(question) or _hf_is_budget_question(question):
+            hint = _hf_extract_product_hint(question)
+
+            # tenta obter canonical pelo nome
+            canonical = _hf_pick_canonical_for_product_name(ns, hint) if hint else None
+
+            # fallback: se não achou pelo hint, tenta pela própria resposta (às vezes a Alma já diz "Zeal Laser")
+            if not canonical and out:
+                canonical = _hf_pick_canonical_for_product_name(ns, _hf_extract_product_hint(out) or hint)
+
+            if canonical:
+                variants = _hf_get_variants_by_canonical(ns, canonical)
+
+                # se houver variantes, injeta SEMPRE a lista completa (até 50/100, aqui não limitamos)
+                if len(variants) >= 2:
+                    block = _hf_format_variants_block(variants)
+
+                    # se o LLM já mostrou poucas, substitui a parte final por algo determinístico
+                    # (não tenta “mesclar” para evitar cortes/duplicações)
+                    return block
+
+        return out
+
+    globals()["_postprocess_answer"] = _postprocess_answer
+
+# =====================================================================================
+# FIM HOTFIX
+# =====================================================================================
 
 
 # ======================================================================
