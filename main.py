@@ -3672,7 +3672,260 @@ def hotfix_variants_and_memory(messages: List[Dict[str,str]], user_id: str, ques
 
 # ======================================================================
 
+# ============================================================
+# HOTFIX: CATALOG CONTEXT STRONG (v2)
+# - Faz lookup direto em /data/catalog.db
+# - Injeta contexto com TODAS as variantes encontradas
+# - Ajuda multi-produto (4 itens na mesma pergunta)
+# ============================================================
 
+import re
+import sqlite3
+from typing import List, Dict, Any, Tuple
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _extract_slugs(text: str) -> List[str]:
+    # apanha /zeal-laser ou zeal-laser (se vier com /)
+    slugs = re.findall(r"\/([a-z0-9][a-z0-9\-]{2,})\/?", text.lower())
+    # remove coisas óbvias que não são slugs de produto
+    blacklist = {"ask", "catalog", "import", "search", "static"}
+    slugs = [s for s in slugs if s not in blacklist]
+    # dedup mantendo ordem
+    out = []
+    seen = set()
+    for s in slugs:
+        if s not in seen:
+            out.append(s); seen.add(s)
+    return out
+
+def _extract_skus(text: str) -> List[str]:
+    # SKU “tipo BigCommerce”: letras/números + . _ -
+    # Ex.: ORK.02.03  | KOR0440--ME-AS | LAM0100
+    raw = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", text.upper())
+    # dedup mantendo ordem
+    out = []
+    seen = set()
+    for x in raw:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out[:30]
+
+def _extract_keywords(text: str) -> List[str]:
+    # palavras “grandes” que ajudam no LIKE (ex.: zeal, orikomi, dublexo)
+    words = re.findall(r"[A-Za-zÀ-ÿ0-9\-]{3,}", text)
+    words = [w.lower() for w in words]
+    stop = {
+        "para","com","sem","que","isto","isso","uma","uns","umas","dos","das","por",
+        "preco","preço","iva","incluido","incluído","portes","entrega","prazo",
+        "quero","preciso","faz","diz","lista","mostra","acrescenta","adiciona",
+        "produto","produtos","variante","variantes","catalogo","catálogo"
+    }
+    keep = [w for w in words if w not in stop and len(w) >= 3]
+    # dedup ordem
+    out = []
+    seen=set()
+    for w in keep:
+        if w not in seen:
+            out.append(w); seen.add(w)
+    return out[:12]
+
+def _db_connect():
+    # usa a tua variável global já existente, senão fallback
+    path = globals().get("CATALOG_DB_PATH") or "/data/catalog.db"
+    return sqlite3.connect(path)
+
+def _db_rows_by_ref(ns: str, refs: List[str]) -> List[Dict[str, Any]]:
+    if not refs:
+        return []
+    ns = ns or globals().get("DEFAULT_NAMESPACE") or "boasafra"
+    qmarks = ",".join(["?"] * len(refs))
+    sql = f"""
+      SELECT id, namespace, ref, name, summary, price, brand, url
+      FROM catalog_items
+      WHERE namespace = ?
+        AND ref IN ({qmarks})
+      ORDER BY CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END, ref
+      LIMIT 200
+    """
+    conn = _db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, [ns, *refs])
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def _db_rows_by_like(ns: str, slugs: List[str], keywords: List[str]) -> List[Dict[str, Any]]:
+    ns = ns or globals().get("DEFAULT_NAMESPACE") or "boasafra"
+    # montamos cláusulas OR com LIKE em name e url
+    like_terms = []
+    params: List[Any] = [ns]
+
+    for s in (slugs or []):
+        like_terms.append("(url LIKE ? OR name LIKE ?)")
+        params.append(f"%/{s}%")
+        params.append(f"%{s}%")
+
+    for k in (keywords or []):
+        like_terms.append("(name LIKE ? OR summary LIKE ?)")
+        params.append(f"%{k}%")
+        params.append(f"%{k}%")
+
+    if not like_terms:
+        return []
+
+    sql = f"""
+      SELECT id, namespace, ref, name, summary, price, brand, url
+      FROM catalog_items
+      WHERE namespace = ?
+        AND ({' OR '.join(like_terms)})
+      ORDER BY
+        CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END,
+        CASE WHEN ref IS NULL OR ref='' THEN 1 ELSE 0 END,
+        ref
+      LIMIT 300
+    """
+    conn = _db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def _parent_url(url: str) -> str:
+    u = (url or "").strip()
+    if "#sku=" in u:
+        return u.split("#sku=", 1)[0]
+    return u
+
+def _group_variants(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+    """
+    Agrupa por (parent_url, name_base aproximado):
+    - parent_url = antes de #sku=
+    - name_base = parte antes de " — " se existir
+    """
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in rows:
+        url = r.get("url") or ""
+        parent = _parent_url(url)
+        name = r.get("name") or ""
+        base = name.split(" — ", 1)[0].strip()
+        key = (parent, base.lower())
+        groups.setdefault(key, []).append(r)
+    # ordenar dentro de cada grupo
+    for k, lst in groups.items():
+        lst.sort(key=lambda x: (0 if "#sku=" in (x.get("url") or "") else 1, (x.get("ref") or "")))
+    return groups
+
+def _catalog_context_block(ns: str, question: str) -> str:
+    skus = _extract_skus(question)
+    slugs = _extract_slugs(question)
+    keys  = _extract_keywords(question)
+
+    rows = []
+    rows += _db_rows_by_ref(ns, skus)
+    rows += _db_rows_by_like(ns, slugs, keys)
+
+    # dedup por id
+    seen = set()
+    uniq = []
+    for r in rows:
+        rid = r.get("id")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        uniq.append(r)
+
+    if not uniq:
+        return ""
+
+    groups = _group_variants(uniq)
+
+    lines = []
+    lines.append("CATALOGO_INTERNO (catalog_items) — DADOS BRUTOS PARA USAR (SEM INVENTAR)")
+    lines.append(f"namespace={ns or globals().get('DEFAULT_NAMESPACE') or 'boasafra'}")
+    lines.append("Regras: se houver variantes (#sku=), dar prioridade a essas linhas.")
+
+    # lista por grupos, e dentro do grupo todas as linhas (isto é o que te faltava)
+    for (parent, base), lst in groups.items():
+        lines.append("")
+        lines.append(f"PRODUTO_BASE: {base} | parent_url: {parent}")
+        for r in lst:
+            ref = r.get("ref") or ""
+            price = r.get("price")
+            brand = r.get("brand") or ""
+            url = r.get("url") or ""
+            # tenta extrair Variante: do summary se existir, senão vazio
+            summary = (r.get("summary") or "")
+            m = re.search(r"(?:^|\n)\s*Variante:\s*(.+)", summary, flags=re.IGNORECASE)
+            variant = (m.group(1).strip() if m else "")
+            # linha curta mas completa
+            lines.append(f"- VAR | ref={ref} | price={price} | brand={brand} | variant={variant} | url={url}")
+
+    return "\n".join(lines)
+
+# ---- Monkey-patch do /ask ----
+# Guardar a função original, se existir
+_ASK_ORIGINAL = globals().get("ask")
+
+@app.post("/ask")
+async def ask(request: Request):
+    data = await request.json()
+    question = (data.get("question") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or "anon"
+    namespace = (data.get("namespace") or "").strip() or None
+    req_top_k = data.get("top_k")
+    decided_top_k = _decide_top_k(question, req_top_k)
+
+    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
+    if not question:
+        return {"answer": "Coloca a tua pergunta em 'question'."}
+
+    # mantém o teu fluxo atual
+    _ = build_rag_products_block(question)
+    messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, namespace)
+
+    # 🔥 HOTFIX: injeta contexto do catálogo (forte)
+    try:
+        cat_block = _catalog_context_block(namespace or DEFAULT_NAMESPACE, question)
+        if cat_block:
+            messages.append({"role": "system", "content": cat_block})
+    except Exception as e:
+        log.exception(f"[hotfix catalog context] falhou: {e}")
+
+    try:
+        answer = grok_chat(messages)
+    except Exception as e:
+        log.exception("Erro ao chamar a x.ai")
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    answer = _postprocess_answer(answer, question, namespace, decided_top_k)
+
+    # ⚠️ se tens isto a forçar links do RAG, mantém, mas aqui é onde costuma estragar a “pureza catálogo-only”
+    # Se estiveres a ver links do RAG em orçamentos, o problema é este force_links_block.
+    answer = _force_links_block(answer, rag_hits, min_links=3)
+
+    local_append_dialog(user_id, question, answer)
+    _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE
+        }
+    }
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
