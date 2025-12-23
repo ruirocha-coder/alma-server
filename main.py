@@ -3569,21 +3569,25 @@ if "build_catalog_variants_block" in globals():
         return "\n".join(lines)
 
     globals()["build_catalog_variants_block"] = build_catalog_variants_block
+# ======================================================================
 
-# ===================== /HOTFIX =====================
 
 # ======================================================================
-# HOTFIX: listar 100% das variantes (grupo por URL-pai/slug) em orçamentos
+# HOTFIX: listar 100% das variantes (agrupamento híbrido: URL + nome + ref)
 # Colar NO FINAL do main.py
 # Requer: CATALOG_DB_PATH = "/data/catalog.db"
 # ======================================================================
 
 import sqlite3, re
 from fastapi.routing import APIRoute
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 def _hf_db_path() -> str:
     return CATALOG_DB_PATH
+
+def _hf_is_quote_like(q: str) -> bool:
+    s = (q or "").lower()
+    return any(k in s for k in ["orçamento","orcamento","cotação","cotacao","proforma","preço","preco","subtotal","iva"])
 
 def _hf_extract_slug_or_urls(text: str) -> List[str]:
     s = (text or "").strip()
@@ -3608,66 +3612,155 @@ def _hf_base_url_from_any(x: str) -> Optional[str]:
         return f"https://interiorguider.com/{x.lower()}"
     return None
 
-def _hf_fetch_all_by_base_url(db_path: str, namespace: str, base_url: str, limit: int = 400) -> List[Dict[str, Any]]:
+def _hf_norm_name_base(name: str) -> str:
+    # tira sufixo " — variante"
+    n = (name or "").strip()
+    return n.split(" — ")[0].strip()
+
+def _hf_ref_prefix(ref: str) -> str:
+    """
+    extrai um prefixo estável do SKU/ref para agrupar:
+    - "ZEA0100" -> "ZEA"
+    - "KOR0440--ME-AS" -> "KOR0440"
+    - "ORK.02.03" -> "ORK"
+    """
+    r = (ref or "").strip()
+    if not r:
+        return ""
+    r = r.replace("#sku=","")
+    # corta em separadores comuns
+    head = re.split(r"(--|_|-|\s|\.)", r, maxsplit=1)[0]
+    # se for tipo ABC1234, devolve ABC ou ABC1234 conforme existir dígitos cedo
+    m = re.match(r"^([A-Z]{2,6})", head, flags=re.I)
+    if m:
+        return m.group(1).upper()
+    return head[:6].upper()
+
+def _hf_fetch_seed_by_url(con, namespace: str, base_url: str, limit: int = 800) -> List[sqlite3.Row]:
     base = base_url.rstrip("/")
     like1 = base + "%"
     like2 = base + "/%"
-
     q = """
     SELECT id, namespace, ref, name, price, brand, url, summary
     FROM catalog_items
     WHERE namespace = ?
+      AND url IS NOT NULL
       AND (url LIKE ? OR url LIKE ?)
     ORDER BY
       CASE WHEN instr(url, '#sku=') > 0 THEN 0 ELSE 1 END,
       url ASC
     LIMIT ?
     """
-    con = sqlite3.connect(db_path)
-    con.row_factory = sqlite3.Row
-    try:
-        cur = con.execute(q, (namespace, like1, like2, limit))
-        return [{
-            "id": r["id"], "namespace": r["namespace"], "ref": r["ref"],
-            "name": r["name"], "price": r["price"], "brand": r["brand"],
-            "url": r["url"], "summary": r["summary"]
-        } for r in cur.fetchall()]
-    finally:
-        con.close()
+    return con.execute(q, (namespace, like1, like2, limit)).fetchall()
 
-def _hf_build_variants_block(rows: List[Dict[str, Any]]) -> str:
-    if not rows:
-        return ""
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+def _hf_fetch_expand_by_name_brand_ref(
+    con,
+    namespace: str,
+    base_name: str,
+    brand: Optional[str],
+    ref_prefix: str,
+    limit: int = 1200
+) -> List[sqlite3.Row]:
+    # base_name pode aparecer como "Produto" ou "Produto — Variante"
+    name_like1 = base_name + "%"
+    # ref_prefix: agrupa variantes com o mesmo prefixo
+    ref_like = (ref_prefix + "%") if ref_prefix else None
+
+    params: List[Any] = [namespace, name_like1]
+    brand_clause = ""
+    if brand:
+        brand_clause = " AND (brand = ? OR brand IS NULL OR brand = '') "
+        params.append(brand)
+
+    ref_clause = ""
+    if ref_like:
+        ref_clause = " OR (ref IS NOT NULL AND ref LIKE ?) "
+        params.append(ref_like)
+
+    q = f"""
+    SELECT id, namespace, ref, name, price, brand, url, summary
+    FROM catalog_items
+    WHERE namespace = ?
+      AND (
+        (name IS NOT NULL AND name LIKE ?){brand_clause}
+        {ref_clause}
+      )
+    ORDER BY
+      CASE WHEN url IS NOT NULL AND instr(url, '#sku=') > 0 THEN 0 ELSE 1 END,
+      CASE WHEN ref IS NOT NULL THEN 0 ELSE 1 END,
+      name ASC
+    LIMIT ?
+    """
+    params.append(limit)
+    return con.execute(q, tuple(params)).fetchall()
+
+def _hf_rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    out=[]
     for r in rows:
-        u = (r.get("url") or "")
-        base = u.split("#sku=")[0].rstrip("/")
-        groups.setdefault(base, []).append(r)
+        out.append({
+            "id": r["id"],
+            "namespace": r["namespace"],
+            "ref": r["ref"],
+            "name": r["name"],
+            "price": r["price"],
+            "brand": r["brand"],
+            "url": r["url"],
+            "summary": r["summary"],
+        })
+    return out
+
+def _hf_dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen=set(); out=[]
+    for it in items:
+        # preferir ref; se não houver, usar url+name
+        key = (it.get("ref") or "") or f"{it.get('url') or ''}||{it.get('name') or ''}"
+        if key in seen: 
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+def _hf_group_key(it: Dict[str, Any]) -> Tuple[str,str]:
+    # agrupar por nome-base + marca (mais estável do que URL no teu caso)
+    base_name = _hf_norm_name_base(it.get("name") or "")
+    brand = (it.get("brand") or "").strip().lower()
+    return (base_name.lower(), brand)
+
+def _hf_build_variants_block(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    groups: Dict[Tuple[str,str], List[Dict[str, Any]]] = {}
+    for it in items:
+        groups.setdefault(_hf_group_key(it), []).append(it)
+
+    def is_variant(u: str) -> bool:
+        return ("#sku=" in (u or ""))
 
     lines = ["CATÁLOGO — VARIANTES (COMPLETO)"]
-    for base, items in groups.items():
-        lines.append(f"\nProduto (URL-pai): {base}")
-        for it in items:
-            ref = it.get("ref") or "(sem ref)"
-            name = it.get("name") or "(sem nome)"
-            price = it.get("price")
+    for (bn, br), rows in groups.items():
+        # ordena variantes primeiro
+        rows = sorted(rows, key=lambda x: (0 if is_variant(x.get("url") or "") else 1, (x.get("url") or ""), (x.get("ref") or "")))
+        title = bn or "(sem nome)"
+        if br:
+            title += f" • marca: {br}"
+        lines.append(f"\nProduto: {title}")
+        for r in rows:
+            ref = r.get("ref") or "(sem ref)"
+            name = r.get("name") or "(sem nome)"
+            price = r.get("price")
             price_s = f"{price}" if price is not None else "(sem preço)"
-            url = it.get("url") or "(sem url)"
+            url = r.get("url") or "(sem url)"
             lines.append(f"- {name} | SKU: {ref} | Preço: {price_s} | URL: {url}")
     return "\n".join(lines).strip()
 
-def _hf_is_quote_like(q: str) -> bool:
-    s = (q or "").lower()
-    return any(k in s for k in ["orçamento","orcamento","cotação","cotacao","proforma","preço","preco","subtotal","iva"])
-
-def _apply_hotfix_variants_injection():
+def _apply_hotfix_variants_injection_hybrid():
     target: Optional[APIRoute] = None
     for r in app.routes:
         if isinstance(r, APIRoute) and r.path == "/ask" and "POST" in (r.methods or set()):
             target = r
             break
     if not target:
-        try: log.warning("[HOTFIX] /ask não encontrado (variants injection).")
+        try: log.warning("[HOTFIX] /ask não encontrado (variants hybrid).")
         except Exception: pass
         return
 
@@ -3687,7 +3780,7 @@ def _apply_hotfix_variants_injection():
         _ = build_rag_products_block(question)
         messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, ns_eff)
 
-        # >>> injeta TODAS as variantes do(s) produto(s) por URL-pai
+        # >>> injeta TODAS as variantes (agrupamento híbrido)
         if _hf_is_quote_like(question):
             db_path = _hf_db_path()
             hits = _hf_extract_slug_or_urls(question)
@@ -3696,20 +3789,36 @@ def _apply_hotfix_variants_injection():
                 b = _hf_base_url_from_any(h)
                 if b: bases.append(b)
 
-            # fallback leve: primeira palavra estilo slug
+            # fallback leve: tenta apanhar um slug no texto
             if not bases:
                 m = re.search(r"\b([a-z0-9][a-z0-9\-]{2,})\b", question.lower())
                 if m:
                     bases.append(f"https://interiorguider.com/{m.group(1)}")
 
-            all_rows: List[Dict[str, Any]] = []
-            for b in list(dict.fromkeys(bases))[:6]:
-                try:
-                    all_rows.extend(_hf_fetch_all_by_base_url(db_path, ns_eff, b, limit=800))
-                except Exception:
-                    pass
+            all_items: List[Dict[str, Any]] = []
 
-            block = _hf_build_variants_block(all_rows)
+            con = sqlite3.connect(db_path)
+            con.row_factory = sqlite3.Row
+            try:
+                for b in list(dict.fromkeys(bases))[:6]:
+                    seed = _hf_fetch_seed_by_url(con, ns_eff, b, limit=1200)
+                    seed_items = _hf_rows_to_dicts(seed)
+                    all_items.extend(seed_items)
+
+                    # expandir por nome-base + marca + prefixo ref (se seed parece “incompleto”)
+                    if seed_items:
+                        base_name = _hf_norm_name_base(seed_items[0].get("name") or "")
+                        brand = seed_items[0].get("brand") or None
+                        ref_prefix = _hf_ref_prefix(seed_items[0].get("ref") or "")
+                        exp = _hf_fetch_expand_by_name_brand_ref(con, ns_eff, base_name, brand, ref_prefix, limit=2000)
+                        all_items.extend(_hf_rows_to_dicts(exp))
+            finally:
+                try: con.close()
+                except Exception: pass
+
+            all_items = _hf_dedupe_items(all_items)
+            block = _hf_build_variants_block(all_items)
+
             if block:
                 messages = messages[:-1] + [
                     {"role":"system","content":"Se houver variantes no bloco seguinte, tens de listar TODAS (não omitir)."},
@@ -3719,7 +3828,7 @@ def _apply_hotfix_variants_injection():
         try:
             answer = grok_chat(messages)
         except Exception as e:
-            try: log.exception("Erro ao chamar a x.ai (HOTFIX variants)")
+            try: log.exception("Erro ao chamar a x.ai (HOTFIX variants hybrid)")
             except Exception: pass
             return {"answer": f"Erro ao chamar o Grok-4: {e}"}
 
@@ -3749,12 +3858,12 @@ def _apply_hotfix_variants_injection():
 
     target.endpoint = patched
     target.dependant.call = patched
-    try: log.info("[HOTFIX] /ask: injeção de variantes completas por URL-pai aplicada (DB fixa).")
+    try: log.info("[HOTFIX] /ask: variantes completas com agrupamento híbrido (URL+nome+ref) aplicado.")
     except Exception: pass
 
-_apply_hotfix_variants_injection()
-
+_apply_hotfix_variants_injection_hybrid()
 # ======================================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
