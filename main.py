@@ -4021,6 +4021,227 @@ async def ask(request: Request):
     }
 
 
+# =====================================================================
+# HOTFIX: variantes completas (usar pergunta raw + agrupar por url_canonical)
+# Colar no FINAL do main.py
+# =====================================================================
+
+import re
+import sqlite3
+from typing import Optional, List, Dict, Any
+
+def _catalog_has_col(conn: sqlite3.Connection, col: str) -> bool:
+    try:
+        cur = conn.execute("PRAGMA table_info(catalog_items)")
+        cols = {row[1] for row in cur.fetchall()}
+        return col in cols
+    except Exception:
+        return False
+
+def _catalog_best_url_col(conn: sqlite3.Connection) -> str:
+    # prioridade: url_canonical (se existir), senão url
+    return "url_canonical" if _catalog_has_col(conn, "url_canonical") else "url"
+
+def _norm_txt(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def build_catalog_variants_block_v2(
+    question_raw: str,
+    namespace: Optional[str] = None,
+    limit_families: int = 6,
+    limit_variants: int = 80
+) -> str:
+    """
+    Lista variantes por família usando url_canonical (se existir) ou url.
+    - Ativa quando:
+      a) a pergunta sugere variantes ("variante/cores/opções..."), OU
+      b) o catálogo já tem várias linhas do mesmo produto para esta query (fallback).
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    qraw = (question_raw or "").strip()
+    ql = _norm_txt(qraw)
+
+    wants_variants = any(k in ql for k in ("variante", "variantes", "cor", "cores", "opção", "opções", "opcoes", "tecido", "acabamento"))
+
+    # Vamos buscar seeds com a query “limpa” (para encontrar o produto),
+    # mas o gatilho vem da pergunta original.
+    cat_q = _catalog_query_from_question(qraw)
+
+    try:
+        with _catalog_conn() as c:
+            url_col = _catalog_best_url_col(c)
+
+            like = f"%{_sanitize_like(cat_q)}%"
+            cur = c.execute(f"""
+                SELECT id, name, ref, price, brand, {url_col} AS u
+                  FROM catalog_items
+                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                 ORDER BY (CASE WHEN {url_col} LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                 LIMIT ?
+            """, (ns, like, like, like, 200))
+            hits = [dict(r) for r in cur.fetchall()]
+
+            if not hits:
+                return ""
+
+            # Agrupar por "parent": remove fragmento #... (porque queres o slug canónico)
+            def parent_of(u: str) -> str:
+                u = (u or "").strip()
+                return u.split("#", 1)[0].strip()
+
+            families: Dict[str, List[Dict[str, Any]]] = {}
+            for r in hits:
+                p = parent_of(r.get("u") or "")
+                if not p:
+                    continue
+                families.setdefault(p, []).append(r)
+
+            # Se não pediu variantes, só ativamos se detetarmos família com >=2 (ou seja: há variantes)
+            if not wants_variants:
+                has_multi = any(len(v) >= 2 for v in families.values())
+                if not has_multi:
+                    return ""
+
+            # escolher as famílias mais prováveis: as que têm mais itens primeiro
+            sorted_parents = sorted(families.keys(), key=lambda p: len(families[p]), reverse=True)[:limit_families]
+
+            out = ["Variantes no catálogo interno (todas as opções encontradas):"]
+            for p in sorted_parents:
+                # agora ir buscar TODAS as variantes dessa família diretamente pelo parent
+                cur2 = c.execute(f"""
+                    SELECT name, ref, price, brand, variant_attrs, {url_col} AS u
+                      FROM catalog_items
+                     WHERE namespace=? AND {url_col} LIKE ?
+                     ORDER BY updated_at DESC
+                     LIMIT ?
+                """, (ns, p + "%", limit_variants))
+                vars_ = [dict(r) for r in cur2.fetchall()]
+
+                # filtrar só as que pertencem mesmo à família (mesmo parent após split)
+                vars_ = [v for v in vars_ if parent_of(v.get("u") or "") == p]
+
+                # se houver muitas linhas, não cortar arbitrariamente; devolve tudo até limit_variants
+                if not vars_:
+                    continue
+
+                # título família
+                prod_name = families[p][0].get("name") or p
+                out.append(f"\n• Produto: {prod_name}")
+
+                # mostrar TODAS as linhas da família
+                for v in vars_:
+                    ref = (v.get("ref") or "(sem dado)").strip()
+                    price = v.get("price")
+                    price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+                    var_txt = (v.get("variant_attrs") or "").strip()
+                    show = var_txt if var_txt else (v.get("name") or "(sem nome)")
+                    # link canónico (sem #...)
+                    link = parent_of(v.get("u") or "") or "(sem URL)"
+                    out.append(f"  - Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {link}")
+
+            return "" if len(out) == 1 else "\n".join(out)
+
+    except Exception as e:
+        try:
+            log.warning(f"[catalog variants v2] falhou: {e}")
+        except Exception:
+            pass
+        return ""
+
+
+# =====================================================================
+# Substitui a função antiga pelo hotfix v2
+build_catalog_variants_block = build_catalog_variants_block_v2
+
+
+# --- Hotfix build_messages: passar pergunta original para variantes ---
+_build_messages_original = build_messages  # guarda por segurança
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    # 1) sinais contextuais → mem0
+    new_facts = extract_contextual_facts_pt(question)
+    for k, v in new_facts.items():
+        mem0_set_fact(user_id, k, v)
+
+    # 2) memórias recentes
+    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
+    memory_block = (
+        "Memórias recentes do utilizador (curto prazo):\n"
+        + "\n".join(f"- {s}" for s in short_snippets[:3])
+        if short_snippets else ""
+    )
+
+    # 3) CATÁLOGO INTERNO (SQLite)
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    cat_q = _catalog_query_from_question(question)
+    catalog_block = build_catalog_block(cat_q, ns)
+
+    # ✅ aqui está o bug principal: usar a pergunta ORIGINAL, não cat_q
+    catalog_variants_block = build_catalog_variants_block(question, ns)
+
+    # 4) RAG (igual ao teu)
+    rag_block = ""
+    rag_used = False
+    rag_hits: List[dict] = []
+    if RAG_READY:
+        try:
+            rag_hits = search_chunks(
+                query=question,
+                namespace=namespace or DEFAULT_NAMESPACE,
+                top_k=RAG_TOP_K_DEFAULT
+            ) or []
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
+            rag_used = bool(rag_block)
+        except Exception as e:
+            try:
+                log.warning(f"[rag] search falhou: {e}")
+            except Exception:
+                pass
+            rag_block, rag_used, rag_hits = "", False, []
+
+    # 5) links candidatos do RAG
+    links_pairs = _links_from_matches(rag_hits, max_links=8)
+    links_block = ""
+    if links_pairs:
+        lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
+        for title, url in links_pairs:
+            lines.append(f"- {title or '-'} — {url}")
+        links_block = "\n".join(lines)
+
+    # 6) bloco de produtos (opcional)
+    products_block = build_rag_products_block(question)
+
+    # 7) montar mensagens
+    messages = [{"role": "system", "content": ALMA_MISSION}]
+    fb = facts_block_for_user(user_id)
+    if fb:
+        messages.append({"role": "system", "content": fb})
+
+    if catalog_block:
+        messages.append({"role": "system", "content": catalog_block})
+    if catalog_variants_block:
+        messages.append({"role": "system", "content": catalog_variants_block})
+
+    if rag_block:
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
+    if links_block:
+        messages.append({"role": "system", "content": links_block})
+
+    if products_block:
+        messages.append({"role": "system", "content": products_block})
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
+
+    messages.append({"role": "user", "content": question})
+    return messages, new_facts, rag_used, rag_hits
+
+# substitui
+# (redefinir no fim garante que o /ask usa esta versão)
+# =====================================================================
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
