@@ -4020,138 +4020,97 @@ async def ask(request: Request):
         }
     }
 
-# =======================================================================================
-# HOTFIX ÚNICO: Forçar listagem COMPLETA de variantes via url_canonical
-# Substitui qualquer hotfix anterior de variantes
-# =======================================================================================
 
-import re
-import sqlite3
+# =========================
+# HOTFIX: Variantes auto (por url_canonical)
+# Cola NO FIM do main.py
+# =========================
+
 from typing import Optional, List, Dict, Any
+import sqlite3
 
-# -------------------- helpers locais --------------------
-
-def _sanitize_like(s: str) -> str:
-    return (s or "").strip().replace("%", "").replace("_", "")
-
-def _extract_ref_tokens(text: str) -> list:
-    toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", text or "", flags=re.I)
-    return [t for t in toks if any(ch.isdigit() for ch in t)]
-
-def _pick_best_catalog_hit(namespace: str, question: str) -> Optional[Dict[str, Any]]:
+def build_catalog_variants_block(question: str,
+                                namespace: Optional[str] = None,
+                                limit_families: int = 3,
+                                limit_variants: int = 120) -> str:
     """
-    Encontra 1 item do catálogo para derivar o url_canonical.
-    Prioridade:
-      1) match exato por SKU/ref
-      2) match por nome/summary (preferindo variantes)
+    OVERRIDE HOTFIX:
+    - em vez de depender de palavras ('variantes', 'cores', etc.),
+      tenta sempre detetar uma família e listar TODAS as variantes do catálogo
+      usando url_canonical.
+    - Só devolve bloco se encontrar >=2 variantes.
     """
     ns = (namespace or DEFAULT_NAMESPACE).strip()
     q = _sanitize_like(question)
-    ref_toks = _extract_ref_tokens(question)
-
-    with _db() as con:
-        con.row_factory = sqlite3.Row
-
-        # 1) match exato por SKU
-        if ref_toks:
-            ph = ",".join("?" * len(ref_toks))
-            rows = con.execute(
-                f"""
-                SELECT *
-                  FROM catalog_items
-                 WHERE namespace=? AND ref IN ({ph})
-                 ORDER BY updated_at DESC
-                 LIMIT 1
-                """,
-                tuple([ns, *ref_toks])
-            ).fetchall()
-            if rows:
-                return dict(rows[0])
-
-        # 2) match por texto (nome / summary / ref)
-        like = f"%{q}%"
-        row = con.execute(
-            """
-            SELECT *
-              FROM catalog_items
-             WHERE namespace=?
-               AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-             ORDER BY
-               (CASE WHEN variant_attrs IS NOT NULL AND TRIM(variant_attrs) <> '' THEN 0 ELSE 1 END),
-               updated_at DESC
-             LIMIT 1
-            """,
-            (ns, like, like, like)
-        ).fetchone()
-
-        return dict(row) if row else None
-
-def _build_variants_block_by_canonical(
-    namespace: str,
-    url_canonical: str,
-    max_variants: int = 80
-) -> str:
-    """
-    Constrói bloco com TODAS as variantes do mesmo url_canonical.
-    """
-    if not url_canonical:
-        return ""
-
-    variants = _get_variants_by_canonical(namespace, url_canonical) or []
-    if len(variants) < 2:
-        return ""
-
-    lines = [
-        "Variantes no catálogo interno (LISTA COMPLETA; mesmo url_canonical):"
-    ]
-
-    for v in variants[:max_variants]:
-        ref = (v.get("ref") or "(sem dado)").strip()
-        name = (v.get("name") or "(sem nome)").strip()
-        brand = (v.get("brand") or "").strip()
-        variant = (v.get("variant_attrs") or "").strip()
-        price = v.get("price")
-        price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-        link = (v.get("url_canonical") or "").strip()
-
-        label = variant if variant else name
-
-        lines.append(
-            f"- Variante: {label} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {link}"
-        )
-
-    return "\n".join(lines)
-
-# -------------------- override do build_messages --------------------
-
-_old_build_messages = build_messages
-
-def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # pipeline original
-    messages, new_facts, rag_used, rag_hits = _old_build_messages(
-        user_id, question, namespace
-    )
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
 
     try:
-        hit = _pick_best_catalog_hit(ns, question)
-        url_canon = (hit or {}).get("url_canonical")
+        with _catalog_conn() as c:
+            cols = _table_cols(c)
 
-        variants_block = _build_variants_block_by_canonical(ns, url_canon)
+            # Se não houver url_canonical na tabela, não fazemos nada (não estraga nada).
+            if "url_canonical" not in cols:
+                return ""
 
-        if variants_block:
-            # injeta ANTES do user message (posição crítica)
-            messages.insert(
-                max(1, len(messages) - 1),
-                {"role": "system", "content": variants_block}
-            )
+            like = f"%{q}%"
+
+            # 1) Encontrar seeds relevantes (para descobrir o url_canonical certo)
+            cur = c.execute("""
+                SELECT url_canonical, name, ref, url
+                  FROM catalog_items
+                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                 ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                 LIMIT ?
+            """, (ns, like, like, like, max(1, limit_families)))
+
+            seeds = [dict(r) for r in cur.fetchall()]
+            if not seeds:
+                return ""
+
+            # 2) Para cada seed, buscar a família completa por url_canonical
+            blocks = []
+            seen_can = set()
+
+            for s in seeds:
+                uc = (s.get("url_canonical") or "").strip()
+                if not uc or uc in seen_can:
+                    continue
+                seen_can.add(uc)
+
+                cur2 = c.execute("""
+                    SELECT name, ref, price, url, variant_attrs, brand
+                      FROM catalog_items
+                     WHERE namespace=? AND url_canonical=?
+                     ORDER BY ref ASC
+                     LIMIT ?
+                """, (ns, uc, limit_variants))
+
+                fam = [dict(r) for r in cur2.fetchall()]
+                if len(fam) < 2:
+                    continue
+
+                # cabeçalho da família
+                header_name = (fam[0].get("name") or s.get("name") or uc).strip()
+                blocks.append(f"• Produto: {header_name}")
+
+                # linhas das variantes
+                for v in fam:
+                    ref = v.get("ref") or "(sem dado)"
+                    price = v.get("price")
+                    price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+                    var_txt = (v.get("variant_attrs") or "").strip()
+                    show = var_txt or (v.get("name") or "").strip() or "(sem variante)"
+                    url = (v.get("url") or "").strip() or "(sem URL)"
+                    blocks.append(f"  - Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {url}")
+
+            if not blocks:
+                return ""
+
+            return "Variantes no catálogo interno (auto; agrupadas por url_canonical):\n" + "\n".join(blocks)
 
     except Exception as e:
-        log.warning(f"[hotfix variants canonical] falhou: {e}")
+        log.warning(f"[catalog variants auto] falhou: {e}")
+        return ""
 
-    return messages, new_facts, rag_used, rag_hits
-	
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
