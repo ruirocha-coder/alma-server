@@ -3927,6 +3927,207 @@ async def ask(request: Request):
         }
     }
 
+# =====================================================================================
+# HOTFIX ÚNICO (no fim do main.py):
+# - adiciona expansão de variantes no /ask sem mexer no código original do endpoint
+# - remove rota /ask antiga e regista nova que chama a antiga + pós-processa answer
+# - não rebenta mesmo que algo falhe
+# =====================================================================================
+
+import re
+import sqlite3
+
+def _hf_db_path():
+    try:
+        p = globals().get("CATALOG_DB_PATH")
+        if isinstance(p, str) and p.strip():
+            return p.strip()
+    except Exception:
+        pass
+    return "/data/catalog.db"
+
+def _hf_has_col(con, table, col):
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == col for r in rows)
+    except Exception:
+        return False
+
+def _hf_get_canonical_by_ref(con, ns, ref):
+    try:
+        row = con.execute(
+            """
+            SELECT url_canonical
+            FROM catalog_items
+            WHERE namespace = ? AND ref = ?
+            LIMIT 1
+            """,
+            (ns, ref),
+        ).fetchone()
+        if not row:
+            return None
+        urlc = (row[0] or "").strip()
+        return urlc or None
+    except Exception:
+        return None
+
+def _hf_fetch_all_by_canonical(con, ns, urlc):
+    try:
+        rows = con.execute(
+            """
+            SELECT ref, name, price, url_canonical, url, summary, variant_attrs
+            FROM catalog_items
+            WHERE namespace = ? AND url_canonical = ?
+            ORDER BY ref ASC
+            """,
+            (ns, urlc),
+        ).fetchall()
+        return rows or []
+    except Exception:
+        return []
+
+def _hf_variant_from_row(row):
+    # row: ref, name, price, url_canonical, url, summary, variant_attrs
+    name = (row[1] or "").strip()
+    vattrs = (row[6] or "").strip()
+    summary = (row[5] or "") or ""
+    if vattrs:
+        return vattrs
+    m = re.search(r"(?:^|\n)\s*Variante:\s*(.+)", summary, flags=re.I)
+    if m:
+        return m.group(1).strip()
+    if "—" in name:
+        return name.split("—", 1)[1].strip()
+    return ""
+
+def _hf_build_options_block(rows):
+    out = []
+    out.append("Opções disponíveis:")
+    for ref, name, price, urlc, url, summary, vattrs in rows:
+        varname = _hf_variant_from_row((ref, name, price, urlc, url, summary, vattrs))
+        label = varname or (name or "").strip() or "Variante"
+        ptxt = ""
+        try:
+            if price is not None and str(price).strip() != "":
+                ptxt = f"{float(price):.2f}€"
+        except Exception:
+            ptxt = str(price or "")
+        out.append(f"- {label} SKU:{ref} | Preço unitário: {ptxt}".rstrip())
+    return "\n".join(out)
+
+def _hf_expand_variants_in_budget(answer: str, namespace: str, default_ns: str = "boasafra") -> str:
+    """
+    Se detectar um bloco de orçamento com SKUs e "Opções disponíveis",
+    substitui as opções pela lista completa de variantes com o mesmo url_canonical.
+    """
+    try:
+        if not answer or "Opções disponíveis" not in answer:
+            return answer
+
+        refs = re.findall(r"\bSKU\s*[:#]?\s*([A-Za-z0-9\.\-]+)\b", answer)
+        if not refs:
+            return answer
+
+        ns = (namespace or default_ns) or default_ns
+        db_path = _hf_db_path()
+
+        con = sqlite3.connect(db_path)
+        try:
+            if not _hf_has_col(con, "catalog_items", "url_canonical"):
+                return answer
+
+            urlc = _hf_get_canonical_by_ref(con, ns, refs[0])
+            if not urlc:
+                return answer
+
+            rows = _hf_fetch_all_by_canonical(con, ns, urlc)
+            if len(rows) < 2:
+                return answer
+
+            new_block = _hf_build_options_block(rows)
+
+            # substitui o bloco entre "Opções disponíveis:" e a linha antes de "Preço..."
+            pattern = r"(Opções disponíveis:\s*)([\s\S]*?)(\n\s*Preço com IVA|\n\s*Preço)"
+            m = re.search(pattern, answer)
+            if not m:
+                return answer
+
+            return answer[:m.start(1)] + new_block + answer[m.start(3):]
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    except Exception:
+        return answer
+
+
+# =========================
+# PATCH DO /ask (sem mexer no original)
+# =========================
+def _hf_patch_ask_route():
+    try:
+        app = globals().get("app")
+        if app is None:
+            return
+
+        orig_ask = globals().get("ask")
+        if orig_ask is None or not callable(orig_ask):
+            return
+
+        # remover a rota antiga /ask POST
+        new_routes = []
+        removed = False
+        for r in list(app.router.routes):
+            try:
+                if getattr(r, "path", None) == "/ask" and "POST" in (getattr(r, "methods", set()) or set()):
+                    removed = True
+                    continue
+            except Exception:
+                pass
+            new_routes.append(r)
+
+        if removed:
+            app.router.routes = new_routes
+
+        from fastapi import Request
+
+        DEFAULT_NAMESPACE = globals().get("DEFAULT_NAMESPACE") or "boasafra"
+
+        @app.post("/ask")
+        async def ask(request: Request):
+            """
+            Wrapper: chama o /ask original (a função antiga) e depois corrige a resposta.
+            """
+            res = await orig_ask(request)
+
+            # res pode ser dict (no teu caso é) — só mexemos se for seguro
+            try:
+                if isinstance(res, dict) and "answer" in res:
+                    # tenta obter namespace do request (se existir) — senão usa default
+                    try:
+                        data = await request.json()
+                        ns = (data.get("namespace") or "").strip() or None
+                    except Exception:
+                        ns = None
+
+                    res["answer"] = _hf_expand_variants_in_budget(res["answer"], ns, DEFAULT_NAMESPACE)
+            except Exception:
+                pass
+
+            return res
+
+    except Exception:
+        try:
+            log = globals().get("log")
+            if log:
+                log.exception("HOTFIX: falhou patch do /ask")
+        except Exception:
+            pass
+
+_hf_patch_ask_route()
+
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
