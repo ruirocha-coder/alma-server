@@ -1920,22 +1920,90 @@ async def budget_csv(request: Request):
 # ---------------------------------------------------------------------------------------
 # ASK endpoints (com injeção + fallback de links e top-k dinâmico)
 # ---------------------------------------------------------------------------------------
+import re
+from typing import Optional
+from fastapi import Request
+
+def _should_force_all_variants(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    if not ql:
+        return False
+
+    triggers = [
+        "todas as variantes", "todas variantes",
+        "todas as opções", "todas opções", "todas as opcoes", "todas opcoes",
+        "quais são as variantes", "quais sao as variantes",
+        "lista as variantes", "listar as variantes",
+        "todas as cores", "todas cores",
+        "opções disponíveis", "opcoes disponiveis",
+        "variantes disponíveis", "variantes disponiveis",
+        "mostra todas as variantes", "mostra todas",
+        "lista tudo", "listar tudo",
+    ]
+    if any(t in ql for t in triggers):
+        return True
+
+    # Heurística curta: presença de "variantes/opções" + "todas/quais"
+    if re.search(r"\b(variantes|opções|opcoes|cores)\b", ql) and re.search(r"\b(todas|quais)\b", ql):
+        return True
+
+    return False
+
+
+def _inject_force_all_variants_system(messages: list, question: str) -> list:
+    """
+    Injeta uma instrução SYSTEM para impedir resumos (ex.: só 3 variantes).
+    Só injeta quando a pergunta pede explicitamente "todas as variantes/opções".
+    """
+    if not _should_force_all_variants(question):
+        return messages
+
+    sys_msg = {
+        "role": "system",
+        "content": (
+            "INSTRUÇÃO CRÍTICA (CATÁLOGO INTERNO):\n"
+            "- Se o utilizador pedir 'todas as variantes/opções/cores/SKUs' de um produto, "
+            "é PROIBIDO resumir ou limitar a 3.\n"
+            "- Deves listar TODAS as variantes existentes no catálogo interno para esse produto.\n"
+            "- Formato por linha: Variante (ou nome) + SKU/ref + preço.\n"
+            "- No fim, inclui apenas 1 link canónico do produto (se existir) e pergunta qual variante/quantidade.\n"
+            "- Não inventes variantes nem preços; usa apenas o catálogo interno."
+        )
+    }
+
+    # Coloca no topo para ter máxima prioridade
+    if isinstance(messages, list) and messages:
+        return [sys_msg] + messages
+    return [sys_msg]
+
+
 @app.get("/ask_get")
 def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
     if not q:
         return {"answer": "Falta query param ?q="}
+
     decided_top_k = _decide_top_k(q, top_k)
-    _ = build_rag_products_block(q)  # mantém sinal de produtos no contexto
+
+    # mantém sinal de produtos no contexto (se usas isto para orientar o modelo)
+    _ = build_rag_products_block(q)
+
     messages, new_facts, rag_used, rag_hits = build_messages(user_id, q, namespace)
+
+    # HOTFIX: força listagem completa quando pedido
+    messages = _inject_force_all_variants_system(messages, q)
+
     try:
         answer = grok_chat(messages)
     except Exception as e:
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
     answer = _postprocess_answer(answer, q, namespace, decided_top_k)
     answer = _force_links_block(answer, rag_hits, min_links=3)
+
     local_append_dialog(user_id, q, answer)
     _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
@@ -1943,33 +2011,46 @@ def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Op
             "used": rag_used,
             "top_k_default": RAG_TOP_K_DEFAULT,
             "top_k_effective": decided_top_k,
-            "namespace": namespace or DEFAULT_NAMESPACE
-        }
+            "namespace": namespace or DEFAULT_NAMESPACE,
+        },
     }
+
 
 @app.post("/ask")
 async def ask(request: Request):
     data = await request.json()
+
     question = (data.get("question") or "").strip()
     user_id = (data.get("user_id") or "").strip() or "anon"
     namespace = (data.get("namespace") or "").strip() or None
     req_top_k = data.get("top_k")
+
     decided_top_k = _decide_top_k(question, req_top_k)
     log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
+
     if not question:
         return {"answer": "Coloca a tua pergunta em 'question'."}
+
     _ = build_rag_products_block(question)
+
     messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, namespace)
+
+    # HOTFIX: força listagem completa quando pedido
+    messages = _inject_force_all_variants_system(messages, question)
+
     try:
         answer = grok_chat(messages)
     except Exception as e:
         log.exception("Erro ao chamar a x.ai")
         return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
     answer = _postprocess_answer(answer, question, namespace, decided_top_k)
     answer = _force_links_block(answer, rag_hits, min_links=3)
+
     local_append_dialog(user_id, question, answer)
     _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
     _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
     return {
         "answer": answer,
         "new_facts_detected": new_facts,
@@ -1977,10 +2058,9 @@ async def ask(request: Request):
             "used": rag_used,
             "top_k_default": RAG_TOP_K_DEFAULT,
             "top_k_effective": decided_top_k,
-            "namespace": namespace or DEFAULT_NAMESPACE
-        }
+            "namespace": namespace or DEFAULT_NAMESPACE,
+        },
     }
-
 # ---------------------------------------------------------------------------------------
 # 📚 Catálogo (SQLite) — backend único via CSV + integração no /status
 # ---------------------------------------------------------------------------------------
