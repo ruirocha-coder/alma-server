@@ -4020,251 +4020,138 @@ async def ask(request: Request):
         }
     }
 
-
-# =====================================================================
-# HOTFIX: Forçar listagem COMPLETA de variantes (sem resumir "3 exemplos")
-# Colar no FINAL do main.py
-# =====================================================================
+# =======================================================================================
+# HOTFIX ÚNICO: Forçar listagem COMPLETA de variantes via url_canonical
+# Substitui qualquer hotfix anterior de variantes
+# =======================================================================================
 
 import re
 import sqlite3
 from typing import Optional, List, Dict, Any
 
-def _catalog_cols(conn: sqlite3.Connection) -> List[str]:
-    cur = conn.execute("PRAGMA table_info(catalog_items)")
-    return [row[1] for row in cur.fetchall()]
+# -------------------- helpers locais --------------------
 
-def _pick_canonical_url_col(conn: sqlite3.Connection) -> str:
+def _sanitize_like(s: str) -> str:
+    return (s or "").strip().replace("%", "").replace("_", "")
+
+def _extract_ref_tokens(text: str) -> list:
+    toks = re.findall(r"[A-Z0-9][A-Z0-9._\-]{2,}", text or "", flags=re.I)
+    return [t for t in toks if any(ch.isdigit() for ch in t)]
+
+def _pick_best_catalog_hit(namespace: str, question: str) -> Optional[Dict[str, Any]]:
     """
-    Tenta encontrar a coluna de URL canónica criada no teu hotfix antigo.
-    Preferências:
-      - url_canonical
-      - qualquer coluna que contenha 'url' e 'canon'
-      - fallback: url
+    Encontra 1 item do catálogo para derivar o url_canonical.
+    Prioridade:
+      1) match exato por SKU/ref
+      2) match por nome/summary (preferindo variantes)
     """
-    cols = _catalog_cols(conn)
-    cols_l = [c.lower() for c in cols]
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q = _sanitize_like(question)
+    ref_toks = _extract_ref_tokens(question)
 
-    if "url_canonical" in cols_l:
-        return cols[cols_l.index("url_canonical")]
+    with _db() as con:
+        con.row_factory = sqlite3.Row
 
-    # procura algo tipo url_canon, canonical_url, urlCanon, etc.
-    for c in cols:
-        cl = c.lower()
-        if ("url" in cl) and ("canon" in cl):
-            return c
+        # 1) match exato por SKU
+        if ref_toks:
+            ph = ",".join("?" * len(ref_toks))
+            rows = con.execute(
+                f"""
+                SELECT *
+                  FROM catalog_items
+                 WHERE namespace=? AND ref IN ({ph})
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                """,
+                tuple([ns, *ref_toks])
+            ).fetchall()
+            if rows:
+                return dict(rows[0])
 
-    return "url"
+        # 2) match por texto (nome / summary / ref)
+        like = f"%{q}%"
+        row = con.execute(
+            """
+            SELECT *
+              FROM catalog_items
+             WHERE namespace=?
+               AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+             ORDER BY
+               (CASE WHEN variant_attrs IS NOT NULL AND TRIM(variant_attrs) <> '' THEN 0 ELSE 1 END),
+               updated_at DESC
+             LIMIT 1
+            """,
+            (ns, like, like, like)
+        ).fetchone()
 
-def _parent(u: str) -> str:
-    u = (u or "").strip()
-    # remove fragmentos e params de sku
-    u = u.split("#", 1)[0]
-    return u.strip()
+        return dict(row) if row else None
 
-def _normq(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def build_catalog_variants_block_FORCE_ALL(
-    question_raw: str,
-    namespace: Optional[str] = None,
-    limit_families: int = 4,
-    limit_variants: int = 120
+def _build_variants_block_by_canonical(
+    namespace: str,
+    url_canonical: str,
+    max_variants: int = 80
 ) -> str:
     """
-    Bloco de variantes "copiável" e com ordem dura: LISTAR TODAS.
-    - Agrupa por URL canónica (se existir), senão por url.
-    - Se encontrar família com >=2 itens, devolve a lista completa.
+    Constrói bloco com TODAS as variantes do mesmo url_canonical.
     """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    qraw = (question_raw or "").strip()
-    ql = _normq(qraw)
-
-    # (não dependemos disto para ativar; é apenas para priorizar famílias)
-    wants = any(k in ql for k in ("variante","variantes","cor","cores","opção","opções","opcoes","tecido","acabamento"))
-
-    # usa a mesma query “limpa” para encontrar o produto
-    cat_q = _catalog_query_from_question(qraw)
-    like = f"%{_sanitize_like(cat_q)}%"
-
-    try:
-        with _catalog_conn() as c:
-            urlcol = _pick_canonical_url_col(c)
-
-            # 1) seeds relevantes (até 200)
-            cur = c.execute(f"""
-                SELECT name, ref, price, brand, variant_attrs, {urlcol} AS u
-                  FROM catalog_items
-                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-                 ORDER BY updated_at DESC
-                 LIMIT 200
-            """, (ns, like, like, like))
-            rows = [dict(r) for r in cur.fetchall()]
-            if not rows:
-                return ""
-
-            # 2) agrupar por parent canónico
-            fam: Dict[str, List[Dict[str, Any]]] = {}
-            for r in rows:
-                p = _parent(r.get("u") or "")
-                if not p:
-                    continue
-                fam.setdefault(p, []).append(r)
-
-            if not fam:
-                return ""
-
-            # 3) escolher famílias candidatas: as que têm mais itens (>=2)
-            parents = [p for p,v in fam.items() if len(v) >= 2]
-            if not parents:
-                return ""
-
-            parents = sorted(parents, key=lambda p: len(fam[p]), reverse=True)[:limit_families]
-
-            out_lines = []
-            for p in parents:
-                # 4) buscar TODAS as linhas dessa família pelo url canónico (prefixo)
-                cur2 = c.execute(f"""
-                    SELECT name, ref, price, brand, variant_attrs, {urlcol} AS u
-                      FROM catalog_items
-                     WHERE namespace=? AND {urlcol} LIKE ?
-                     ORDER BY updated_at DESC
-                     LIMIT ?
-                """, (ns, p + "%", limit_variants))
-                vars_ = [dict(r) for r in cur2.fetchall()]
-                # filtra só parent exato
-                vars_ = [v for v in vars_ if _parent(v.get("u") or "") == p]
-
-                if len(vars_) < 2:
-                    continue
-
-                # produto (nome base)
-                prod_name = fam[p][0].get("name") or p
-
-                # header + ordens duras
-                out_lines.append("VARIANTES_CATALOGO_INTERNO (LISTAR_TODAS_SEM_RESUMIR)")
-                out_lines.append(f"PRODUTO: {prod_name}")
-                out_lines.append(f"URL_CANONICA: {p}")
-                out_lines.append(f"TOTAL_VARIANTES: {len(vars_)}")
-                out_lines.append("INSTRUÇÃO: quando responder, transcreve TODAS as variantes abaixo (uma por linha) sem omitir nenhuma.")
-                out_lines.append("FORMATO_LINHA: Variante | SKU | Preço | Link\n")
-
-                # linhas prontas a copiar
-                for v in vars_:
-                    var_txt = (v.get("variant_attrs") or "").strip()
-                    show = var_txt if var_txt else (v.get("name") or "(sem nome)")
-                    ref = (v.get("ref") or "(sem dado)").strip()
-                    price = v.get("price")
-                    price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
-                    link = _parent(v.get("u") or "") or "(sem URL)"
-                    out_lines.append(f"- {show} | {ref} | {price_txt} | {link}")
-
-                # se a pergunta explicitamente pede variantes, já chega a 1 família
-                if wants:
-                    break
-
-            return "\n".join(out_lines) if out_lines else ""
-
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix variants FORCE_ALL] falhou: {e}")
-        except Exception:
-            pass
+    if not url_canonical:
         return ""
 
-# substitui a função usada pelo build_messages (o teu nome original)
-build_catalog_variants_block = build_catalog_variants_block_FORCE_ALL
+    variants = _get_variants_by_canonical(namespace, url_canonical) or []
+    if len(variants) < 2:
+        return ""
 
+    lines = [
+        "Variantes no catálogo interno (LISTA COMPLETA; mesmo url_canonical):"
+    ]
 
-# ------------------ Hotfix build_messages: ordem dura anti-resumo ------------------
-_build_messages_prev = build_messages  # backup
+    for v in variants[:max_variants]:
+        ref = (v.get("ref") or "(sem dado)").strip()
+        name = (v.get("name") or "(sem nome)").strip()
+        brand = (v.get("brand") or "").strip()
+        variant = (v.get("variant_attrs") or "").strip()
+        price = v.get("price")
+        price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+        link = (v.get("url_canonical") or "").strip()
+
+        label = variant if variant else name
+
+        lines.append(
+            f"- Variante: {label} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {link}"
+        )
+
+    return "\n".join(lines)
+
+# -------------------- override do build_messages --------------------
+
+_old_build_messages = build_messages
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # 1) sinais contextuais → mem0
-    new_facts = extract_contextual_facts_pt(question)
-    for k, v in new_facts.items():
-        mem0_set_fact(user_id, k, v)
-
-    # 2) memórias recentes
-    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
-    memory_block = (
-        "Memórias recentes do utilizador (curto prazo):\n"
-        + "\n".join(f"- {s}" for s in short_snippets[:3])
-        if short_snippets else ""
+    # pipeline original
+    messages, new_facts, rag_used, rag_hits = _old_build_messages(
+        user_id, question, namespace
     )
 
-    # 3) CATÁLOGO INTERNO
     ns = (namespace or DEFAULT_NAMESPACE).strip()
-    cat_q = _catalog_query_from_question(question)
-    catalog_block = build_catalog_block(cat_q, ns)
 
-    # ✅ variantes: usar pergunta raw e bloco "FORCE_ALL"
-    catalog_variants_block = build_catalog_variants_block(question, ns)
+    try:
+        hit = _pick_best_catalog_hit(ns, question)
+        url_canon = (hit or {}).get("url_canonical")
 
-    # 4) RAG (igual ao teu)
-    rag_block = ""
-    rag_used = False
-    rag_hits: List[dict] = []
-    if RAG_READY:
-        try:
-            rag_hits = search_chunks(
-                query=question,
-                namespace=namespace or DEFAULT_NAMESPACE,
-                top_k=RAG_TOP_K_DEFAULT
-            ) or []
-            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
-            rag_used = bool(rag_block)
-        except Exception as e:
-            try:
-                log.warning(f"[rag] search falhou: {e}")
-            except Exception:
-                pass
-            rag_block, rag_used, rag_hits = "", False, []
+        variants_block = _build_variants_block_by_canonical(ns, url_canon)
 
-    # 5) links candidatos do RAG
-    links_pairs = _links_from_matches(rag_hits, max_links=8)
-    links_block = ""
-    if links_pairs:
-        lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
-        for title, url in links_pairs:
-            lines.append(f"- {title or '-'} — {url}")
-        links_block = "\n".join(lines)
+        if variants_block:
+            # injeta ANTES do user message (posição crítica)
+            messages.insert(
+                max(1, len(messages) - 1),
+                {"role": "system", "content": variants_block}
+            )
 
-    # 6) bloco de produtos (opcional)
-    products_block = build_rag_products_block(question)
+    except Exception as e:
+        log.warning(f"[hotfix variants canonical] falhou: {e}")
 
-    # 7) montar mensagens
-    messages = [{"role": "system", "content": ALMA_MISSION}]
-    fb = facts_block_for_user(user_id)
-    if fb:
-        messages.append({"role": "system", "content": fb})
-
-    if catalog_block:
-        messages.append({"role": "system", "content": catalog_block})
-
-    if catalog_variants_block:
-        # ✅ ORDEM DURA para não listar só “3 exemplos”
-        messages.append({"role": "system", "content":
-            "INSTRUÇÃO DURA (catálogo): Se existir um bloco 'VARIANTES_CATALOGO_INTERNO', tens de listar TODAS as variantes desse bloco (TOTAL_VARIANTES) — é proibido resumir, cortar, ou mostrar apenas algumas."
-        })
-        messages.append({"role": "system", "content": catalog_variants_block})
-
-    if rag_block:
-        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
-    if links_block:
-        messages.append({"role": "system", "content": links_block})
-    if products_block:
-        messages.append({"role": "system", "content": products_block})
-    if memory_block:
-        messages.append({"role": "system", "content": memory_block})
-
-    messages.append({"role": "user", "content": question})
     return messages, new_facts, rag_used, rag_hits
-
-# =====================================================================
-
+	
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
