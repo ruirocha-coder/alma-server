@@ -4238,7 +4238,156 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # FIM HOTFIX
 # =======================================================================================
 
+# =============================================================================
+# HOTFIX — Expandir resultados de catálogo para TODAS as variantes por url_canonical
+# (evita o caso "orçamento mostra 3 mas existem 6")
+# =============================================================================
 
+try:
+    _ORIGINAL_build_catalog_block = build_catalog_block
+except NameError:
+    _ORIGINAL_build_catalog_block = None
+
+def _has_col(c, table: str, col: str) -> bool:
+    try:
+        cur = c.execute(f"PRAGMA table_info({table})")
+        return any((row[1] == col) for row in cur.fetchall())
+    except Exception:
+        return False
+
+def _expand_to_canonical_rows(ns: str, seed_rows: list, limit: int = 60) -> list:
+    """
+    Recebe rows já encontradas (por LIKE ou ref) e, se existir url_canonical,
+    expande para TODAS as rows desse canonical.
+    """
+    if not seed_rows:
+        return []
+
+    try:
+        with _catalog_conn() as c:
+            if not _has_col(c, "catalog_items", "url_canonical"):
+                return seed_rows  # sem coluna -> não dá para expandir
+
+            # apanha os canonicals presentes nas seed_rows
+            canonicals = []
+            for r in seed_rows:
+                uc = (r.get("url_canonical") or "").strip()
+                if uc:
+                    canonicals.append(uc)
+
+            if not canonicals:
+                return seed_rows
+
+            # escolhe o canonical mais frequente (mais robusto)
+            from collections import Counter
+            url_canonical = Counter(canonicals).most_common(1)[0][0]
+
+            cur = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at, url_canonical
+                  FROM catalog_items
+                 WHERE namespace=? AND url_canonical=?
+                 ORDER BY
+                    (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                    ref ASC,
+                    updated_at DESC
+                 LIMIT ?
+            """, (ns, url_canonical, int(limit)))
+
+            rows = [dict(r) for r in cur.fetchall()]
+            return rows or seed_rows
+    except Exception as e:
+        try:
+            log.warning(f"[catalog/hotfix] expand_to_canonical falhou: {e}")
+        except Exception:
+            pass
+        return seed_rows
+
+def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    """
+    Wrapper do build_catalog_block original:
+    1) corre a pesquisa normal (LIKE/ref)
+    2) se houver resultados, expande por url_canonical para incluir TODAS as variantes
+    3) formata bloco para o LLM
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+
+    if _ORIGINAL_build_catalog_block is None:
+        return ""
+
+    # Usamos o original para obter rows + texto? O original já devolve texto final.
+    # Então aqui vamos reexecutar uma versão “rows-first” de forma segura:
+    # estratégia: chamar o original e, se vier vazio, devolve vazio.
+    # Se vier cheio, voltamos a ir buscar rows "seed" pela mesma query e expandimos.
+
+    # 1) chama original; se não há catálogo, sai
+    text = _ORIGINAL_build_catalog_block(question, namespace, limit)
+    if not text:
+        return ""
+
+    # 2) reconstruir seeds rapidamente (query simples) para obter url_canonical
+    #    (sem depender da implementação do original)
+    try:
+        q_raw = (question or "").strip()
+        q_clean = _catalog_query_from_question(q_raw)
+        terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q_clean)) if len(t) >= 3]
+
+        seed_rows = []
+        with _catalog_conn() as c:
+            if terms:
+                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
+                like_args = []
+                for t in terms:
+                    p = f"%{t}%"
+                    like_args.extend([p, p, p])
+
+                cur = c.execute(f"""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at, url_canonical
+                      FROM catalog_items
+                     WHERE namespace=? AND {where_and}
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                     LIMIT ?
+                """, tuple([ns, *like_args, int(limit)]))
+
+                seed_rows = [dict(r) for r in cur.fetchall()]
+
+        # 3) expande por canonical
+        expanded = _expand_to_canonical_rows(ns, seed_rows, limit=80) if seed_rows else []
+
+        # 4) se não expandiu nada, mantém texto original
+        if not expanded:
+            return text
+
+        # 5) formata bloco completo
+        lines = [f"CATÁLOGO INTERNO — ns={ns} (usar SÓ estes dados para orçamentos/preços; NÃO usar RAG aqui)"]
+        seen = set()
+        for r in expanded[:80]:
+            name = r.get("name") or "(sem nome)"
+            ref  = r.get("ref") or "(sem dado)"
+            price = r.get("price")
+            price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+            url = r.get("url") or "(sem URL)"
+            brand = r.get("brand") or ""
+            variant = (r.get("variant_attrs") or "").strip()
+            key = (ref, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            name_show = f"{name} — Variante: {variant}" if variant else name
+            lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+
+        try:
+            log.info(f"[catalog/hotfix] ns={ns} q={q_raw!r} seeds={len(seed_rows)} expanded={len(expanded)}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        try:
+            log.warning(f"[catalog/hotfix] wrapper falhou, a usar original: {e}")
+        except Exception:
+            pass
+        return text
 
 # ---------------------------------------------------------------------------------------
 # Local run
