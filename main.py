@@ -1201,38 +1201,19 @@ _session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
 _session.mount("https://", _adapter); _session.mount("http://", _adapter)
 
-def grok_chat(messages, timeout=120, *, mode: str = "default"):
+def grok_chat(messages, timeout=120):
     if not XAI_API_KEY:
         raise RuntimeError("Falta XAI_API_KEY")
-
-    if mode == "catalog":
-        max_tokens = 3000
-        temperature = 0.08
-        top_p = 0.9
-    else:
-        max_tokens = 1400
-        temperature = 0.5
-        top_p = 0.95
-
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
         "Connection": "keep-alive",
     }
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "max_tokens": int(max_tokens),
-        "temperature": float(temperature),
-        "top_p": float(top_p),
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-    }
-
+    payload = {"model": MODEL, "messages": messages}
     r = _session.post(XAI_API_URL, headers=headers, json=payload, timeout=timeout)
-    log.info(f"[x.ai] mode={mode} status={r.status_code} body={r.text[:300]}")
+    log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
     r.raise_for_status()
-    return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+    return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
 
 # ---------------------------------------------------------------------------------------
 # Blocos de contexto e construção das mensagens
@@ -4257,189 +4238,6 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # FIM HOTFIX
 # =======================================================================================
 
-# ---------------------------------------------------------------------------------------
-# HOTFIX ÚNICO: restaura build_messages, remove rotas duplicadas, /ask robusto, JSON sempre
-# Colar no FIM do main.py
-# ---------------------------------------------------------------------------------------
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
-import inspect
-
-# 1) Restaurar build_messages original (se foi "wrapped" para devolver 5 valores)
-if "_original_build_messages" in globals():
-    try:
-        build_messages = _original_build_messages  # volta a 4 retornos
-        log.info("[hotfix] build_messages restaurado para a versão original (4 retornos).")
-    except Exception as e:
-        log.warning(f"[hotfix] não consegui restaurar build_messages: {e}")
-
-def _detect_catalog_mode(messages) -> bool:
-    # Heurística: se o LLM "viu" um bloco de catálogo interno
-    try:
-        for m in messages or []:
-            if m.get("role") == "system" and isinstance(m.get("content"), str):
-                if m["content"].startswith("CATÁLOGO INTERNO"):
-                    return True
-    except Exception:
-        pass
-    return False
-
-def _grok_chat_safe(messages, mode: str = "default", timeout: int = 120) -> str:
-    """
-    Chama grok_chat com mode se existir; caso contrário, chama sem mode.
-    Evita rebentar se grok_chat ainda não foi alterado.
-    """
-    try:
-        sig = inspect.signature(grok_chat)
-        if "mode" in sig.parameters:
-            return grok_chat(messages, timeout=timeout, mode=mode)
-        return grok_chat(messages, timeout=timeout)
-    except TypeError:
-        # fallback se signature não for introspectável / wrapper
-        try:
-            return grok_chat(messages, timeout=timeout, mode=mode)
-        except Exception:
-            return grok_chat(messages, timeout=timeout)
-
-# 2) Remover rotas antigas / duplicadas (POST /ask e GET /ask_get)
-def _drop_routes(path: str, method: str):
-    keep = []
-    removed = 0
-    for r in list(app.router.routes):
-        try:
-            methods = getattr(r, "methods", None)
-            if getattr(r, "path", None) == path and methods and method in methods:
-                removed += 1
-                continue
-        except Exception:
-            pass
-        keep.append(r)
-    app.router.routes = keep
-    if removed:
-        log.info(f"[hotfix] removidas {removed} rota(s) {method} {path}")
-
-_drop_routes("/ask", "POST")
-_drop_routes("/ask_get", "GET")
-
-# 3) Re-registar /ask e /ask_get (uma única vez, robustos)
-async def _ask_handler(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"answer": "JSON inválido no body."})
-
-    question = (data.get("question") or "").strip()
-    user_id = (data.get("user_id") or "").strip() or "anon"
-    namespace = (data.get("namespace") or "").strip() or None
-    req_top_k = data.get("top_k")
-
-    if not question:
-        return {"answer": "Coloca a tua pergunta em 'question'."}
-
-    decided_top_k = _decide_top_k(question, req_top_k)
-    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k} question={question!r}")
-
-    # mantém sinal de produtos (não quebra nada se RAG não estiver pronto)
-    try:
-        _ = build_rag_products_block(question)
-    except Exception:
-        pass
-
-    try:
-        messages, new_facts, rag_used, rag_hits = build_messages(user_id, question, namespace)
-        catalog_mode = _detect_catalog_mode(messages)
-
-        answer = _grok_chat_safe(messages, mode=("catalog" if catalog_mode else "default"), timeout=120)
-
-        answer = _postprocess_answer(answer, question, namespace, decided_top_k)
-        answer = _force_links_block(answer, rag_hits, min_links=3)
-
-        local_append_dialog(user_id, question, answer)
-        try:
-            _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-            _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-        except Exception:
-            pass
-
-        return {
-            "answer": answer,
-            "new_facts_detected": new_facts,
-            "rag": {
-                "used": rag_used,
-                "top_k_default": RAG_TOP_K_DEFAULT,
-                "top_k_effective": decided_top_k,
-                "namespace": namespace or DEFAULT_NAMESPACE,
-                "catalog_mode": catalog_mode
-            }
-        }
-
-    except Exception as e:
-        log.exception("[/ask] erro inesperado")
-        return JSONResponse(status_code=500, content={"answer": f"Erro interno no servidor: {e}"})
-
-
-def _ask_get_handler(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
-    if not q:
-        return {"answer": "Falta query param ?q="}
-
-    decided_top_k = _decide_top_k(q, top_k)
-
-    try:
-        _ = build_rag_products_block(q)
-    except Exception:
-        pass
-
-    try:
-        messages, new_facts, rag_used, rag_hits = build_messages(user_id, q, namespace)
-        catalog_mode = _detect_catalog_mode(messages)
-
-        answer = _grok_chat_safe(messages, mode=("catalog" if catalog_mode else "default"), timeout=120)
-
-        answer = _postprocess_answer(answer, q, namespace, decided_top_k)
-        answer = _force_links_block(answer, rag_hits, min_links=3)
-
-        local_append_dialog(user_id, q, answer)
-        try:
-            _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-            _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
-        except Exception:
-            pass
-
-        return {
-            "answer": answer,
-            "new_facts_detected": new_facts,
-            "rag": {
-                "used": rag_used,
-                "top_k_default": RAG_TOP_K_DEFAULT,
-                "top_k_effective": decided_top_k,
-                "namespace": namespace or DEFAULT_NAMESPACE,
-                "catalog_mode": catalog_mode
-            }
-        }
-
-    except Exception as e:
-        log.exception("[/ask_get] erro inesperado")
-        return JSONResponse(status_code=500, content={"answer": f"Erro interno no servidor: {e}"})
-
-
-app.add_api_route("/ask", _ask_handler, methods=["POST"])
-app.add_api_route("/ask_get", _ask_get_handler, methods=["GET"])
-
-# 4) Garantir JSON sempre (evita SyntaxError no frontend)
-@app.exception_handler(RequestValidationError)
-async def _handle_validation_error(request, exc: RequestValidationError):
-    return JSONResponse(status_code=422, content={"answer": "Pedido inválido (payload).", "error": str(exc)})
-
-@app.exception_handler(StarletteHTTPException)
-async def _handle_http_exception(request, exc: StarletteHTTPException):
-    msg = exc.detail if isinstance(exc.detail, str) else "Erro HTTP."
-    return JSONResponse(status_code=exc.status_code, content={"answer": f"Erro HTTP: {msg}", "status_code": exc.status_code})
-
-@app.exception_handler(Exception)
-async def _handle_any_exception(request, exc: Exception):
-    log.exception("[hotfix] exceção não tratada")
-    return JSONResponse(status_code=500, content={"answer": f"Erro interno no servidor: {exc}"})
 
 
 # ---------------------------------------------------------------------------------------
