@@ -1201,19 +1201,38 @@ _session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
 _session.mount("https://", _adapter); _session.mount("http://", _adapter)
 
-def grok_chat(messages, timeout=120):
+def grok_chat(messages, timeout=120, *, mode: str = "default"):
     if not XAI_API_KEY:
         raise RuntimeError("Falta XAI_API_KEY")
+
+    if mode == "catalog":
+        max_tokens = 1800
+        temperature = 0.08
+        top_p = 0.9
+    else:
+        max_tokens = 1400
+        temperature = 0.5
+        top_p = 0.95
+
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
         "Connection": "keep-alive",
     }
-    payload = {"model": MODEL, "messages": messages}
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+    }
+
     r = _session.post(XAI_API_URL, headers=headers, json=payload, timeout=timeout)
-    log.info(f"[x.ai] status={r.status_code} body={r.text[:300]}")
+    log.info(f"[x.ai] mode={mode} status={r.status_code} body={r.text[:300]}")
     r.raise_for_status()
-    return r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+    return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
 
 # ---------------------------------------------------------------------------------------
 # Blocos de contexto e construção das mensagens
@@ -4237,6 +4256,123 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 # FIM HOTFIX
 # =======================================================================================
+
+# =============================================================================
+# HOTFIX — catalog_mode derivado do conteúdo injetado
+# =============================================================================
+
+_original_build_messages = build_messages
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    messages, new_facts, rag_used, rag_hits = _original_build_messages(
+        user_id, question, namespace
+    )
+
+    # Heurística robusta:
+    # Se houver bloco explícito de catálogo interno → modo catálogo
+    catalog_mode = False
+    for m in messages:
+        if (
+            m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith("CATÁLOGO INTERNO")
+        ):
+            catalog_mode = True
+            break
+
+    return messages, new_facts, rag_used, rag_hits, catalog_mode
+
+# =============================================================================
+# HOTFIX — /ask e /ask_get sensíveis a catalog_mode
+# =============================================================================
+
+@app.post("/ask")
+async def ask(request: Request):
+    data = await request.json()
+    question = (data.get("question") or "").strip()
+    user_id = (data.get("user_id") or "").strip() or "anon"
+    namespace = (data.get("namespace") or "").strip() or None
+    req_top_k = data.get("top_k")
+
+    decided_top_k = _decide_top_k(question, req_top_k)
+    log.info(f"[/ask] user_id={user_id} ns={namespace or DEFAULT_NAMESPACE} top_k={decided_top_k}")
+
+    if not question:
+        return {"answer": "Coloca a tua pergunta em 'question'."}
+
+    _ = build_rag_products_block(question)
+
+    messages, new_facts, rag_used, rag_hits, catalog_mode = build_messages(
+        user_id, question, namespace
+    )
+
+    try:
+        answer = grok_chat(
+            messages,
+            mode=("catalog" if catalog_mode else "default")
+        )
+    except Exception as e:
+        log.exception("Erro ao chamar a x.ai")
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    answer = _postprocess_answer(answer, question, namespace, decided_top_k)
+    answer = _force_links_block(answer, rag_hits, min_links=3)
+
+    local_append_dialog(user_id, question, answer)
+    _mem0_create(content=f"User: {question}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE,
+            "catalog_mode": catalog_mode
+        }
+    }
+
+
+@app.get("/ask_get")
+def ask_get(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
+    if not q:
+        return {"answer": "Falta query param ?q="}
+
+    decided_top_k = _decide_top_k(q, top_k)
+    _ = build_rag_products_block(q)
+
+    messages, new_facts, rag_used, rag_hits, catalog_mode = build_messages(
+        user_id, q, namespace
+    )
+
+    try:
+        answer = grok_chat(
+            messages,
+            mode=("catalog" if catalog_mode else "default")
+        )
+    except Exception as e:
+        return {"answer": f"Erro ao chamar o Grok-4: {e}"}
+
+    answer = _postprocess_answer(answer, q, namespace, decided_top_k)
+    answer = _force_links_block(answer, rag_hits, min_links=3)
+
+    local_append_dialog(user_id, q, answer)
+    _mem0_create(content=f"User: {q}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+    _mem0_create(content=f"Alma: {answer}", user_id=user_id, metadata={"source": "alma-server", "type": "dialog"})
+
+    return {
+        "answer": answer,
+        "new_facts_detected": new_facts,
+        "rag": {
+            "used": rag_used,
+            "top_k_default": RAG_TOP_K_DEFAULT,
+            "top_k_effective": decided_top_k,
+            "namespace": namespace or DEFAULT_NAMESPACE,
+            "catalog_mode": catalog_mode
+        }
+    }
 
 
 # ---------------------------------------------------------------------------------------
