@@ -4239,156 +4239,233 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 
 # =============================================================================
-# HOTFIX — Expandir resultados de catálogo para TODAS as variantes por url_canonical
-# (evita o caso "orçamento mostra 3 mas existem 6")
+# HOTFIX — Em pedidos de ORÇAMENTO, força listagem COMPLETA de variantes do catálogo
+# (quando o Grok resumir para 3/4 apesar do mission)
 # =============================================================================
 
-try:
-    _ORIGINAL_build_catalog_block = build_catalog_block
-except NameError:
-    _ORIGINAL_build_catalog_block = None
+import re
+from typing import Optional, List, Dict, Any
 
-def _has_col(c, table: str, col: str) -> bool:
+# --- heurísticas --------------------------------------------------------------
+
+_BUDGET_PAT = re.compile(r"\b(or[çc]amento|cot[aã]o|proforma|pre[çc]o|precos|preços|quanto\s+custa|quanto\s+fica)\b", re.I)
+
+def _is_budget_intent(q: str) -> bool:
+    return bool(_BUDGET_PAT.search((q or "").lower()))
+
+def _count_listed_skus(answer: str) -> int:
+    """
+    Conta SKUs listados no texto (padrões mais comuns do teu output).
+    """
+    a = answer or ""
+    # SKU: XXXXX ou (SKU: XXXXX) ou "SKU XXXXX"
+    skus = re.findall(r"\bSKU\s*[:\-]?\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I)
+    # dedup
+    return len({s.upper() for s in skus})
+
+def _canon_from_url(url: str) -> str:
+    """
+    remove fragmentos e params específicos; mantém /slug
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    u = u.split("#", 1)[0]
+    return u
+
+def _pick_best_seed(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Preferir linha com url_canonical preenchido; depois qualquer com url.
+    """
+    if not rows:
+        return None
+    for r in rows:
+        if (r.get("url_canonical") or "").strip():
+            return r
+    for r in rows:
+        if (r.get("url") or "").strip():
+            return r
+    return rows[0]
+
+# --- acesso catálogo ----------------------------------------------------------
+
+def _catalog_search_seed(namespace: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Procura seeds no catálogo usando a tua lógica "limpa" (nome/summary/ref).
+    Usa colunas url_canonical e url se existirem.
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q_raw = (query or "").strip()
+    q_clean = ""
     try:
-        cur = c.execute(f"PRAGMA table_info({table})")
-        return any((row[1] == col) for row in cur.fetchall())
+        q_clean = _catalog_query_from_question(q_raw)
     except Exception:
-        return False
+        q_clean = q_raw
 
-def _expand_to_canonical_rows(ns: str, seed_rows: list, limit: int = 60) -> list:
-    """
-    Recebe rows já encontradas (por LIKE ou ref) e, se existir url_canonical,
-    expande para TODAS as rows desse canonical.
-    """
-    if not seed_rows:
-        return []
+    # termos
+    terms = [t for t in re.split(r"[\s,;]+", (q_clean or "")) if len(t) >= 3]
+    if not terms:
+        terms = [t for t in re.split(r"[\s,;]+", (q_raw or "")) if len(t) >= 3]
 
+    rows: List[Dict[str, Any]] = []
     try:
         with _catalog_conn() as c:
-            if not _has_col(c, "catalog_items", "url_canonical"):
-                return seed_rows  # sem coluna -> não dá para expandir
+            # tenta AND primeiro
+            where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms)) if terms else "1=1"
+            like_args = []
+            for t in terms:
+                p = f"%{_sanitize_like(t)}%"
+                like_args.extend([p, p, p])
 
-            # apanha os canonicals presentes nas seed_rows
-            canonicals = []
-            for r in seed_rows:
-                uc = (r.get("url_canonical") or "").strip()
-                if uc:
-                    canonicals.append(uc)
-
-            if not canonicals:
-                return seed_rows
-
-            # escolhe o canonical mais frequente (mais robusto)
-            from collections import Counter
-            url_canonical = Counter(canonicals).most_common(1)[0][0]
-
+            # inclui url_canonical se existir
             cur = c.execute("""
-                SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at, url_canonical
+                SELECT namespace, name, ref, price, url, brand, variant_attrs,
+                       CASE
+                         WHEN instr(sql, 'url_canonical') > 0 THEN url_canonical
+                         ELSE NULL
+                       END AS url_canonical
+                FROM (
+                  SELECT *, 'url_canonical' as sql
                   FROM catalog_items
-                 WHERE namespace=? AND url_canonical=?
-                 ORDER BY
-                    (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
-                    ref ASC,
-                    updated_at DESC
-                 LIMIT ?
-            """, (ns, url_canonical, int(limit)))
-
+                )
+                WHERE namespace=? AND """ + where_and + """
+                ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                LIMIT ?
+            """, tuple([ns, *like_args, limit]))
             rows = [dict(r) for r in cur.fetchall()]
-            return rows or seed_rows
-    except Exception as e:
+    except Exception:
+        # fallback simples sem truques de SQL
         try:
-            log.warning(f"[catalog/hotfix] expand_to_canonical falhou: {e}")
+            with _catalog_conn() as c:
+                like = f"%{_sanitize_like(q_clean or q_raw)}%"
+                cur = c.execute("""
+                    SELECT namespace, name, ref, price, url, brand, variant_attrs, url_canonical
+                    FROM catalog_items
+                    WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                    ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                    LIMIT ?
+                """, (ns, like, like, like, limit))
+                rows = [dict(r) for r in cur.fetchall()]
         except Exception:
-            pass
-        return seed_rows
+            rows = []
 
-def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+    return rows
+
+def _catalog_get_variants(namespace: str, seed: Dict[str, Any], limit_variants: int = 40) -> List[Dict[str, Any]]:
     """
-    Wrapper do build_catalog_block original:
-    1) corre a pesquisa normal (LIKE/ref)
-    2) se houver resultados, expande por url_canonical para incluir TODAS as variantes
-    3) formata bloco para o LLM
+    Busca variantes por url_canonical (preferido). Se não existir, por parent url (#sku=).
     """
     ns = (namespace or DEFAULT_NAMESPACE).strip()
 
-    if _ORIGINAL_build_catalog_block is None:
-        return ""
+    url_canonical = (seed.get("url_canonical") or "").strip()
+    url = (seed.get("url") or "").strip()
+    parent = _canon_from_url(url)
 
-    # Usamos o original para obter rows + texto? O original já devolve texto final.
-    # Então aqui vamos reexecutar uma versão “rows-first” de forma segura:
-    # estratégia: chamar o original e, se vier vazio, devolve vazio.
-    # Se vier cheio, voltamos a ir buscar rows "seed" pela mesma query e expandimos.
-
-    # 1) chama original; se não há catálogo, sai
-    text = _ORIGINAL_build_catalog_block(question, namespace, limit)
-    if not text:
-        return ""
-
-    # 2) reconstruir seeds rapidamente (query simples) para obter url_canonical
-    #    (sem depender da implementação do original)
     try:
-        q_raw = (question or "").strip()
-        q_clean = _catalog_query_from_question(q_raw)
-        terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q_clean)) if len(t) >= 3]
-
-        seed_rows = []
         with _catalog_conn() as c:
-            if terms:
-                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
+            if url_canonical:
+                cur = c.execute("""
+                    SELECT name, ref, price, url, brand, variant_attrs, url_canonical
+                    FROM catalog_items
+                    WHERE namespace=? AND url_canonical=?
+                    ORDER BY ref ASC
+                    LIMIT ?
+                """, (ns, url_canonical, limit_variants))
+                rows = [dict(r) for r in cur.fetchall()]
+                return rows
 
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at, url_canonical
-                      FROM catalog_items
-                     WHERE namespace=? AND {where_and}
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?
-                """, tuple([ns, *like_args, int(limit)]))
+            if parent:
+                cur = c.execute("""
+                    SELECT name, ref, price, url, brand, variant_attrs, url_canonical
+                    FROM catalog_items
+                    WHERE namespace=? AND (url=? OR url LIKE ?)
+                    ORDER BY ref ASC
+                    LIMIT ?
+                """, (ns, parent, parent + "#sku=%", limit_variants))
+                rows = [dict(r) for r in cur.fetchall()]
+                return rows
+    except Exception:
+        pass
 
-                seed_rows = [dict(r) for r in cur.fetchall()]
+    return []
 
-        # 3) expande por canonical
-        expanded = _expand_to_canonical_rows(ns, seed_rows, limit=80) if seed_rows else []
+def _format_variants_budget_answer(product_name: str, variants: List[Dict[str, Any]]) -> str:
+    """
+    Gera resposta determinística: lista TODAS as variantes do catálogo (até 40),
+    e pede escolha.
+    """
+    # tentar nome “base”
+    title = (product_name or "Produto").strip()
 
-        # 4) se não expandiu nada, mantém texto original
-        if not expanded:
-            return text
+    lines = [f"{title} ({len(variants)} variantes disponíveis no catálogo interno):"]
+    for v in variants[:40]:
+        var_txt = (v.get("variant_attrs") or "").strip()
+        sku = (v.get("ref") or "").strip() or "(sem dado)"
+        price = v.get("price")
+        price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
 
-        # 5) formata bloco completo
-        lines = [f"CATÁLOGO INTERNO — ns={ns} (usar SÓ estes dados para orçamentos/preços; NÃO usar RAG aqui)"]
-        seen = set()
-        for r in expanded[:80]:
-            name = r.get("name") or "(sem nome)"
-            ref  = r.get("ref") or "(sem dado)"
-            price = r.get("price")
-            price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-            url = r.get("url") or "(sem URL)"
-            brand = r.get("brand") or ""
-            variant = (r.get("variant_attrs") or "").strip()
-            key = (ref, url)
-            if key in seen:
-                continue
-            seen.add(key)
-            name_show = f"{name} — Variante: {variant}" if variant else name
-            lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+        # link canónico (sem #)
+        url = _canon_from_url(v.get("url") or "")
+        if not url:
+            url = _canon_from_url(v.get("url_canonical") or "")
 
-        try:
-            log.info(f"[catalog/hotfix] ns={ns} q={q_raw!r} seeds={len(seed_rows)} expanded={len(expanded)}")
-        except Exception:
-            pass
+        label = var_txt if var_txt else (v.get("name") or "").strip() or "(sem variante)"
+        # 1 link único só no fim (política); aqui não meto links em cada linha
+        lines.append(f"- {label} | SKU: {sku} | Preço unitário: {price_txt}")
 
-        return "\n".join(lines)
+    # link único canónico (se houver)
+    best_url = ""
+    for v in variants:
+        u = _canon_from_url(v.get("url") or "")
+        if u:
+            best_url = u
+            break
+    if best_url:
+        lines.append("")
+        lines.append("Preço com IVA incluído; portes não incluídos.")
+        lines.append(f"[ver produto]({best_url})")
+    else:
+        lines.append("")
+        lines.append("Preço com IVA incluído; portes não incluídos.")
 
-    except Exception as e:
-        try:
-            log.warning(f"[catalog/hotfix] wrapper falhou, a usar original: {e}")
-        except Exception:
-            pass
-        return text
+    lines.append("")
+    lines.append("Indica a variante escolhida (pelo SKU ou nome exato) e a quantidade para avançar.")
+    return "\n".join(lines)
 
+# --- override _postprocess_answer --------------------------------------------
+
+_ORIG__postprocess_answer = _postprocess_answer
+
+def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
+    """
+    Mantém o pipeline existente, mas se for orçamento e houver 'resumo indevido'
+    (ex.: lista 3 quando catálogo tem 6), substitui por output determinístico.
+    """
+    # primeiro fazes o que já tinhas
+    step2 = _ORIG__postprocess_answer(answer, user_query, namespace, decided_top_k)
+
+    # só intervém em orçamento
+    if not _is_budget_intent(user_query):
+        return step2
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+
+    # tenta encontrar o produto no catálogo a partir da própria pergunta
+    seeds = _catalog_search_seed(ns, user_query, limit=10)
+    seed = _pick_best_seed(seeds)
+    if not seed:
+        return step2  # sem seed → não mexe
+
+    variants = _catalog_get_variants(ns, seed, limit_variants=40)
+    # só faz override se houver várias variantes e a resposta listou menos do que devia
+    if len(variants) >= 4:
+        listed = _count_listed_skus(step2)
+        if listed and listed < len({(v.get("ref") or "").upper() for v in variants if (v.get("ref") or "").strip()}):
+            # substitui por listagem completa do catálogo
+            base_name = (seed.get("name") or "").strip() or "Produto"
+            return _format_variants_budget_answer(base_name, variants)
+
+    return step2
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
