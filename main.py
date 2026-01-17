@@ -4237,235 +4237,115 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 # FIM HOTFIX
 # =======================================================================================
-
 # =============================================================================
-# HOTFIX — Em pedidos de ORÇAMENTO, força listagem COMPLETA de variantes do catálogo
-# (quando o Grok resumir para 3/4 apesar do mission)
+# HOTFIX — Em pedidos de ORÇAMENTO, injeta SEMPRE a lista completa de variantes
+# (usando url_canonical). Não depende de palavras-chave "variantes".
 # =============================================================================
-
 import re
 from typing import Optional, List, Dict, Any
 
-# --- heurísticas --------------------------------------------------------------
+_ORIG_build_messages = build_messages
 
 _BUDGET_PAT = re.compile(r"\b(or[çc]amento|cot[aã]o|proforma|pre[çc]o|precos|preços|quanto\s+custa|quanto\s+fica)\b", re.I)
 
 def _is_budget_intent(q: str) -> bool:
     return bool(_BUDGET_PAT.search((q or "").lower()))
 
-def _count_listed_skus(answer: str) -> int:
+def _catalog_seed_row(ns: str, question: str) -> Optional[Dict[str, Any]]:
     """
-    Conta SKUs listados no texto (padrões mais comuns do teu output).
+    Tenta encontrar 1 linha seed no catálogo para extrair url_canonical.
+    Usa a tua query "limpa" e um fallback tolerante.
     """
-    a = answer or ""
-    # SKU: XXXXX ou (SKU: XXXXX) ou "SKU XXXXX"
-    skus = re.findall(r"\bSKU\s*[:\-]?\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I)
-    # dedup
-    return len({s.upper() for s in skus})
+    q_raw = (question or "").strip()
+    q_clean = _catalog_query_from_question(q_raw) if "_catalog_query_from_question" in globals() else q_raw
+    like = f"%{_sanitize_like(q_clean) if '_sanitize_like' in globals() else q_clean}%"
 
-def _canon_from_url(url: str) -> str:
-    """
-    remove fragmentos e params específicos; mantém /slug
-    """
-    u = (url or "").strip()
-    if not u:
-        return ""
-    u = u.split("#", 1)[0]
-    return u
-
-def _pick_best_seed(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Preferir linha com url_canonical preenchido; depois qualquer com url.
-    """
-    if not rows:
-        return None
-    for r in rows:
-        if (r.get("url_canonical") or "").strip():
-            return r
-    for r in rows:
-        if (r.get("url") or "").strip():
-            return r
-    return rows[0]
-
-# --- acesso catálogo ----------------------------------------------------------
-
-def _catalog_search_seed(namespace: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Procura seeds no catálogo usando a tua lógica "limpa" (nome/summary/ref).
-    Usa colunas url_canonical e url se existirem.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q_raw = (query or "").strip()
-    q_clean = ""
-    try:
-        q_clean = _catalog_query_from_question(q_raw)
-    except Exception:
-        q_clean = q_raw
-
-    # termos
-    terms = [t for t in re.split(r"[\s,;]+", (q_clean or "")) if len(t) >= 3]
-    if not terms:
-        terms = [t for t in re.split(r"[\s,;]+", (q_raw or "")) if len(t) >= 3]
-
-    rows: List[Dict[str, Any]] = []
     try:
         with _catalog_conn() as c:
-            # tenta AND primeiro
-            where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms)) if terms else "1=1"
-            like_args = []
-            for t in terms:
-                p = f"%{_sanitize_like(t)}%"
-                like_args.extend([p, p, p])
-
-            # inclui url_canonical se existir
+            # tenta match por name/summary/ref, preferindo linhas com url_canonical preenchido
             cur = c.execute("""
-                SELECT namespace, name, ref, price, url, brand, variant_attrs,
-                       CASE
-                         WHEN instr(sql, 'url_canonical') > 0 THEN url_canonical
-                         ELSE NULL
-                       END AS url_canonical
-                FROM (
-                  SELECT *, 'url_canonical' as sql
+                SELECT *
                   FROM catalog_items
-                )
-                WHERE namespace=? AND """ + where_and + """
-                ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                LIMIT ?
-            """, tuple([ns, *like_args, limit]))
-            rows = [dict(r) for r in cur.fetchall()]
-    except Exception:
-        # fallback simples sem truques de SQL
+                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                 ORDER BY
+                   (CASE WHEN url_canonical IS NOT NULL AND TRIM(url_canonical)<>'' THEN 0 ELSE 1 END),
+                   (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                   updated_at DESC
+                 LIMIT 1
+            """, (ns, like, like, like))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
         try:
-            with _catalog_conn() as c:
-                like = f"%{_sanitize_like(q_clean or q_raw)}%"
-                cur = c.execute("""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, url_canonical
-                    FROM catalog_items
-                    WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-                    ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                    LIMIT ?
-                """, (ns, like, like, like, limit))
-                rows = [dict(r) for r in cur.fetchall()]
+            log.warning(f"[hotfix] seed falhou: {e}")
         except Exception:
-            rows = []
+            pass
+        return None
 
-    return rows
-
-def _catalog_get_variants(namespace: str, seed: Dict[str, Any], limit_variants: int = 40) -> List[Dict[str, Any]]:
+def build_catalog_variants_full_block_by_canonical(question: str, namespace: Optional[str] = None, limit_variants: int = 40) -> str:
     """
-    Busca variantes por url_canonical (preferido). Se não existir, por parent url (#sku=).
+    Bloco determinístico: encontra seed -> url_canonical -> lista TODAS as variantes desse canonical.
     """
     ns = (namespace or DEFAULT_NAMESPACE).strip()
+    seed = _catalog_seed_row(ns, question)
+    if not seed:
+        return ""
+    urlc = (seed.get("url_canonical") or "").strip()
+    if not urlc:
+        return ""
 
-    url_canonical = (seed.get("url_canonical") or "").strip()
-    url = (seed.get("url") or "").strip()
-    parent = _canon_from_url(url)
+    if "_get_variants_by_canonical" not in globals():
+        return ""
 
-    try:
-        with _catalog_conn() as c:
-            if url_canonical:
-                cur = c.execute("""
-                    SELECT name, ref, price, url, brand, variant_attrs, url_canonical
-                    FROM catalog_items
-                    WHERE namespace=? AND url_canonical=?
-                    ORDER BY ref ASC
-                    LIMIT ?
-                """, (ns, url_canonical, limit_variants))
-                rows = [dict(r) for r in cur.fetchall()]
-                return rows
+    vars_ = _get_variants_by_canonical(ns, urlc) or []
+    if not vars_:
+        return ""
 
-            if parent:
-                cur = c.execute("""
-                    SELECT name, ref, price, url, brand, variant_attrs, url_canonical
-                    FROM catalog_items
-                    WHERE namespace=? AND (url=? OR url LIKE ?)
-                    ORDER BY ref ASC
-                    LIMIT ?
-                """, (ns, parent, parent + "#sku=%", limit_variants))
-                rows = [dict(r) for r in cur.fetchall()]
-                return rows
-    except Exception:
-        pass
+    # limita por segurança (mas alto)
+    vars_ = vars_[:max(1, int(limit_variants))]
 
-    return []
-
-def _format_variants_budget_answer(product_name: str, variants: List[Dict[str, Any]]) -> str:
-    """
-    Gera resposta determinística: lista TODAS as variantes do catálogo (até 40),
-    e pede escolha.
-    """
-    # tentar nome “base”
-    title = (product_name or "Produto").strip()
-
-    lines = [f"{title} ({len(variants)} variantes disponíveis no catálogo interno):"]
-    for v in variants[:40]:
-        var_txt = (v.get("variant_attrs") or "").strip()
-        sku = (v.get("ref") or "").strip() or "(sem dado)"
+    lines = [f"VARIANTES COMPLETAS (CATÁLOGO INTERNO) — url_canonical={urlc} — TOTAL={len(vars_)}"]
+    for v in vars_:
+        name = (v.get("name") or "").strip() or "(sem nome)"
+        ref  = (v.get("ref") or "").strip() or "(sem SKU)"
         price = v.get("price")
         price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-
-        # link canónico (sem #)
-        url = _canon_from_url(v.get("url") or "")
-        if not url:
-            url = _canon_from_url(v.get("url_canonical") or "")
-
-        label = var_txt if var_txt else (v.get("name") or "").strip() or "(sem variante)"
-        # 1 link único só no fim (política); aqui não meto links em cada linha
-        lines.append(f"- {label} | SKU: {sku} | Preço unitário: {price_txt}")
-
-    # link único canónico (se houver)
-    best_url = ""
-    for v in variants:
-        u = _canon_from_url(v.get("url") or "")
-        if u:
-            best_url = u
-            break
-    if best_url:
-        lines.append("")
-        lines.append("Preço com IVA incluído; portes não incluídos.")
-        lines.append(f"[ver produto]({best_url})")
-    else:
-        lines.append("")
-        lines.append("Preço com IVA incluído; portes não incluídos.")
-
-    lines.append("")
-    lines.append("Indica a variante escolhida (pelo SKU ou nome exato) e a quantidade para avançar.")
+        variant = (v.get("variant_attrs") or "").strip()
+        url = (v.get("url") or "").strip() or "(sem URL)"
+        show = variant if variant else name
+        lines.append(f"- Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {url}")
     return "\n".join(lines)
 
-# --- override _postprocess_answer --------------------------------------------
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    messages, new_facts, rag_used, rag_hits = _ORIG_build_messages(user_id, question, namespace)
 
-_ORIG__postprocess_answer = _postprocess_answer
+    # Se for orçamento/preço → injeta lista completa de variantes (por canonical)
+    if _is_budget_intent(question):
+        try:
+            ns = (namespace or DEFAULT_NAMESPACE).strip()
+            full_vars = build_catalog_variants_full_block_by_canonical(question, ns, limit_variants=40)
+            if full_vars:
+                # mete imediatamente a seguir ao "CATÁLOGO INTERNO" se existir; senão acrescenta no fim dos system
+                inserted = False
+                for i, m in enumerate(messages):
+                    if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
+                        messages.insert(i + 1, {"role": "system", "content": full_vars})
+                        inserted = True
+                        break
+                if not inserted:
+                    messages.append({"role": "system", "content": full_vars})
 
-def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
-    """
-    Mantém o pipeline existente, mas se for orçamento e houver 'resumo indevido'
-    (ex.: lista 3 quando catálogo tem 6), substitui por output determinístico.
-    """
-    # primeiro fazes o que já tinhas
-    step2 = _ORIG__postprocess_answer(answer, user_query, namespace, decided_top_k)
+                try:
+                    log.info("[hotfix] orçamento -> variantes completas injetadas via url_canonical")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                log.warning(f"[hotfix] falhou a injeção de variantes completas: {e}")
+            except Exception:
+                pass
 
-    # só intervém em orçamento
-    if not _is_budget_intent(user_query):
-        return step2
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-
-    # tenta encontrar o produto no catálogo a partir da própria pergunta
-    seeds = _catalog_search_seed(ns, user_query, limit=10)
-    seed = _pick_best_seed(seeds)
-    if not seed:
-        return step2  # sem seed → não mexe
-
-    variants = _catalog_get_variants(ns, seed, limit_variants=40)
-    # só faz override se houver várias variantes e a resposta listou menos do que devia
-    if len(variants) >= 4:
-        listed = _count_listed_skus(step2)
-        if listed and listed < len({(v.get("ref") or "").upper() for v in variants if (v.get("ref") or "").strip()}):
-            # substitui por listagem completa do catálogo
-            base_name = (seed.get("name") or "").strip() or "Produto"
-            return _format_variants_budget_answer(base_name, variants)
-
-    return step2
+    return messages, new_facts, rag_used, rag_hits
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
