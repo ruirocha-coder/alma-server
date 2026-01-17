@@ -4239,14 +4239,9 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 
 # =============================================================================
-# HOTFIX — Em ORÇAMENTOS, injectar SEMPRE variantes completas da família (url_canonical)
+# HOTFIX — Em ORÇAMENTO, força execução do build_catalog_variants_block
 # =============================================================================
 
-import re
-import sqlite3
-from typing import Optional, List, Dict, Any
-
-# guarda original
 _original_build_messages = build_messages
 
 _BUDGET_WORDS = (
@@ -4258,153 +4253,52 @@ def _is_budget_intent(q: str) -> bool:
     ql = (q or "").lower()
     return any(w in ql for w in _BUDGET_WORDS)
 
-def _has_col(conn: sqlite3.Connection, table: str, col: str) -> bool:
-    try:
-        cur = conn.execute(f"PRAGMA table_info({table})")
-        cols = {r[1] for r in cur.fetchall()}
-        return col in cols
-    except Exception:
-        return False
-
-def _fetch_variants_by_canonical(ns: str, url_canonical: str, limit: int = 40) -> List[Dict[str, Any]]:
-    try:
-        with _catalog_conn() as conn:
-            if not _has_col(conn, "catalog_items", "url_canonical"):
-                return []
-            cur = conn.execute(
-                """
-                SELECT name, ref, price, url, brand, variant_attrs, url_canonical
-                  FROM catalog_items
-                 WHERE namespace=? AND url_canonical=?
-                 ORDER BY ref ASC
-                 LIMIT ?
-                """,
-                (ns, url_canonical, limit)
-            )
-            return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
-
-def _fetch_variants_by_parent_url(ns: str, parent_url: str, limit: int = 40) -> List[Dict[str, Any]]:
-    try:
-        with _catalog_conn() as conn:
-            cur = conn.execute(
-                """
-                SELECT name, ref, price, url, brand, variant_attrs
-                  FROM catalog_items
-                 WHERE namespace=? AND url LIKE ?
-                 ORDER BY ref ASC
-                 LIMIT ?
-                """,
-                (ns, parent_url + "%", limit)
-            )
-            return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
-
-def _canonicalize_url(url: str) -> str:
-    return (url or "").split("#")[0].strip()
-
-def _best_family_seed_from_catalog_block(catalog_block: str) -> Optional[str]:
-    """
-    Extrai 1 URL do bloco 'CATÁLOGO INTERNO' para usar como seed.
-    Procura a primeira ocorrência 'Link: ...'
-    """
-    if not catalog_block:
-        return None
-    m = re.search(r"Link:\s*(\S+)", catalog_block)
-    if not m:
-        return None
-    return m.group(1).strip()
-
-def _variants_block_from_rows(rows: List[Dict[str, Any]], title: str = "VARIANTES (AUTO)") -> str:
-    if not rows:
-        return ""
-    lines = [f"{title} — listar TODAS as variantes abaixo (não resumir):"]
-    for r in rows:
-        ref = r.get("ref") or "(sem dado)"
-        price = r.get("price")
-        price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-        var = (r.get("variant_attrs") or "").strip()
-        name = (r.get("name") or "").strip()
-        show = var or name or "(sem nome)"
-        url = r.get("url") or "(sem URL)"
-        lines.append(f"- Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {url}")
-    return "\n".join(lines)
-
-def _build_budget_variants_injection(ns: str, question: str, catalog_block: str) -> str:
-    """
-    1) tenta url_canonical: usa o seed (link) e procura o canonical correspondente no DB
-    2) se não houver canonical, faz fallback por parent url (antes de #)
-    """
-    seed_url = _best_family_seed_from_catalog_block(catalog_block)
-    if not seed_url:
-        return ""
-
-    parent = _canonicalize_url(seed_url)
-
-    # 1) tentar canonical via DB (a partir de qualquer linha com url como a seed)
-    url_canonical = None
-    try:
-        with _catalog_conn() as conn:
-            if _has_col(conn, "catalog_items", "url_canonical"):
-                cur = conn.execute(
-                    """
-                    SELECT url_canonical
-                      FROM catalog_items
-                     WHERE namespace=? AND (url=? OR url LIKE ?)
-                     ORDER BY updated_at DESC
-                     LIMIT 1
-                    """,
-                    (ns, seed_url, parent + "%")
-                )
-                row = cur.fetchone()
-                if row:
-                    url_canonical = (row[0] or "").strip() if isinstance(row, tuple) else (row["url_canonical"] or "").strip()
-    except Exception:
-        url_canonical = None
-
-    if url_canonical:
-        rows = _fetch_variants_by_canonical(ns, url_canonical, limit=40)
-        block = _variants_block_from_rows(rows, title="VARIANTES (AUTO — url_canonical)")
-        if block:
-            return block
-
-    # 2) fallback por URL-pai
-    rows = _fetch_variants_by_parent_url(ns, parent, limit=40)
-    # se a tabela guarda variantes como '#sku=' também entra aqui porque LIKE parent% apanha ambas
-    block = _variants_block_from_rows(rows, title="VARIANTES (AUTO — parent url)")
-    return block
-
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # chama o original (mantém tudo como está)
     messages, new_facts, rag_used, rag_hits = _original_build_messages(user_id, question, namespace)
 
-    # descobrir ns e o bloco de catálogo que já foi injectado
     ns = (namespace or DEFAULT_NAMESPACE).strip()
 
-    catalog_block = ""
-    for m in messages:
-        if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
-            catalog_block = m["content"]
+    # 1) só em pedidos de orçamento
+    if not _is_budget_intent(question):
+        return messages, new_facts, rag_used, rag_hits
+
+    # 2) já existe bloco de variantes? se sim, não mexe
+    has_variants_block = any(
+        m.get("role") == "system"
+        and isinstance(m.get("content"), str)
+        and ("Variantes no catálogo interno" in m["content"] or m["content"].startswith("Variantes no catálogo interno"))
+        for m in messages
+    )
+    if has_variants_block:
+        return messages, new_facts, rag_used, rag_hits
+
+    # 3) força o variants_block a disparar (sem depender do texto do utilizador)
+    cat_q = _catalog_query_from_question(question)
+    forced_q = f"{cat_q} variantes"
+    variants_block = build_catalog_variants_block(forced_q, ns)
+
+    # logging útil para confirmares no Railway logs
+    try:
+        log.info(f"[hotfix/variants] budget=1 ns={ns} cat_q={cat_q!r} injected={bool(variants_block)}")
+    except Exception:
+        pass
+
+    if not variants_block:
+        return messages, new_facts, rag_used, rag_hits
+
+    # 4) injecta logo a seguir ao CATÁLOGO INTERNO (para o Grok ver primeiro)
+    insert_at = 1
+    for i, m in enumerate(messages):
+        if (
+            m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith("CATÁLOGO INTERNO")
+        ):
+            insert_at = i + 1
             break
 
-    # se for orçamento e houver catálogo, injeta variantes completas (auto)
-    if _is_budget_intent(question) and catalog_block:
-        inj = _build_budget_variants_injection(ns, question, catalog_block)
-        if inj:
-            # injecta logo a seguir ao catálogo (antes de RAG/memória)
-            # encontra índice do catálogo
-            idx = None
-            for i, m in enumerate(messages):
-                if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
-                    idx = i
-                    break
-            insert_at = (idx + 1) if idx is not None else 1
-            messages.insert(insert_at, {"role": "system", "content": inj})
-
-            # regra explícita para não resumir (curta e objetiva)
-            messages.insert(insert_at + 1, {"role": "system", "content": "Em modo ORÇAMENTO: usa o bloco VARIANTES (AUTO) e lista TODAS as variantes desse bloco (até 40), sem resumir para 3."})
+    messages.insert(insert_at, {"role": "system", "content": variants_block})
+    messages.insert(insert_at + 1, {"role": "system", "content": "Em ORÇAMENTO: se houver variantes no catálogo, listar TODAS as variantes apresentadas acima (até 40), sem resumir."})
 
     return messages, new_facts, rag_used, rag_hits
 
