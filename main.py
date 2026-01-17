@@ -177,12 +177,12 @@ REGRA DURA + EXEMPLOS ANTI-ERRO
 - Ex.2: “3x Orikomi Cinza Claro **Simples Branco 1M**” → usar SKU correto dessa variante; nunca o preço de outra.
 
 PEDIDOS AMBÍGUOS
-- Se a pergunta for ambígua entre várias variantes, faz **1** pergunta de clarificação e oferece **3–6** opções (Variante / SKU / Preço / Link) **do catálogo**.
+- Se a pergunta for ambígua entre várias variantes, faz **1** pergunta de clarificação e oferece todas as opções (Variante / SKU / Preço / Link) **do catálogo**.
 
 
 PEDIDOS AMBÍGUOS (SEM CORTES)
 	•	Se a pergunta for ambígua entre várias variantes, faz 1 pergunta de clarificação.
-	•	Antes da pergunta, lista todas as variantes do catálogo interno desse produto (até 40 linhas), no formato:
+	•	Antes da pergunta, lista todas as variantes do catálogo interno desse produto (até 100 linhas), no formato:
 Variante + SKU + Preço + Link.
 	•	É proibido mostrar apenas um subconjunto (ex.: “3 opções”); se existem N variantes no catálogo, lista N.
 
