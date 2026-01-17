@@ -4237,178 +4237,151 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 # FIM HOTFIX
 # =======================================================================================
-# =============================================================================
-# HOTFIX — Em ORÇAMENTOS/PREÇOS, injeta SEMPRE variantes completas do catálogo
-# (mesmo que a pergunta não contenha "variantes/cores/opções")
-# Colar no FINAL do main.py
-# =============================================================================
+# =======================================================================================
+# HOTFIX ÚNICO (colar NO FIM do ficheiro) — Orçamentos: variantes completas por URL canónica
+# Objetivos:
+# 1) Em pedidos de orçamento/preço, listar TODAS as variantes do catálogo (sem depender do LLM).
+# 2) Usar a URL canónica (parent sem #) como chave para agrupar variantes.
+# 3) Em orçamentos, NÃO anexar “Links úteis (do RAG)” nem injetar links via RAG no texto final.
+# =======================================================================================
 
-try:
-    _ORIGINAL_BUILD_MESSAGES = build_messages
-except Exception:
-    _ORIGINAL_BUILD_MESSAGES = None
+# --- guarda referências às funções atuais (para não perder comportamento noutros casos) ---
+_build_messages__orig = build_messages
+_postprocess_answer__orig = _postprocess_answer
+_force_links_block__orig = _force_links_block
 
-
-def _is_budget_like(q: str) -> bool:
-    s = (q or "").lower()
-    # cobre "orçamento", "orcamento", "cotação", "preço", "quanto custa", etc.
-    if any(k in s for k in ("orçament", "orcament", "cotac", "proforma", "preço", "preco", "quanto custa", "quanto fica")):
-        return True
-    # padrão quantidade "2x", "3 x", "qtd 4", etc.
-    if re.search(r"\b\d+\s*x\b", s) or re.search(r"\bqtd\b|\bunidades?\b", s):
-        return True
-    return False
-
-
-def _catalog_has_col(col_name: str) -> bool:
-    try:
-        with _catalog_conn() as c:
-            cur = c.execute("PRAGMA table_info(catalog_items)")
-            cols = {r[1] for r in cur.fetchall()}
-            return col_name in cols
-    except Exception:
-        return False
-
-
-def _build_catalog_variants_block_forced(question: str, namespace: Optional[str], max_rows: int = 400, max_variants: int = 120) -> str:
+def _extract_first_catalog_parent_url(catalog_block: str) -> str:
     """
-    Versão FORÇADA: tenta sempre encontrar variantes (#sku=) para o produto referido,
-    sem depender de keywords tipo "variantes".
-    Agrupa por url_canonical (se existir) senão por url sem fragmento.
-    Escolhe 1 grupo (o mais provável) para não poluir o prompt.
+    Extrai o primeiro Link do bloco do catálogo e devolve o URL canónico (sem fragmento #...).
+    Isto torna a URL canónica a chave (como queres).
     """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q_raw = (question or "").strip()
-    q_clean = _catalog_query_from_question(q_raw) if " _catalog_query_from_question" in globals() else q_raw
-    terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q_clean)) if len(t) >= 2]
-
-    has_url_canon = _catalog_has_col("url_canonical")
-
-    try:
-        with _catalog_conn() as c:
-            # WHERE por termos (AND) para focar no produto certo
-            if terms:
-                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
-                select_cols = "name, ref, price, url, brand, variant_attrs" + (", url_canonical" if has_url_canon else "")
-                cur = c.execute(
-                    f"""
-                    SELECT {select_cols}
-                      FROM catalog_items
-                     WHERE namespace=? AND {where_and}
-                     ORDER BY updated_at DESC
-                     LIMIT ?
-                    """,
-                    tuple([ns, *like_args, int(max_rows)])
-                )
-            else:
-                select_cols = "name, ref, price, url, brand, variant_attrs" + (", url_canonical" if has_url_canon else "")
-                cur = c.execute(
-                    f"""
-                    SELECT {select_cols}
-                      FROM catalog_items
-                     WHERE namespace=?
-                     ORDER BY updated_at DESC
-                     LIMIT ?
-                    """,
-                    (ns, int(max_rows))
-                )
-
-            rows = [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        try:
-            log.warning(f"[catalog variants forced] falhou: {e}")
-        except Exception:
-            pass
+    if not catalog_block:
         return ""
+    m = re.search(r"\bLink:\s*(https?://[^\s]+)", catalog_block)
+    if not m:
+        return ""
+    u = (m.group(1) or "").strip()
+    # canon IG + remove fragmento
+    u = _canon_ig_url(u) or u
+    return u.split("#", 1)[0].strip()
 
+def _fetch_variants_by_parent_url(ns: str, parent_url: str, limit: int = 500) -> List[Dict]:
+    """
+    Devolve TODAS as variantes (#sku=) do catálogo para um parent_url (URL canónico).
+    """
+    ns = (ns or DEFAULT_NAMESPACE or "").strip()
+    parent = (parent_url or "").strip()
+    if not ns or not parent:
+        return []
+    with _catalog_conn() as c:
+        cur = c.execute("""
+            SELECT name, ref, price, url, brand, variant_attrs, updated_at
+              FROM catalog_items
+             WHERE namespace=?
+               AND url LIKE ?
+             ORDER BY updated_at DESC
+             LIMIT ?
+        """, (ns, parent + "#sku=%", int(limit)))
+        return [dict(r) for r in cur.fetchall()]
+
+def _variants_block_full(rows: List[Dict]) -> str:
     if not rows:
         return ""
-
-    # filtra variantes reais (#sku=)
-    variants = [r for r in rows if "#sku=" in ((r.get("url") or "").lower())]
-    if not variants:
-        return ""
-
-    # agrupar
-    groups: Dict[str, List[Dict]] = {}
-    for r in variants:
-        u = (r.get("url") or "").strip()
-        parent = u.split("#", 1)[0] if u else ""
-        key = (r.get("url_canonical") or "").strip() if has_url_canon else ""
-        group_key = key or parent
-        if not group_key:
-            continue
-        groups.setdefault(group_key, []).append(r)
-
-    if not groups:
-        return ""
-
-    # escolher o melhor grupo: +variants_count + match tokens no name
-    tokens = [t.lower() for t in terms if t]
-    def score_group(items: List[Dict]) -> float:
-        title = (items[0].get("name") or "").lower()
-        hit = sum(1 for t in tokens if t in title)
-        return (len(items) * 10.0) + hit
-
-    best_key, best_items = max(groups.items(), key=lambda kv: score_group(kv[1]))
-
-    # ordenar e limitar (mas alto, para não cortar as 6 do Zeal)
-    best_items_sorted = sorted(best_items, key=lambda x: (x.get("ref") or "", x.get("variant_attrs") or "", x.get("name") or ""))
-    best_items_sorted = best_items_sorted[:max_variants]
-
-    title = best_items_sorted[0].get("name") or best_key
-
-    out = [
-        "CATÁLOGO INTERNO — VARIANTES COMPLETAS (forçado para orçamentos/preços):",
-        f"• Produto: {title}",
-        "  (Variante | SKU | Preço | Link)"
-    ]
-    for r in best_items_sorted:
-        ref = r.get("ref") or "(sem ref)"
-        pr = r.get("price")
-        pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-        url = (r.get("url") or "").strip() or "(sem url)"
+    # ordenação estável por variante+sku (para não “baralhar” a leitura)
+    rows = sorted(rows, key=lambda r: ((r.get("variant_attrs") or ""), (r.get("ref") or "")))
+    out = ["CATÁLOGO INTERNO — Variantes disponíveis (lista completa):"]
+    for r in rows:
         va = (r.get("variant_attrs") or "").strip()
-        label = va or (r.get("name") or "")
-        out.append(f"  - {label} | SKU:{ref} | {pr_s} | {url}")
-
+        if not va:
+            # fallback: se variant_attrs estiver vazio, usa o sufixo do name (se existir)
+            va = (r.get("name") or "").strip() or "(sem variante)"
+        ref = (r.get("ref") or "").strip() or "(sem SKU)"
+        pr  = r.get("price")
+        pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
+        out.append(f"- Variante: {va} | SKU: {ref} | {pr_s}")
     return "\n".join(out)
 
+def _strip_rag_links_section(text: str) -> str:
+    """
+    Remove blocos “Links úteis (do RAG): …” e “Links candidatos …” do texto final.
+    """
+    if not text:
+        return text
+    # remove secções típicas (até ao fim)
+    text = re.sub(r"\n?\s*Links\s+úteis\s*\(do\s+RAG\)\s*:\s*\n(?:-.*\n?)*\s*$", "", text, flags=re.I)
+    text = re.sub(r"\n?\s*Links\s+candidatos\s*\(do\s+RAG.*?\)\s*:\s*\n(?:-.*\n?)*", "\n", text, flags=re.I)
+    return text.strip()
 
-# Monkey-patch build_messages para injectar variantes em orçamentos
-if _ORIGINAL_BUILD_MESSAGES:
-    def build_messages(user_id: str, question: str, namespace: Optional[str]):
-        messages, new_facts, rag_used, rag_hits = _ORIGINAL_BUILD_MESSAGES(user_id, question, namespace)
+def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
+    """
+    Override:
+    - Em ORÇAMENTOS: não injeta links do RAG; só normaliza markdown e remove blocos de links.
+    - Noutros casos: mantém pipeline original.
+    """
+    if _is_budget_intent_pt(user_query):
+        step1 = _fix_product_links_markdown(answer or "")
+        return _strip_rag_links_section(step1)
+    return _postprocess_answer__orig(answer, user_query, namespace, decided_top_k)
 
-        if _is_budget_like(question):
-            # já existe bloco de variantes?
-            has_variants_block = any(
-                (m.get("role") == "system")
-                and isinstance(m.get("content"), str)
-                and ("CATÁLOGO INTERNO — Variantes" in m["content"] or "VARIANTES COMPLETAS" in m["content"])
-                for m in messages
-            )
-            if not has_variants_block:
-                ns = (namespace or DEFAULT_NAMESPACE).strip()
-                forced = _build_catalog_variants_block_forced(question, ns)
-                if forced:
-                    # injeta logo a seguir ao catalog_block (se existir), senão depois do mission
-                    insert_at = 1
-                    for i, m in enumerate(messages):
-                        if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
-                            insert_at = i + 1
-                            break
-                    messages.insert(insert_at, {"role": "system", "content": forced})
-                    try:
-                        log.info(f"[hotfix] injected forced variants block for budget query ns={ns}")
-                    except Exception:
-                        pass
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    """
+    Override:
+    - Mantém o build_messages original.
+    - Em ORÇAMENTOS: força injeção de lista completa de variantes no SYSTEM,
+      usando a URL canónica do primeiro match do catálogo como chave.
+    """
+    messages, new_facts, rag_used, rag_hits = _build_messages__orig(user_id, question, namespace)
 
+    if not _is_budget_intent_pt(question):
         return messages, new_facts, rag_used, rag_hits
+
+    # Encontrar o bloco do catálogo já injetado (se existir)
+    catalog_block = ""
+    for m in messages:
+        if m.get("role") == "system" and isinstance(m.get("content"), str) and "CATÁLOGO INTERNO" in m["content"]:
+            catalog_block = m["content"]
+            break
+
+    ns = (namespace or DEFAULT_NAMESPACE or "").strip()
+    parent_url = _extract_first_catalog_parent_url(catalog_block)
+    if not parent_url:
+        return messages, new_facts, rag_used, rag_hits
+
+    variants = _fetch_variants_by_parent_url(ns, parent_url, limit=800)
+    if len(variants) < 2:
+        return messages, new_facts, rag_used, rag_hits
+
+    variants_block = _variants_block_full(variants)
+
+    # Instrução crítica + dados completos: entra no topo para máxima prioridade
+    sys_msg = {
+        "role": "system",
+        "content": (
+            "INSTRUÇÃO CRÍTICA (ORÇAMENTO / CATÁLOGO-ONLY):\n"
+            "- O utilizador está a pedir orçamento/preço.\n"
+            "- É OBRIGATÓRIO listar TODAS as variantes do catálogo interno (sem resumir).\n"
+            "- NÃO incluir links do RAG nem secções 'Links úteis'.\n"
+            "- Depois da lista completa, pedir ao utilizador para confirmar a variante/SKU.\n\n"
+            + variants_block
+        )
+    }
+    return [sys_msg] + messages, new_facts, rag_used, rag_hits
+
+def _force_links_block(answer: str, matches: List[dict], min_links: int = 3) -> str:
+    """
+    Override:
+    - Nunca força links em orçamentos (mesmo que o texto não tenha links).
+    - Noutros casos mantém comportamento original.
+    """
+    # Nota: não temos user_query aqui; detetamos por heurística no próprio texto.
+    # Se quiseres 100% rigor, muda o chamador para passar a query. Para hotfix: heurística suficiente.
+    if answer and re.search(r"\borçament|preç|sku\b", answer, flags=re.I):
+        return answer
+    return _force_links_block__orig(answer, matches, min_links=min_links)
+
+# =======================================================================================
+# FIM HOTFIX ÚNICO
+# =======================================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
