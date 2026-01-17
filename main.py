@@ -4238,146 +4238,206 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # FIM HOTFIX
 # =======================================================================================
 # =======================================================================================
-# HOTFIX ÚNICO (colar NO FIM do ficheiro) — Orçamentos: variantes completas por URL canónica
-# Objetivos:
-# 1) Em pedidos de orçamento/preço, listar TODAS as variantes do catálogo (sem depender do LLM).
-# 2) Usar a URL canónica (parent sem #) como chave para agrupar variantes.
-# 3) Em orçamentos, NÃO anexar “Links úteis (do RAG)” nem injetar links via RAG no texto final.
+# HOTFIX ÚNICO — ORÇAMENTO: listar variantes COMPLETAS via SQLite (bypass LLM)
+# - Em pedidos de orçamento/preço sem SKU explícito, devolve diretamente:
+#   todas as variantes do produto (por URL canónica parent) + pergunta de clarificação.
+# - Evita o “limitador” do LLM (que resume para 3).
 # =======================================================================================
 
-# --- guarda referências às funções atuais (para não perder comportamento noutros casos) ---
-_build_messages__orig = build_messages
-_postprocess_answer__orig = _postprocess_answer
-_force_links_block__orig = _force_links_block
+from fastapi import Response
+import inspect
 
-def _extract_first_catalog_parent_url(catalog_block: str) -> str:
-    """
-    Extrai o primeiro Link do bloco do catálogo e devolve o URL canónico (sem fragmento #...).
-    Isto torna a URL canónica a chave (como queres).
-    """
-    if not catalog_block:
-        return ""
-    m = re.search(r"\bLink:\s*(https?://[^\s]+)", catalog_block)
-    if not m:
-        return ""
-    u = (m.group(1) or "").strip()
-    # canon IG + remove fragmento
-    u = _canon_ig_url(u) or u
-    return u.split("#", 1)[0].strip()
+def _has_explicit_sku_or_ref(q: str) -> bool:
+    ql = (q or "").lower()
+    if "#sku=" in ql or "sku:" in ql:
+        return True
+    # se a pergunta tiver um token com dígitos (tipo SKU/ref), consideramos explícito
+    try:
+        return bool(_extract_ref_tokens(q))
+    except Exception:
+        return False
 
-def _fetch_variants_by_parent_url(ns: str, parent_url: str, limit: int = 500) -> List[Dict]:
+def _catalog_best_parent_url(ns: str, term: str) -> str:
     """
-    Devolve TODAS as variantes (#sku=) do catálogo para um parent_url (URL canónico).
+    Encontra o melhor parent_url (canónico, sem #) para o termo,
+    preferindo URLs com #sku (variantes) e depois a mais recente.
     """
+    ns = (ns or DEFAULT_NAMESPACE or "").strip()
+    term = (term or "").strip()
+    if not ns or not term:
+        return ""
+
+    like = f"%{_sanitize_like(term)}%"
+    with _catalog_conn() as c:
+        cur = c.execute("""
+            SELECT url, updated_at
+              FROM catalog_items
+             WHERE namespace=?
+               AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+             ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                      updated_at DESC
+             LIMIT 30
+        """, (ns, like, like, like))
+        rows = [dict(r) for r in cur.fetchall()]
+
+    for r in rows:
+        u = (r.get("url") or "").strip()
+        if not u:
+            continue
+        u = _canon_ig_url(u) or u
+        parent = u.split("#", 1)[0].strip()
+        if parent:
+            return parent
+    return ""
+
+def _catalog_all_variants_by_parent(ns: str, parent_url: str, limit: int = 2000) -> list:
     ns = (ns or DEFAULT_NAMESPACE or "").strip()
     parent = (parent_url or "").strip()
     if not ns or not parent:
         return []
     with _catalog_conn() as c:
         cur = c.execute("""
-            SELECT name, ref, price, url, brand, variant_attrs, updated_at
+            SELECT name, ref, price, url, variant_attrs
               FROM catalog_items
              WHERE namespace=?
                AND url LIKE ?
-             ORDER BY updated_at DESC
+             ORDER BY
+               CASE WHEN variant_attrs IS NULL OR variant_attrs='' THEN 1 ELSE 0 END,
+               variant_attrs ASC,
+               ref ASC
              LIMIT ?
         """, (ns, parent + "#sku=%", int(limit)))
         return [dict(r) for r in cur.fetchall()]
 
-def _variants_block_full(rows: List[Dict]) -> str:
-    if not rows:
-        return ""
-    # ordenação estável por variante+sku (para não “baralhar” a leitura)
-    rows = sorted(rows, key=lambda r: ((r.get("variant_attrs") or ""), (r.get("ref") or "")))
-    out = ["CATÁLOGO INTERNO — Variantes disponíveis (lista completa):"]
-    for r in rows:
-        va = (r.get("variant_attrs") or "").strip()
+def _format_variants_answer(product_title: str, variants: list) -> str:
+    lines = []
+    lines.append(f"{product_title} (orçamento para 1 unidade)")
+    lines.append("")
+    lines.append("Variantes disponíveis no catálogo interno (lista completa):")
+    for v in variants:
+        va = (v.get("variant_attrs") or "").strip()
         if not va:
-            # fallback: se variant_attrs estiver vazio, usa o sufixo do name (se existir)
-            va = (r.get("name") or "").strip() or "(sem variante)"
-        ref = (r.get("ref") or "").strip() or "(sem SKU)"
-        pr  = r.get("price")
+            # fallback: tentar extrair a “parte variante” do name
+            nm = (v.get("name") or "").strip()
+            va = nm.split("—", 1)[-1].strip() if "—" in nm else (nm or "(sem variante)")
+        ref = (v.get("ref") or "").strip() or "(sem SKU)"
+        pr  = v.get("price")
         pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-        out.append(f"- Variante: {va} | SKU: {ref} | {pr_s}")
-    return "\n".join(out)
+        # link canónico do produto (um só)
+        lines.append(f"- Variante: {va} | SKU: {ref} | Preço unitário: {pr_s}")
+    lines.append("")
+    lines.append("Preço com IVA incluído; portes não incluídos.")
+    lines.append("")
+    lines.append("Qual variante (SKU ou nome exato)?")
+    return "\n".join(lines)
 
-def _strip_rag_links_section(text: str) -> str:
+def _direct_budget_answer_if_ambiguous(question: str, namespace: str) -> str:
     """
-    Remove blocos “Links úteis (do RAG): …” e “Links candidatos …” do texto final.
+    Se for orçamento/preço e houver múltiplas variantes, devolve resposta direta (sem LLM).
     """
-    if not text:
-        return text
-    # remove secções típicas (até ao fim)
-    text = re.sub(r"\n?\s*Links\s+úteis\s*\(do\s+RAG\)\s*:\s*\n(?:-.*\n?)*\s*$", "", text, flags=re.I)
-    text = re.sub(r"\n?\s*Links\s+candidatos\s*\(do\s+RAG.*?\)\s*:\s*\n(?:-.*\n?)*", "\n", text, flags=re.I)
-    return text.strip()
-
-def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
-    """
-    Override:
-    - Em ORÇAMENTOS: não injeta links do RAG; só normaliza markdown e remove blocos de links.
-    - Noutros casos: mantém pipeline original.
-    """
-    if _is_budget_intent_pt(user_query):
-        step1 = _fix_product_links_markdown(answer or "")
-        return _strip_rag_links_section(step1)
-    return _postprocess_answer__orig(answer, user_query, namespace, decided_top_k)
-
-def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    """
-    Override:
-    - Mantém o build_messages original.
-    - Em ORÇAMENTOS: força injeção de lista completa de variantes no SYSTEM,
-      usando a URL canónica do primeiro match do catálogo como chave.
-    """
-    messages, new_facts, rag_used, rag_hits = _build_messages__orig(user_id, question, namespace)
-
     if not _is_budget_intent_pt(question):
-        return messages, new_facts, rag_used, rag_hits
-
-    # Encontrar o bloco do catálogo já injetado (se existir)
-    catalog_block = ""
-    for m in messages:
-        if m.get("role") == "system" and isinstance(m.get("content"), str) and "CATÁLOGO INTERNO" in m["content"]:
-            catalog_block = m["content"]
-            break
+        return ""
+    if _has_explicit_sku_or_ref(question):
+        return ""
 
     ns = (namespace or DEFAULT_NAMESPACE or "").strip()
-    parent_url = _extract_first_catalog_parent_url(catalog_block)
-    if not parent_url:
-        return messages, new_facts, rag_used, rag_hits
+    # term “limpo” (ex.: "zeal laser")
+    term = _catalog_query_from_question(question)
 
-    variants = _fetch_variants_by_parent_url(ns, parent_url, limit=800)
+    parent = _catalog_best_parent_url(ns, term)
+    if not parent:
+        return ""
+
+    variants = _catalog_all_variants_by_parent(ns, parent)
     if len(variants) < 2:
-        return messages, new_facts, rag_used, rag_hits
+        return ""
 
-    variants_block = _variants_block_full(variants)
+    # Título: tenta buscar do catálogo (produto base) para apresentar bem
+    title = "Produto"
+    try:
+        with _catalog_conn() as c:
+            cur = c.execute("""
+                SELECT name
+                  FROM catalog_items
+                 WHERE namespace=? AND url=?
+                 ORDER BY updated_at DESC LIMIT 1
+            """, (ns, parent))
+            r = cur.fetchone()
+            if r and r[0]:
+                title = str(r[0]).strip()
+            else:
+                # fallback: usar o termo
+                title = term.strip() or "Produto"
+    except Exception:
+        title = term.strip() or "Produto"
 
-    # Instrução crítica + dados completos: entra no topo para máxima prioridade
-    sys_msg = {
-        "role": "system",
-        "content": (
-            "INSTRUÇÃO CRÍTICA (ORÇAMENTO / CATÁLOGO-ONLY):\n"
-            "- O utilizador está a pedir orçamento/preço.\n"
-            "- É OBRIGATÓRIO listar TODAS as variantes do catálogo interno (sem resumir).\n"
-            "- NÃO incluir links do RAG nem secções 'Links úteis'.\n"
-            "- Depois da lista completa, pedir ao utilizador para confirmar a variante/SKU.\n\n"
-            + variants_block
-        )
-    }
-    return [sys_msg] + messages, new_facts, rag_used, rag_hits
+    return _format_variants_answer(title, variants)
 
-def _force_links_block(answer: str, matches: List[dict], min_links: int = 3) -> str:
+def _patch_route(path: str, methods: set, wrapper_factory):
     """
-    Override:
-    - Nunca força links em orçamentos (mesmo que o texto não tenha links).
-    - Noutros casos mantém comportamento original.
+    Substitui o endpoint já registado no FastAPI para (path, methods) pelo wrapper.
+    Não cria rotas duplicadas.
     """
-    # Nota: não temos user_query aqui; detetamos por heurística no próprio texto.
-    # Se quiseres 100% rigor, muda o chamador para passar a query. Para hotfix: heurística suficiente.
-    if answer and re.search(r"\borçament|preç|sku\b", answer, flags=re.I):
-        return answer
-    return _force_links_block__orig(answer, matches, min_links=min_links)
+    for route in list(getattr(app, "router", app).routes):
+        if getattr(route, "path", None) != path:
+            continue
+        rm = set(getattr(route, "methods", set()) or set())
+        if not (rm & methods):
+            continue
+        orig = route.endpoint
+        route.endpoint = wrapper_factory(orig)
+
+# ----- wrappers que interceptam e devolvem resposta direta -----
+
+def _wrap_ask_get(orig_endpoint):
+    def _new(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
+        if q:
+            direct = _direct_budget_answer_if_ambiguous(q, namespace)
+            if direct:
+                return {
+                    "answer": direct,
+                    "new_facts_detected": {},
+                    "rag": {
+                        "used": False,
+                        "top_k_default": RAG_TOP_K_DEFAULT,
+                        "top_k_effective": _decide_top_k(q, top_k),
+                        "namespace": namespace or DEFAULT_NAMESPACE,
+                    },
+                }
+        return orig_endpoint(q=q, user_id=user_id, namespace=namespace, top_k=top_k)
+    return _new
+
+def _wrap_ask_post(orig_endpoint):
+    async def _new(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return await orig_endpoint(request)
+
+        question = (data.get("question") or "").strip()
+        namespace = (data.get("namespace") or "").strip() or None
+
+        if question:
+            direct = _direct_budget_answer_if_ambiguous(question, namespace)
+            if direct:
+                decided_top_k = _decide_top_k(question, data.get("top_k"))
+                return {
+                    "answer": direct,
+                    "new_facts_detected": {},
+                    "rag": {
+                        "used": False,
+                        "top_k_default": RAG_TOP_K_DEFAULT,
+                        "top_k_effective": decided_top_k,
+                        "namespace": namespace or DEFAULT_NAMESPACE,
+                    },
+                }
+
+        return await orig_endpoint(request)
+    return _new
+
+# ----- aplicar patch às rotas existentes -----
+_patch_route("/ask_get", {"GET"}, _wrap_ask_get)
+_patch_route("/ask", {"POST"}, _wrap_ask_post)
 
 # =======================================================================================
 # FIM HOTFIX ÚNICO
