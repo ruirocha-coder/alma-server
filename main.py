@@ -4238,47 +4238,49 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # FIM HOTFIX
 # =======================================================================================
 # =======================================================================================
-# HOTFIX ÚNICO — ORÇAMENTO: listar variantes COMPLETAS via SQLite (bypass LLM)
-# - Em pedidos de orçamento/preço sem SKU explícito, devolve diretamente:
-#   todas as variantes do produto (por URL canónica parent) + pergunta de clarificação.
-# - Evita o “limitador” do LLM (que resume para 3).
+# HOTFIX ÚNICO (ROBUSTO) — Middleware que força listagem COMPLETA de variantes (SQLite)
+# Interceta /ask e /ask_get antes do router:
+# - Se intenção = orçamento/preço e NÃO há SKU/ref explícito -> devolve TODAS as variantes
+#   do produto (agrupadas por URL canónica parent) e pede clarificação.
+# - Evita o LLM (logo: sem “só 3”, sem “há mais opções”, sem invenções).
 # =======================================================================================
 
-from fastapi import Response
-import inspect
+from fastapi.responses import JSONResponse
+from urllib.parse import parse_qs
 
 def _has_explicit_sku_or_ref(q: str) -> bool:
     ql = (q or "").lower()
-    if "#sku=" in ql or "sku:" in ql:
+    if "#sku=" in ql or "sku" in ql:
         return True
-    # se a pergunta tiver um token com dígitos (tipo SKU/ref), consideramos explícito
     try:
-        return bool(_extract_ref_tokens(q))
+        toks = _extract_ref_tokens(q or "")
+        return bool(toks)
     except Exception:
         return False
 
 def _catalog_best_parent_url(ns: str, term: str) -> str:
-    """
-    Encontra o melhor parent_url (canónico, sem #) para o termo,
-    preferindo URLs com #sku (variantes) e depois a mais recente.
-    """
+    """Encontra o melhor URL-pai (canónico, sem #) para um termo."""
     ns = (ns or DEFAULT_NAMESPACE or "").strip()
     term = (term or "").strip()
     if not ns or not term:
         return ""
 
     like = f"%{_sanitize_like(term)}%"
-    with _catalog_conn() as c:
-        cur = c.execute("""
-            SELECT url, updated_at
-              FROM catalog_items
-             WHERE namespace=?
-               AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-             ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
-                      updated_at DESC
-             LIMIT 30
-        """, (ns, like, like, like))
-        rows = [dict(r) for r in cur.fetchall()]
+    try:
+        with _catalog_conn() as c:
+            cur = c.execute("""
+                SELECT url, updated_at
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                 ORDER BY
+                   (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                   updated_at DESC
+                 LIMIT 60
+            """, (ns, like, like, like))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        rows = []
 
     for r in rows:
         u = (r.get("url") or "").strip()
@@ -4290,60 +4292,95 @@ def _catalog_best_parent_url(ns: str, term: str) -> str:
             return parent
     return ""
 
-def _catalog_all_variants_by_parent(ns: str, parent_url: str, limit: int = 2000) -> list:
+def _catalog_all_variants_by_parent(ns: str, parent_url: str, limit: int = 5000) -> list:
+    """Devolve TODAS as variantes (url LIKE parent#sku=%) sem cap prático."""
     ns = (ns or DEFAULT_NAMESPACE or "").strip()
     parent = (parent_url or "").strip()
     if not ns or not parent:
         return []
-    with _catalog_conn() as c:
-        cur = c.execute("""
-            SELECT name, ref, price, url, variant_attrs
-              FROM catalog_items
-             WHERE namespace=?
-               AND url LIKE ?
-             ORDER BY
-               CASE WHEN variant_attrs IS NULL OR variant_attrs='' THEN 1 ELSE 0 END,
-               variant_attrs ASC,
-               ref ASC
-             LIMIT ?
-        """, (ns, parent + "#sku=%", int(limit)))
-        return [dict(r) for r in cur.fetchall()]
+    try:
+        with _catalog_conn() as c:
+            cur = c.execute("""
+                SELECT name, ref, price, url, variant_attrs, updated_at
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND url LIKE ?
+                 ORDER BY
+                   (CASE WHEN variant_attrs IS NULL OR variant_attrs='' THEN 1 ELSE 0 END),
+                   variant_attrs ASC,
+                   ref ASC,
+                   updated_at DESC
+                 LIMIT ?
+            """, (ns, parent + "#sku=%", int(limit)))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
 
-def _format_variants_answer(product_title: str, variants: list) -> str:
+def _catalog_title_for_parent(ns: str, parent_url: str, fallback: str) -> str:
+    ns = (ns or DEFAULT_NAMESPACE or "").strip()
+    parent = (parent_url or "").strip()
+    if not ns or not parent:
+        return fallback or "Produto"
+    try:
+        with _catalog_conn() as c:
+            cur = c.execute("""
+                SELECT name
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND (url=? OR url LIKE ?)
+                 ORDER BY (CASE WHEN url=? THEN 0 ELSE 1 END), updated_at DESC
+                 LIMIT 1
+            """, (ns, parent, parent + "#sku=%", parent))
+            r = cur.fetchone()
+            if r and r[0]:
+                return str(r[0]).strip()
+    except Exception:
+        pass
+    return fallback or "Produto"
+
+def _format_full_variants_answer(title: str, parent_url: str, variants: list, qty: int = 1) -> str:
+    parent_url = (_canon_ig_url(parent_url) or parent_url).split("#", 1)[0]
     lines = []
-    lines.append(f"{product_title} (orçamento para 1 unidade)")
+    lines.append(f"{title} (orçamento para {qty} unidade{'s' if qty != 1 else ''})")
     lines.append("")
     lines.append("Variantes disponíveis no catálogo interno (lista completa):")
     for v in variants:
         va = (v.get("variant_attrs") or "").strip()
         if not va:
-            # fallback: tentar extrair a “parte variante” do name
             nm = (v.get("name") or "").strip()
             va = nm.split("—", 1)[-1].strip() if "—" in nm else (nm or "(sem variante)")
         ref = (v.get("ref") or "").strip() or "(sem SKU)"
         pr  = v.get("price")
         pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-        # link canónico do produto (um só)
-        lines.append(f"- Variante: {va} | SKU: {ref} | Preço unitário: {pr_s}")
+        # link determinístico: parent#sku=REF se houver ref
+        link = f"{parent_url}#sku={ref}" if ref and ref != "(sem SKU)" else parent_url
+        lines.append(f"- Variante: {va} | SKU: {ref} | Preço unitário: {pr_s} | Link: {link}")
     lines.append("")
     lines.append("Preço com IVA incluído; portes não incluídos.")
+    lines.append(f"Link canónico do produto: {parent_url}")
     lines.append("")
-    lines.append("Qual variante (SKU ou nome exato)?")
+    lines.append("Qual variante (SKU ou nome exato) confirma para eu fechar o orçamento?")
     return "\n".join(lines)
 
-def _direct_budget_answer_if_ambiguous(question: str, namespace: str) -> str:
-    """
-    Se for orçamento/preço e houver múltiplas variantes, devolve resposta direta (sem LLM).
-    """
+def _try_direct_budget_answer(question: str, namespace: str) -> str:
+    """Retorna texto pronto OU '' se não aplicar."""
     if not _is_budget_intent_pt(question):
         return ""
     if _has_explicit_sku_or_ref(question):
         return ""
 
     ns = (namespace or DEFAULT_NAMESPACE or "").strip()
-    # term “limpo” (ex.: "zeal laser")
-    term = _catalog_query_from_question(question)
 
+    # tenta apanhar quantidade “1/2/3 ...” (mínimo 1)
+    qty = 1
+    try:
+        m = re.search(r"\b(\d+)\s*(?:x|unid\.?|unidade|unidades)\b", (question or "").lower())
+        if m:
+            qty = max(1, int(m.group(1)))
+    except Exception:
+        qty = 1
+
+    term = _catalog_query_from_question(question)
     parent = _catalog_best_parent_url(ns, term)
     if not parent:
         return ""
@@ -4352,76 +4389,25 @@ def _direct_budget_answer_if_ambiguous(question: str, namespace: str) -> str:
     if len(variants) < 2:
         return ""
 
-    # Título: tenta buscar do catálogo (produto base) para apresentar bem
-    title = "Produto"
-    try:
-        with _catalog_conn() as c:
-            cur = c.execute("""
-                SELECT name
-                  FROM catalog_items
-                 WHERE namespace=? AND url=?
-                 ORDER BY updated_at DESC LIMIT 1
-            """, (ns, parent))
-            r = cur.fetchone()
-            if r and r[0]:
-                title = str(r[0]).strip()
-            else:
-                # fallback: usar o termo
-                title = term.strip() or "Produto"
-    except Exception:
-        title = term.strip() or "Produto"
+    title = _catalog_title_for_parent(ns, parent, fallback=term)
+    return _format_full_variants_answer(title, parent, variants, qty=qty)
 
-    return _format_variants_answer(title, variants)
+@app.middleware("http")
+async def budget_variants_sqlite_middleware(request: Request, call_next):
+    path = (request.url.path or "").rstrip("/")
 
-def _patch_route(path: str, methods: set, wrapper_factory):
-    """
-    Substitui o endpoint já registado no FastAPI para (path, methods) pelo wrapper.
-    Não cria rotas duplicadas.
-    """
-    for route in list(getattr(app, "router", app).routes):
-        if getattr(route, "path", None) != path:
-            continue
-        rm = set(getattr(route, "methods", set()) or set())
-        if not (rm & methods):
-            continue
-        orig = route.endpoint
-        route.endpoint = wrapper_factory(orig)
+    # --- /ask_get (GET) ---
+    if path == "/ask_get":
+        qs = parse_qs((request.url.query or ""), keep_blank_values=True)
+        q = (qs.get("q", [""])[0] or "").strip()
+        user_id = (qs.get("user_id", ["anon"])[0] or "anon").strip()
+        namespace = (qs.get("namespace", [None])[0] or None)
 
-# ----- wrappers que interceptam e devolvem resposta direta -----
-
-def _wrap_ask_get(orig_endpoint):
-    def _new(q: str = "", user_id: str = "anon", namespace: str = None, top_k: Optional[int] = None):
         if q:
-            direct = _direct_budget_answer_if_ambiguous(q, namespace)
+            direct = _try_direct_budget_answer(q, namespace)
             if direct:
-                return {
-                    "answer": direct,
-                    "new_facts_detected": {},
-                    "rag": {
-                        "used": False,
-                        "top_k_default": RAG_TOP_K_DEFAULT,
-                        "top_k_effective": _decide_top_k(q, top_k),
-                        "namespace": namespace or DEFAULT_NAMESPACE,
-                    },
-                }
-        return orig_endpoint(q=q, user_id=user_id, namespace=namespace, top_k=top_k)
-    return _new
-
-def _wrap_ask_post(orig_endpoint):
-    async def _new(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            return await orig_endpoint(request)
-
-        question = (data.get("question") or "").strip()
-        namespace = (data.get("namespace") or "").strip() or None
-
-        if question:
-            direct = _direct_budget_answer_if_ambiguous(question, namespace)
-            if direct:
-                decided_top_k = _decide_top_k(question, data.get("top_k"))
-                return {
+                decided_top_k = _decide_top_k(q, None)
+                return JSONResponse({
                     "answer": direct,
                     "new_facts_detected": {},
                     "rag": {
@@ -4430,14 +4416,38 @@ def _wrap_ask_post(orig_endpoint):
                         "top_k_effective": decided_top_k,
                         "namespace": namespace or DEFAULT_NAMESPACE,
                     },
-                }
+                })
 
-        return await orig_endpoint(request)
-    return _new
+        return await call_next(request)
 
-# ----- aplicar patch às rotas existentes -----
-_patch_route("/ask_get", {"GET"}, _wrap_ask_get)
-_patch_route("/ask", {"POST"}, _wrap_ask_post)
+    # --- /ask (POST) ---
+    if path == "/ask" and request.method.upper() == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            return await call_next(request)
+
+        question = (data.get("question") or "").strip()
+        namespace = (data.get("namespace") or "").strip() or None
+
+        if question:
+            direct = _try_direct_budget_answer(question, namespace)
+            if direct:
+                decided_top_k = _decide_top_k(question, data.get("top_k"))
+                return JSONResponse({
+                    "answer": direct,
+                    "new_facts_detected": {},
+                    "rag": {
+                        "used": False,
+                        "top_k_default": RAG_TOP_K_DEFAULT,
+                        "top_k_effective": decided_top_k,
+                        "namespace": namespace or DEFAULT_NAMESPACE,
+                    },
+                })
+
+        return await call_next(request)
+
+    return await call_next(request)
 
 # =======================================================================================
 # FIM HOTFIX ÚNICO
