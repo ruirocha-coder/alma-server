@@ -4237,115 +4237,177 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 # FIM HOTFIX
 # =======================================================================================
+
 # =============================================================================
-# HOTFIX — Em pedidos de ORÇAMENTO, injeta SEMPRE a lista completa de variantes
-# (usando url_canonical). Não depende de palavras-chave "variantes".
+# HOTFIX — Em ORÇAMENTOS, injectar SEMPRE variantes completas da família (url_canonical)
 # =============================================================================
+
 import re
+import sqlite3
 from typing import Optional, List, Dict, Any
 
-_ORIG_build_messages = build_messages
+# guarda original
+_original_build_messages = build_messages
 
-_BUDGET_PAT = re.compile(r"\b(or[çc]amento|cot[aã]o|proforma|pre[çc]o|precos|preços|quanto\s+custa|quanto\s+fica)\b", re.I)
+_BUDGET_WORDS = (
+    "orçament", "orcamento", "cotação", "cotacao", "proforma",
+    "preço", "preco", "quanto custa", "quanto fica", "fatura", "quote"
+)
 
 def _is_budget_intent(q: str) -> bool:
-    return bool(_BUDGET_PAT.search((q or "").lower()))
+    ql = (q or "").lower()
+    return any(w in ql for w in _BUDGET_WORDS)
 
-def _catalog_seed_row(ns: str, question: str) -> Optional[Dict[str, Any]]:
-    """
-    Tenta encontrar 1 linha seed no catálogo para extrair url_canonical.
-    Usa a tua query "limpa" e um fallback tolerante.
-    """
-    q_raw = (question or "").strip()
-    q_clean = _catalog_query_from_question(q_raw) if "_catalog_query_from_question" in globals() else q_raw
-    like = f"%{_sanitize_like(q_clean) if '_sanitize_like' in globals() else q_clean}%"
-
+def _has_col(conn: sqlite3.Connection, table: str, col: str) -> bool:
     try:
-        with _catalog_conn() as c:
-            # tenta match por name/summary/ref, preferindo linhas com url_canonical preenchido
-            cur = c.execute("""
-                SELECT *
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        cols = {r[1] for r in cur.fetchall()}
+        return col in cols
+    except Exception:
+        return False
+
+def _fetch_variants_by_canonical(ns: str, url_canonical: str, limit: int = 40) -> List[Dict[str, Any]]:
+    try:
+        with _catalog_conn() as conn:
+            if not _has_col(conn, "catalog_items", "url_canonical"):
+                return []
+            cur = conn.execute(
+                """
+                SELECT name, ref, price, url, brand, variant_attrs, url_canonical
                   FROM catalog_items
-                 WHERE namespace=? AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-                 ORDER BY
-                   (CASE WHEN url_canonical IS NOT NULL AND TRIM(url_canonical)<>'' THEN 0 ELSE 1 END),
-                   (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
-                   updated_at DESC
-                 LIMIT 1
-            """, (ns, like, like, like))
-            row = cur.fetchone()
-            return dict(row) if row else None
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix] seed falhou: {e}")
-        except Exception:
-            pass
+                 WHERE namespace=? AND url_canonical=?
+                 ORDER BY ref ASC
+                 LIMIT ?
+                """,
+                (ns, url_canonical, limit)
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+def _fetch_variants_by_parent_url(ns: str, parent_url: str, limit: int = 40) -> List[Dict[str, Any]]:
+    try:
+        with _catalog_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT name, ref, price, url, brand, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=? AND url LIKE ?
+                 ORDER BY ref ASC
+                 LIMIT ?
+                """,
+                (ns, parent_url + "%", limit)
+            )
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+def _canonicalize_url(url: str) -> str:
+    return (url or "").split("#")[0].strip()
+
+def _best_family_seed_from_catalog_block(catalog_block: str) -> Optional[str]:
+    """
+    Extrai 1 URL do bloco 'CATÁLOGO INTERNO' para usar como seed.
+    Procura a primeira ocorrência 'Link: ...'
+    """
+    if not catalog_block:
         return None
+    m = re.search(r"Link:\s*(\S+)", catalog_block)
+    if not m:
+        return None
+    return m.group(1).strip()
 
-def build_catalog_variants_full_block_by_canonical(question: str, namespace: Optional[str] = None, limit_variants: int = 40) -> str:
-    """
-    Bloco determinístico: encontra seed -> url_canonical -> lista TODAS as variantes desse canonical.
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    seed = _catalog_seed_row(ns, question)
-    if not seed:
+def _variants_block_from_rows(rows: List[Dict[str, Any]], title: str = "VARIANTES (AUTO)") -> str:
+    if not rows:
         return ""
-    urlc = (seed.get("url_canonical") or "").strip()
-    if not urlc:
-        return ""
-
-    if "_get_variants_by_canonical" not in globals():
-        return ""
-
-    vars_ = _get_variants_by_canonical(ns, urlc) or []
-    if not vars_:
-        return ""
-
-    # limita por segurança (mas alto)
-    vars_ = vars_[:max(1, int(limit_variants))]
-
-    lines = [f"VARIANTES COMPLETAS (CATÁLOGO INTERNO) — url_canonical={urlc} — TOTAL={len(vars_)}"]
-    for v in vars_:
-        name = (v.get("name") or "").strip() or "(sem nome)"
-        ref  = (v.get("ref") or "").strip() or "(sem SKU)"
-        price = v.get("price")
+    lines = [f"{title} — listar TODAS as variantes abaixo (não resumir):"]
+    for r in rows:
+        ref = r.get("ref") or "(sem dado)"
+        price = r.get("price")
         price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-        variant = (v.get("variant_attrs") or "").strip()
-        url = (v.get("url") or "").strip() or "(sem URL)"
-        show = variant if variant else name
+        var = (r.get("variant_attrs") or "").strip()
+        name = (r.get("name") or "").strip()
+        show = var or name or "(sem nome)"
+        url = r.get("url") or "(sem URL)"
         lines.append(f"- Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {url}")
     return "\n".join(lines)
 
+def _build_budget_variants_injection(ns: str, question: str, catalog_block: str) -> str:
+    """
+    1) tenta url_canonical: usa o seed (link) e procura o canonical correspondente no DB
+    2) se não houver canonical, faz fallback por parent url (antes de #)
+    """
+    seed_url = _best_family_seed_from_catalog_block(catalog_block)
+    if not seed_url:
+        return ""
+
+    parent = _canonicalize_url(seed_url)
+
+    # 1) tentar canonical via DB (a partir de qualquer linha com url como a seed)
+    url_canonical = None
+    try:
+        with _catalog_conn() as conn:
+            if _has_col(conn, "catalog_items", "url_canonical"):
+                cur = conn.execute(
+                    """
+                    SELECT url_canonical
+                      FROM catalog_items
+                     WHERE namespace=? AND (url=? OR url LIKE ?)
+                     ORDER BY updated_at DESC
+                     LIMIT 1
+                    """,
+                    (ns, seed_url, parent + "%")
+                )
+                row = cur.fetchone()
+                if row:
+                    url_canonical = (row[0] or "").strip() if isinstance(row, tuple) else (row["url_canonical"] or "").strip()
+    except Exception:
+        url_canonical = None
+
+    if url_canonical:
+        rows = _fetch_variants_by_canonical(ns, url_canonical, limit=40)
+        block = _variants_block_from_rows(rows, title="VARIANTES (AUTO — url_canonical)")
+        if block:
+            return block
+
+    # 2) fallback por URL-pai
+    rows = _fetch_variants_by_parent_url(ns, parent, limit=40)
+    # se a tabela guarda variantes como '#sku=' também entra aqui porque LIKE parent% apanha ambas
+    block = _variants_block_from_rows(rows, title="VARIANTES (AUTO — parent url)")
+    return block
+
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    messages, new_facts, rag_used, rag_hits = _ORIG_build_messages(user_id, question, namespace)
+    # chama o original (mantém tudo como está)
+    messages, new_facts, rag_used, rag_hits = _original_build_messages(user_id, question, namespace)
 
-    # Se for orçamento/preço → injeta lista completa de variantes (por canonical)
-    if _is_budget_intent(question):
-        try:
-            ns = (namespace or DEFAULT_NAMESPACE).strip()
-            full_vars = build_catalog_variants_full_block_by_canonical(question, ns, limit_variants=40)
-            if full_vars:
-                # mete imediatamente a seguir ao "CATÁLOGO INTERNO" se existir; senão acrescenta no fim dos system
-                inserted = False
-                for i, m in enumerate(messages):
-                    if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
-                        messages.insert(i + 1, {"role": "system", "content": full_vars})
-                        inserted = True
-                        break
-                if not inserted:
-                    messages.append({"role": "system", "content": full_vars})
+    # descobrir ns e o bloco de catálogo que já foi injectado
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
 
-                try:
-                    log.info("[hotfix] orçamento -> variantes completas injetadas via url_canonical")
-                except Exception:
-                    pass
-        except Exception as e:
-            try:
-                log.warning(f"[hotfix] falhou a injeção de variantes completas: {e}")
-            except Exception:
-                pass
+    catalog_block = ""
+    for m in messages:
+        if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
+            catalog_block = m["content"]
+            break
+
+    # se for orçamento e houver catálogo, injeta variantes completas (auto)
+    if _is_budget_intent(question) and catalog_block:
+        inj = _build_budget_variants_injection(ns, question, catalog_block)
+        if inj:
+            # injecta logo a seguir ao catálogo (antes de RAG/memória)
+            # encontra índice do catálogo
+            idx = None
+            for i, m in enumerate(messages):
+                if m.get("role") == "system" and isinstance(m.get("content"), str) and m["content"].startswith("CATÁLOGO INTERNO"):
+                    idx = i
+                    break
+            insert_at = (idx + 1) if idx is not None else 1
+            messages.insert(insert_at, {"role": "system", "content": inj})
+
+            # regra explícita para não resumir (curta e objetiva)
+            messages.insert(insert_at + 1, {"role": "system", "content": "Em modo ORÇAMENTO: usa o bloco VARIANTES (AUTO) e lista TODAS as variantes desse bloco (até 40), sem resumir para 3."})
 
     return messages, new_facts, rag_used, rag_hits
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
