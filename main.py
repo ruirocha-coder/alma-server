@@ -3436,7 +3436,7 @@ def _final_fix_incoherences():
         import re
         from typing import Optional, List, Dict
 
-        def build_catalog_block_final(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+        def build_catalog_block_final(question: str, namespace: Optional[str] = None, limit: int = 120) -> str:
             ns = (namespace or DEFAULT_NAMESPACE or "").strip() or "default"
             q_raw = (question or "").strip()
 
