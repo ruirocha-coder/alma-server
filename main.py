@@ -4239,206 +4239,328 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
 # =======================================================================================
 
 # =============================================================================
-# HOTFIX FINAL — ORÇAMENTO: listar SEMPRE TODAS as variantes via url_canonical
-# + cortar RAG/links/produtos em modo orçamento
-# Colar NO FIM do main.py
+# HOTFIX FINAL — Orçamentos com estado persistente (SQLite /data/quotes.db)
+# - Guarda linhas do orçamento por user_id+namespace (persistente no Railway)
+# - Evita “perder memória” quando o utilizador diz “gera orçamento completo”
+# - Em quote_mode: CORTA RAG/links/produtos (para não aparecer “Links do RAG”)
+# - Quando o utilizador fornece um SKU (ref), fixa a linha no orçamento (com preço do catálogo)
 # =============================================================================
+# Colar NO FIM do main.py (depois de app e das funções existentes estarem definidas)
 
-import re
-from typing import Optional, List, Dict, Any, Tuple
+import os, sqlite3, time, re
+from typing import Optional, Dict, Any, List, Tuple
 
-def _is_quote_intent_pt(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(k in t for k in (
-        "orçament", "orcament", "cotação", "cotacao", "proforma", "preço", "preco",
-        "quanto custa", "quanto fica", "orçar", "orçar"
-    ))
+QUOTES_DB_PATH = os.getenv("QUOTES_DB_PATH", "/data/quotes.db")
 
-def _has_explicit_sku_or_variant_hint(text: str) -> bool:
-    """Se o utilizador já deu SKU (#sku= ou ref) ou uma escolha clara de variante."""
-    if not text:
-        return False
-    t = text.lower()
-    if "#sku=" in t:
-        return True
-    # Se tiver um "ref" típico no texto (usa o teu extrator se existir)
+def _quotes_conn() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(QUOTES_DB_PATH), exist_ok=True)
+    c = sqlite3.connect(QUOTES_DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
+
+def _quotes_init() -> None:
     try:
-        if _extract_ref_tokens(text):
-            return True
+        with _quotes_conn() as c:
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS quotes (
+                quote_id     TEXT PRIMARY KEY,
+                user_id      TEXT NOT NULL,
+                namespace    TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'open',
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL
+            );
+            """)
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS quote_items (
+                quote_id        TEXT NOT NULL,
+                line_id         INTEGER NOT NULL,
+                ref             TEXT,
+                qty             INTEGER NOT NULL DEFAULT 1,
+                unit_price      REAL,
+                name_snapshot   TEXT,
+                variant_snapshot TEXT,
+                url_snapshot    TEXT,
+                PRIMARY KEY (quote_id, line_id)
+            );
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_quotes_user_ns ON quotes(user_id, namespace, status);")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_quote_items_quote ON quote_items(quote_id);")
+    except Exception as e:
+        try:
+            log.warning(f"[quotes] init falhou: {e}")
+        except Exception:
+            pass
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _quote_get_open(user_id: str, namespace: str) -> str:
+    """1 orçamento aberto por (user_id, namespace)."""
+    _quotes_init()
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+    with _quotes_conn() as c:
+        row = c.execute(
+            "SELECT quote_id FROM quotes WHERE user_id=? AND namespace=? AND status='open' ORDER BY updated_at DESC LIMIT 1",
+            (uid, ns)
+        ).fetchone()
+        if row and row["quote_id"]:
+            return row["quote_id"]
+
+        qid = f"q_{uid}_{ns}_{_now_ts()}"
+        ts = _now_ts()
+        c.execute(
+            "INSERT INTO quotes(quote_id,user_id,namespace,status,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+            (qid, uid, ns, "open", ts, ts)
+        )
+        return qid
+
+def _quote_touch(quote_id: str) -> None:
+    try:
+        with _quotes_conn() as c:
+            c.execute("UPDATE quotes SET updated_at=? WHERE quote_id=?", (_now_ts(), quote_id))
     except Exception:
         pass
-    # Heurística leve: "cor=" ou "variante:" ou "modelo:"
-    if any(k in t for k in ("cor=", "variante", "modelo:", "acabamento", "tamanho", "versão", "versao")):
-        return True
-    return False
 
-def _pick_url_canonical(ns: str, question: str) -> str:
-    """
-    Tenta encontrar um url_canonical para o produto mencionado:
-    1) por SKU/ref exato
-    2) por LIKE em name/summary/ref usando query limpa
-    """
-    ns = (ns or DEFAULT_NAMESPACE).strip()
-    q_raw = (question or "").strip()
+def _quote_next_line_id(quote_id: str) -> int:
+    with _quotes_conn() as c:
+        row = c.execute("SELECT COALESCE(MAX(line_id),0) AS m FROM quote_items WHERE quote_id=?", (quote_id,)).fetchone()
+        return int(row["m"] or 0) + 1
 
-    # 1) por ref
-    try:
-        ref_toks = _extract_ref_tokens(q_raw) or []
-    except Exception:
-        ref_toks = []
-
+def _catalog_get_by_ref(ns: str, ref: str) -> Optional[Dict[str, Any]]:
+    """Lê UMA linha do catálogo por ref exacto."""
+    if not ref:
+        return None
     try:
         with _catalog_conn() as c:
-            if ref_toks:
-                cur = c.execute(
-                    f"""
-                    SELECT url_canonical
-                      FROM catalog_items
-                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
-                     ORDER BY updated_at DESC
-                     LIMIT 1
-                    """,
-                    tuple([ns, *ref_toks])
-                )
-                row = cur.fetchone()
-                if row and (row.get("url_canonical") if isinstance(row, dict) else row[0]):
-                    return (row.get("url_canonical") if isinstance(row, dict) else row[0]) or ""
-
-            # 2) por LIKE
-            q_clean = _catalog_query_from_question(q_raw)
-            terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q_clean)) if len(t) >= 3]
-            if not terms:
-                return ""
-
-            where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-            like_args: List[str] = []
-            for t in terms:
-                p = f"%{t}%"
-                like_args.extend([p, p, p])
-
-            cur = c.execute(
-                f"""
-                SELECT url_canonical
+            r = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_attrs, summary
                   FROM catalog_items
-                 WHERE namespace=? AND {where_and}
-                 ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
+                 WHERE namespace=? AND ref=?
                  LIMIT 1
-                """,
-                tuple([ns, *like_args])
-            )
-            row = cur.fetchone()
-            if row:
-                return (row.get("url_canonical") if isinstance(row, dict) else row[0]) or ""
+            """, (ns, ref)).fetchone()
+            return dict(r) if r else None
     except Exception as e:
         try:
-            log.warning(f"[hotfix-final] _pick_url_canonical falhou: {e}")
+            log.warning(f"[quotes] catalog_get_by_ref falhou: {e}")
         except Exception:
             pass
+        return None
 
-    return ""
-
-def _get_variants_by_url_canonical(ns: str, url_canonical: str) -> List[Dict[str, Any]]:
-    if not url_canonical:
-        return []
-    ns = (ns or DEFAULT_NAMESPACE).strip()
-    try:
-        with _catalog_conn() as c:
-            cur = c.execute(
-                """
-                SELECT name, ref, price, url, brand, variant_attrs, url_canonical, updated_at
-                  FROM catalog_items
-                 WHERE namespace=? AND url_canonical=?
-                 ORDER BY ref ASC
-                """,
-                (ns, url_canonical)
-            )
-            return [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix-final] _get_variants_by_url_canonical falhou: {e}")
-        except Exception:
-            pass
-        return []
-
-def _format_variants_block(rows: List[Dict[str, Any]], ns: str) -> str:
-    if not rows:
+def _canon_parent(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
         return ""
-    # ordenar com variantes primeiro (#sku=) mas sem cortar nada
-    def _rank(r: Dict[str, Any]) -> Tuple[int, str]:
-        u = (r.get("url") or "")
-        return (0 if "#sku=" in u else 1, (r.get("ref") or ""))
-    rows_sorted = sorted(rows, key=_rank)
+    return u.split("#", 1)[0]
 
-    title = (rows_sorted[0].get("name") or "(produto)").strip()
-    out = [f"CATÁLOGO INTERNO — VARIANTES COMPLETAS (url_canonical) — ns={ns}",
-           f"Produto: {title}",
-           "Formato: Variante | SKU | Preço | Link"]
-    for r in rows_sorted:
-        ref = r.get("ref") or "(sem ref)"
-        pr = r.get("price")
-        pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-        url = r.get("url") or "(sem url)"
-        va = (r.get("variant_attrs") or "").strip()
-        label = va or (r.get("name") or "(sem nome)")
-        out.append(f"- {label} | SKU:{ref} | {pr_s} | {url}")
-    return "\n".join(out)
+def _strip_html_visible(text: str) -> str:
+    # simples: remove tags; suficiente para “Variante:” no summary
+    if not text:
+        return ""
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-# --- Guardar referência ao build_messages atual, se existir ---
+def _quote_add_or_increment_item(quote_id: str, ns: str, ref: str, qty: int = 1) -> Tuple[bool, str]:
+    """
+    Adiciona ou incrementa por ref.
+    Retorna (ok, msg)
+    """
+    if not ref:
+        return (False, "sem ref")
+    ns = (ns or DEFAULT_NAMESPACE).strip()
+    qty = int(qty or 1)
+    if qty < 1:
+        qty = 1
+
+    cat = _catalog_get_by_ref(ns, ref)
+    name = variant = url = None
+    unit_price = None
+    if cat:
+        name = cat.get("name")
+        unit_price = cat.get("price")
+        url = cat.get("url")
+        variant = (cat.get("variant_attrs") or "").strip()
+
+        # fallback: tentar “Variante:” no summary visível
+        if not variant:
+            s = _strip_html_visible(cat.get("summary") or "")
+            m = re.search(r"(?:^|\b)Variante\s*:\s*(.+)$", s, flags=re.I)
+            if m:
+                variant = m.group(1).strip()
+
+    try:
+        with _quotes_conn() as c:
+            existing = c.execute("""
+                SELECT line_id, qty FROM quote_items
+                 WHERE quote_id=? AND ref=?
+                 LIMIT 1
+            """, (quote_id, ref)).fetchone()
+
+            if existing:
+                new_qty = int(existing["qty"] or 0) + qty
+                c.execute("""
+                    UPDATE quote_items
+                       SET qty=?,
+                           unit_price=COALESCE(?, unit_price),
+                           name_snapshot=COALESCE(?, name_snapshot),
+                           variant_snapshot=COALESCE(?, variant_snapshot),
+                           url_snapshot=COALESCE(?, url_snapshot)
+                     WHERE quote_id=? AND line_id=?
+                """, (new_qty, unit_price, name, variant, url, quote_id, int(existing["line_id"])))
+            else:
+                line_id = _quote_next_line_id(quote_id)
+                c.execute("""
+                    INSERT INTO quote_items(quote_id,line_id,ref,qty,unit_price,name_snapshot,variant_snapshot,url_snapshot)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (quote_id, line_id, ref, qty, unit_price, name, variant, url))
+
+        _quote_touch(quote_id)
+
+        if cat:
+            return (True, f"item {ref} gravado no orçamento (qty={qty})")
+        return (True, f"item {ref} gravado no orçamento (qty={qty}) mas sem match no catálogo")
+    except Exception as e:
+        try:
+            log.warning(f"[quotes] add falhou: {e}")
+        except Exception:
+            pass
+        return (False, f"erro ao gravar item {ref}")
+
+def _quote_list_items(quote_id: str) -> List[Dict[str, Any]]:
+    try:
+        with _quotes_conn() as c:
+            rows = c.execute("""
+                SELECT line_id, ref, qty, unit_price, name_snapshot, variant_snapshot, url_snapshot
+                  FROM quote_items
+                 WHERE quote_id=?
+                 ORDER BY line_id ASC
+            """, (quote_id,)).fetchall()
+            return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+def _quote_context_block(quote_id: str) -> str:
+    """
+    Bloco PARA O LLM: estado do orçamento.
+    Não é para o utilizador — é para evitar “perder memória”.
+    """
+    items = _quote_list_items(quote_id)
+    if not items:
+        return "ORÇAMENTO ATIVO (persistente): vazio (sem linhas ainda)."
+    lines = ["ORÇAMENTO ATIVO (persistente) — linhas já fixadas (NÃO inventar; usar exatamente):"]
+    for it in items:
+        ref = it.get("ref") or "(sem ref)"
+        qty = it.get("qty") or 1
+        name = it.get("name_snapshot") or "(sem nome)"
+        var  = (it.get("variant_snapshot") or "").strip()
+        pr   = it.get("unit_price")
+        pr_s = f"{float(pr):.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
+        title = f"{name} — {var}" if var else name
+        lines.append(f"- QTY={qty}; SKU={ref}; PREÇO_UNIT={pr_s}; ITEM={title}")
+    lines.append("Regra: se o utilizador disser “gera orçamento completo”, compilar estas linhas num resumo final com subtotais e total.")
+    return "\n".join(lines)
+
+def _extract_explicit_skus_and_qty(text: str) -> List[Tuple[int, str]]:
+    """
+    Extrai (qty, SKU) quando o utilizador dá um ref explícito.
+    Exemplos:
+      - "SKU: ORK.01.01"
+      - "2x ORK.01.01"
+      - "quantidade 2 ORK.01.01"
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    out: List[Tuple[int, str]] = []
+
+    # padrão "2x <REF>"
+    for m in re.finditer(r"\b(\d+)\s*x\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
+        out.append((int(m.group(1)), m.group(2)))
+
+    # padrão "SKU: <REF>" (qty pode vir antes no texto, mas aqui default=1)
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
+        out.append((1, m.group(1)))
+
+    # padrão “(<REF>)” muito comum na tua UI
+    for m in re.finditer(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", t, flags=re.I):
+        out.append((1, m.group(1)))
+
+    # dedup simples (mantém o maior qty se repetir)
+    best: Dict[str, int] = {}
+    for qty, ref in out:
+        refu = ref.strip()
+        best[refu] = max(best.get(refu, 0), int(qty))
+    return [(q, r) for r, q in best.items()]
+
+def _is_quote_mode(question: str) -> bool:
+    # usa o teu detector existente se houver
+    try:
+        return bool(_is_budget_intent_pt(question))
+    except Exception:
+        q = (question or "").lower()
+        return any(k in q for k in ("orçament", "orcament", "cotação", "cotacao", "preço", "preco", "proforma"))
+
+def _is_quote_compile_command(question: str) -> bool:
+    q = (question or "").lower()
+    return ("orçamento completo" in q) or ("orcamento completo" in q) or ("gera o orçamento completo" in q) or ("gera orçamento completo" in q)
+
+# -----------------------------------------------------------------------------
+# PATCH: build_messages — acrescenta estado persistente + corta RAG em quote_mode
+# -----------------------------------------------------------------------------
 try:
-    _build_messages_prev = build_messages
+    _build_messages_prev = build_messages  # guarda por segurança
 except Exception:
     _build_messages_prev = None
 
 def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    """
-    Hotfix: em ORÇAMENTO sem SKU/variante explícita,
-    injeta bloco determinístico de variantes por url_canonical e remove RAG/links/produtos.
-    Também corrige o erro de passar cat_q para build_catalog_variants_block: passa question.
-    """
-    # 1) sinais contextuais → mem0 (mantém comportamento anterior)
-    new_facts = extract_contextual_facts_pt(question)
-    for k, v in new_facts.items():
-        mem0_set_fact(user_id, k, v)
+    # 0) normalizações
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q  = (question or "").strip()
+    uid = (user_id or "anon").strip() or "anon"
 
-    # 2) memórias recentes (igual)
-    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
+    quote_mode = _is_quote_mode(q)
+
+    # 1) inicializa/obtém orçamento e atualiza se houver SKU explícito
+    quote_id = _quote_get_open(uid, ns) if quote_mode else None
+    if quote_id:
+        for qty, ref in _extract_explicit_skus_and_qty(q):
+            _quote_add_or_increment_item(quote_id, ns, ref, qty)
+
+    # 2) mem0 facts (mantém como tens)
+    new_facts = extract_contextual_facts_pt(q)
+    for k, v in new_facts.items():
+        mem0_set_fact(uid, k, v)
+
+    # 3) memória curta (mantém)
+    short_snippets = _mem0_search(q, user_id=uid, limit=5) or local_search_snippets(uid, limit=5)
     memory_block = (
         "Memórias recentes do utilizador (curto prazo):\n"
-        + "\n".join(f"- {s}" for s in short_snippets[:3])
+        + "\n".join(f"- {s}" for s in (short_snippets or [])[:3])
         if short_snippets else ""
     )
 
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-
-    # 3) Catálogo base (igual: usa query limpa para procurar)
-    cat_q = _catalog_query_from_question(question)
+    # 4) catálogo interno SEMPRE
+    cat_q = _catalog_query_from_question(q)
     catalog_block = build_catalog_block(cat_q, ns)
 
-    # 3b) Variantes (CORREÇÃO: passa a pergunta original, não cat_q)
-    catalog_variants_block = build_catalog_variants_block(question, ns)
+    # variantes: em quote_mode também (porque “pedido sem variante definida => listar variantes”)
+    # Nota: se o teu build_catalog_variants_block tiver limites, já os aumentaste para não cortar.
+    catalog_variants_block = build_catalog_variants_block(cat_q, ns)
 
-    # 3c) Regra de negócio: ORÇAMENTO sem SKU => listar variantes completas por url_canonical
-    quote_mode = _is_quote_intent_pt(question)
-    if quote_mode and not _has_explicit_sku_or_variant_hint(question):
-        uc = _pick_url_canonical(ns, question)
-        rows_uc = _get_variants_by_url_canonical(ns, uc) if uc else []
-        forced_block = _format_variants_block(rows_uc, ns) if rows_uc else ""
-        if forced_block:
-            catalog_variants_block = forced_block  # sobrepõe qualquer outra fonte de variantes
-
-    # 4) RAG e derivados
+    # 5) RAG: em quote_mode = CORTADO (para não aparecer links do RAG em orçamentos)
     rag_block = ""
     rag_used = False
     rag_hits: List[dict] = []
+    links_block = ""
+    products_block = ""
 
-    if not quote_mode and RAG_READY:
-        # só usar RAG fora do modo orçamento
+    if (not quote_mode) and RAG_READY:
         try:
             rag_hits = search_chunks(
-                query=question,
-                namespace=namespace or DEFAULT_NAMESPACE,
+                query=q,
+                namespace=ns,
                 top_k=RAG_TOP_K_DEFAULT
             ) or []
             rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
@@ -4447,51 +4569,73 @@ def build_messages(user_id: str, question: str, namespace: Optional[str]):
             log.warning(f"[rag] search falhou: {e}")
             rag_block, rag_used, rag_hits = "", False, []
 
-    links_block = ""
-    products_block = ""
-    if not quote_mode:
-        # links e produtos só fora de orçamento
+        # links candidatos do RAG (apenas fora de quote_mode)
         links_pairs = _links_from_matches(rag_hits, max_links=8)
         if links_pairs:
-            lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
+            lines = ["Links candidatos (do RAG):"]
             for title, url in links_pairs:
                 lines.append(f"- {title or '-'} — {url}")
             links_block = "\n".join(lines)
 
-        products_block = build_rag_products_block(question)
+        # bloco de produtos (apenas fora de quote_mode)
+        products_block = build_rag_products_block(q)
 
-    # 5) montar mensagens (igual ordem: mission, facts, catálogo, depois resto)
+    # 6) montar mensagens
     messages = [{"role": "system", "content": ALMA_MISSION}]
-    fb = facts_block_for_user(user_id)
+    fb = facts_block_for_user(uid)
     if fb:
         messages.append({"role": "system", "content": fb})
 
+    # estado persistente do orçamento (antes de tudo, para o LLM não “perder” linhas)
+    if quote_id:
+        messages.append({"role": "system", "content": _quote_context_block(quote_id)})
+
+        # instrução simples e “elegante”: se orçamento sem variante => listar variantes
+        messages.append({"role": "system", "content": (
+            "REGRA OPERACIONAL (ORÇAMENTO): "
+            "Se o pedido for de orçamento e NÃO houver SKU/variante explícita escolhida, "
+            "a tua primeira resposta DEVE ser listar TODAS as variantes do catálogo interno desse produto "
+            "e pedir ao utilizador que confirme o SKU."
+        )})
+
+        # comando “gera orçamento completo” => deve compilar a partir do estado persistente
+        if _is_quote_compile_command(q):
+            messages.append({"role": "system", "content": (
+                "COMANDO DETETADO: o utilizador pediu para gerar o orçamento completo. "
+                "Não procures no RAG. Compila o orçamento final usando APENAS o ORÇAMENTO ATIVO (persistente) acima: "
+                "linhas, subtotais e total. Termina com 1 próxima ação (ex.: confirmar morada / portes / proforma)."
+            )})
+
+    # catálogo primeiro
     if catalog_block:
         messages.append({"role": "system", "content": catalog_block})
     if catalog_variants_block:
         messages.append({"role": "system", "content": catalog_variants_block})
 
+    # depois RAG (só fora de quote_mode)
     if rag_block:
-        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
     if links_block:
         messages.append({"role": "system", "content": links_block})
     if products_block:
         messages.append({"role": "system", "content": products_block})
+
     if memory_block:
         messages.append({"role": "system", "content": memory_block})
 
-    messages.append({"role": "user", "content": question})
+    messages.append({"role": "user", "content": q})
 
+    # logs curtos úteis
     try:
-        log.info(f"[hotfix-final] quote_mode={quote_mode} has_variant_hint={_has_explicit_sku_or_variant_hint(question)} "
-                 f"forced_variants={'yes' if ('url_canonical' in (catalog_variants_block or '')) else 'no'}")
+        if quote_id:
+            log.info(f"[quotes] quote_mode={quote_mode} quote_id={quote_id} items={len(_quote_list_items(quote_id))}")
     except Exception:
         pass
 
     return messages, new_facts, rag_used, rag_hits
 
 try:
-    log.info("[hotfix-final] build_messages redefinido: orçamento -> variantes completas por url_canonical; RAG cortado.")
+    log.info("[hotfix-quotes] build_messages redefinido: estado persistente de orçamento + RAG cortado em quote_mode.")
 except Exception:
     pass
 # =============================================================================
