@@ -4098,7 +4098,7 @@ def _format_variants_block(product_label: str, variants: List[Dict[str, Any]]) -
 def build_catalog_variants_block(question: str,
                                  namespace: Optional[str] = None,
                                  limit_families: int = 5,
-                                 limit_variants: int = 80) -> str:
+                                 limit_variants: int = 500) -> str:
     ns = (namespace or DEFAULT_NAMESPACE).strip()
 
     # Só gera bloco quando há intenção clara de variantes (ou orçamento — tratado no build_messages abaixo)
