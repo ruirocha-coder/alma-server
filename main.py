@@ -4642,6 +4642,267 @@ except Exception:
 # FIM HOTFIX FINAL
 # =============================================================================
 
+# =============================================================================
+# HOTFIX INCREMENTAL — quotes: sticky mode + não gravar "(sem nome)" + pending items
+# Colar NO FIM do main.py (depois do hotfix de quotes atual)
+# =============================================================================
+
+import time, re
+from typing import Optional, Dict, Any, List, Tuple
+
+# --- 1) Extender schema: tabela de pendentes (não-matched) ---
+def _quotes_init_v2() -> None:
+    _quotes_init()  # chama o init anterior
+    try:
+        with _quotes_conn() as c:
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS quote_pending (
+                quote_id     TEXT NOT NULL,
+                pending_id   INTEGER NOT NULL,
+                raw_text     TEXT,
+                qty          INTEGER NOT NULL DEFAULT 1,
+                created_at   INTEGER NOT NULL,
+                PRIMARY KEY (quote_id, pending_id)
+            );
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_quote_pending_quote ON quote_pending(quote_id);")
+    except Exception as e:
+        try:
+            log.warning(f"[quotes-v2] init pendentes falhou: {e}")
+        except Exception:
+            pass
+
+def _quote_has_open(user_id: str, namespace: str) -> Optional[str]:
+    """Devolve quote_id aberto se existir, sem criar novo."""
+    _quotes_init_v2()
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+    try:
+        with _quotes_conn() as c:
+            row = c.execute(
+                "SELECT quote_id FROM quotes WHERE user_id=? AND namespace=? AND status='open' ORDER BY updated_at DESC LIMIT 1",
+                (uid, ns)
+            ).fetchone()
+            return (row["quote_id"] if row else None)
+    except Exception:
+        return None
+
+def _quote_is_recent(quote_id: str, max_age_s: int = 60 * 60 * 6) -> bool:
+    """Considera orçamento ‘ativo’ se foi mexido nas últimas X horas (default 6h)."""
+    try:
+        with _quotes_conn() as c:
+            row = c.execute("SELECT updated_at FROM quotes WHERE quote_id=? LIMIT 1", (quote_id,)).fetchone()
+            if not row:
+                return False
+            return (int(time.time()) - int(row["updated_at"] or 0)) <= int(max_age_s)
+    except Exception:
+        return False
+
+def _quote_add_pending(quote_id: str, raw_text: str, qty: int = 1) -> None:
+    """Guarda pedido pendente (sem SKU válido), para o LLM pedir clarificação sem poluir itens."""
+    try:
+        _quotes_init_v2()
+        qt = int(qty or 1)
+        if qt < 1: qt = 1
+        raw = (raw_text or "").strip()
+        if not raw:
+            return
+        with _quotes_conn() as c:
+            row = c.execute(
+                "SELECT COALESCE(MAX(pending_id),0) AS m FROM quote_pending WHERE quote_id=?",
+                (quote_id,)
+            ).fetchone()
+            pid = int(row["m"] or 0) + 1
+            c.execute("""
+                INSERT INTO quote_pending(quote_id,pending_id,raw_text,qty,created_at)
+                VALUES (?,?,?,?,?)
+            """, (quote_id, pid, raw[:400], qt, int(time.time())))
+        _quote_touch(quote_id)
+    except Exception:
+        pass
+
+def _quote_list_pending(quote_id: str) -> List[Dict[str, Any]]:
+    try:
+        _quotes_init_v2()
+        with _quotes_conn() as c:
+            rows = c.execute("""
+                SELECT pending_id, raw_text, qty, created_at
+                  FROM quote_pending
+                 WHERE quote_id=?
+                 ORDER BY pending_id ASC
+            """, (quote_id,)).fetchall()
+            return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+# --- 2) Override: não gravar item se não existir no catálogo ---
+_quote_add_or_increment_item_prev = _quote_add_or_increment_item
+
+def _quote_add_or_increment_item(quote_id: str, ns: str, ref: str, qty: int = 1) -> Tuple[bool, str]:
+    """
+    V2:
+    - Só grava em quote_items se houver match no catálogo.
+    - Se não houver match, NÃO grava (evita '(sem nome)') e manda para pending.
+    """
+    ns = (ns or DEFAULT_NAMESPACE).strip()
+    ref_clean = (ref or "").strip()
+    if not ref_clean:
+        return (False, "sem ref")
+
+    cat = _catalog_get_by_ref(ns, ref_clean)
+    if not cat:
+        _quote_add_pending(quote_id, raw_text=f"SKU/ref não encontrado: {ref_clean}", qty=qty)
+        try:
+            log.info(f"[quotes-v2] ref sem match no catálogo -> pending (ref={ref_clean})")
+        except Exception:
+            pass
+        return (False, f"SKU/ref {ref_clean} não existe no catálogo (guardado como pendente)")
+
+    # match existe -> usa a função anterior (que grava snapshots e incrementa)
+    return _quote_add_or_increment_item_prev(quote_id, ns, ref_clean, qty)
+
+# --- 3) Sticky quote_mode: se há orçamento aberto recente, mantém quote_mode em follow-ups ---
+def _is_quote_followup_text(q: str) -> bool:
+    """
+    Frases típicas de continuação que não dizem 'orçamento/preço' mas são parte do fluxo.
+    Mantém isto simples e robusto.
+    """
+    t = (q or "").strip().lower()
+    if not t:
+        return False
+    triggers = [
+        "gera completo", "orçamento completo", "orcamento completo",
+        "total", "soma", "subtotal",
+        "junta", "adiciona", "acrescenta", "mais", "e também", "e tambem",
+        "remove", "tirar", "substitui", "troca",
+        "confirma", "ok", "certo", "segue"
+    ]
+    if any(k in t for k in triggers):
+        return True
+    # mensagens muito curtas são frequentemente follow-up (“ok”, “sim”, “agora este”)
+    if len(t) <= 18:
+        return True
+    return False
+
+# --- 4) Override build_messages (sem mexer nas tuas rotas): quote_mode sticky + RAG sempre cortado quando sticky ---
+_build_messages_quotes_prev = build_messages
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q  = (question or "").strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    # detetor original
+    quote_mode = _is_quote_mode(q)
+
+    # sticky: se existe orçamento aberto recente e a mensagem parece follow-up, força quote_mode
+    open_qid = _quote_has_open(uid, ns)
+    if (not quote_mode) and open_qid and _quote_is_recent(open_qid) and _is_quote_followup_text(q):
+        quote_mode = True
+        try:
+            log.info(f"[quotes-v2] sticky quote_mode=True (open_qid={open_qid})")
+        except Exception:
+            pass
+
+    # Se quote_mode, garante quote_id (não cria se não houver? aqui CRIA, porque entrou em quote_mode)
+    quote_id = _quote_get_open(uid, ns) if quote_mode else None
+
+    # Se o utilizador forneceu SKUs explícitos, tenta gravar (só se existir no catálogo; senão pending)
+    if quote_id:
+        for qty, ref in _extract_explicit_skus_and_qty(q):
+            _quote_add_or_increment_item(quote_id, ns, ref, qty)
+
+        # Se NÃO houve SKUs explícitos, mas a frase parece “adiciona 1 <produto>”, guarda como pending (texto cru)
+        # (isto evita o LLM inventar e mantém rasto do pedido)
+        if not _extract_explicit_skus_and_qty(q) and _is_quote_followup_text(q) and len(q) > 18:
+            # guarda a frase como pendente para o LLM pedir o SKU correto
+            _quote_add_pending(quote_id, raw_text=q, qty=1)
+
+    # Agora construímos mensagens como antes, mas:
+    # - em quote_mode: cortamos RAG/links/produtos SEMPRE (mesmo sticky)
+    # - e injetamos bloco do orçamento + pendentes
+    messages, new_facts, rag_used, rag_hits = _build_messages_quotes_prev(uid, q, ns)
+
+    if quote_id:
+        # Remove qualquer RAG/links/produtos que tenham entrado por algum motivo
+        filtered = []
+        for m in messages:
+            if m.get("role") != "system":
+                filtered.append(m); continue
+            c = m.get("content") or ""
+            if isinstance(c, str) and (
+                c.startswith("Conhecimento corporativo (RAG") or
+                c.startswith("Links candidatos (do RAG") or
+                c.startswith("Produtos para orçamento (do RAG")
+            ):
+                continue
+            filtered.append(m)
+        messages = filtered
+
+        # Injeta/atualiza contexto do orçamento no topo (logo após mission/facts)
+        # (mais robusto do que depender do bloco anterior)
+        pending = _quote_list_pending(quote_id)
+        pending_block = ""
+        if pending:
+            lines = ["ITENS PENDENTES (sem SKU válido / sem match no catálogo) — NÃO incluir em totais:"]
+            for p in pending[:20]:
+                lines.append(f"- QTY={p.get('qty')}; TEXTO={p.get('raw_text')}")
+            lines.append("Regra: pedir ao utilizador o SKU exato do catálogo para cada item pendente.")
+            pending_block = "\n".join(lines)
+
+        inject_blocks = []
+        inject_blocks.append({"role": "system", "content": _quote_context_block(quote_id)})
+        if pending_block:
+            inject_blocks.append({"role": "system", "content": pending_block})
+
+        # mete logo após o primeiro system (mission) e (se existir) facts_block
+        out = []
+        inserted = False
+        for i, m in enumerate(messages):
+            out.append(m)
+            if not inserted and m.get("role") == "system":
+                # após os primeiros 1-2 system blocks
+                # insere quando já passaram pelo menos 1 system (mission) e possivelmente facts
+                if i >= 0:
+                    # insere quando o próximo não é system facts? (mantém simples: insere após o 2º system se existir)
+                    pass
+        # estratégia simples: reconstrói: mission + facts (se houver) + inject + resto (sem duplicar inject)
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
+        user_msgs = [m for m in messages if m.get("role") != "system"]
+
+        mission = sys_msgs[0:1]
+        rest_sys = sys_msgs[1:]
+        facts = []
+        rest_after_facts = rest_sys
+        # heurística: facts_block_for_user costuma ser o 2º system; mantém se for curto e começar por "FACTS" ou "Factos"
+        if rest_sys:
+            c0 = rest_sys[0].get("content") or ""
+            if isinstance(c0, str) and ("FACT" in c0.upper() or "FATO" in c0.upper() or "Fact" in c0):
+                facts = rest_sys[0:1]
+                rest_after_facts = rest_sys[1:]
+
+        messages = mission + facts + inject_blocks + rest_after_facts + user_msgs
+
+        # Marca RAG como não usado
+        rag_used = False
+        rag_hits = []
+
+    try:
+        if quote_id:
+            log.info(f"[quotes-v2] quote_id={quote_id} items={len(_quote_list_items(quote_id))} pending={len(_quote_list_pending(quote_id))}")
+    except Exception:
+        pass
+
+    return messages, new_facts, rag_used, rag_hits
+
+try:
+    log.info("[hotfix-quotes-v2] ativo: sticky quote_mode + pending sem '(sem nome)' + RAG cortado em modo orçamento.")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX INCREMENTAL
+# =============================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
