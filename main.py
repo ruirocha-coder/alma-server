@@ -5314,6 +5314,91 @@ except Exception:
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — usar orçamento persistente quando não há novos produtos no pedido
+# =============================================================================
+
+def _question_mentions_new_product(question: str) -> bool:
+    """
+    Retorna True apenas se houver indicação clara de novo produto.
+    """
+    q = (question or "").lower()
+
+    # palavras que indicam novo item
+    triggers = [
+        "adiciona",
+        "junta",
+        "mais um",
+        "acrescenta",
+        "inclui",
+        "coloca",
+        "também",
+        "outro",
+        "outra",
+    ]
+
+    # se não menciona nada concreto, não é novo produto
+    if not any(t in q for t in triggers):
+        return False
+
+    # se tiver SKU explícito → é novo produto
+    if re.search(r"\b[A-Z0-9._\-]{4,}\b", question):
+        return True
+
+    # se tiver nome suficientemente longo
+    words = [w for w in q.split() if len(w) > 4]
+    return len(words) >= 2
+
+
+# ----------------------------------------------------------------------
+
+try:
+    _build_messages_prev2 = build_messages
+except Exception:
+    _build_messages_prev2 = None
+
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+    q = (question or "").strip()
+
+    quote_mode = _is_quote_mode(q)
+
+    quote_id = _quote_get_open(uid, ns) if quote_mode else None
+    existing_items = _quote_list_items(quote_id) if quote_id else []
+
+    # ----------------------------------------------------------
+    # 🔒 CASO CRÍTICO:
+    # já existem itens e o utilizador não indicou novo produto
+    # ----------------------------------------------------------
+    if quote_mode and existing_items and not _question_mentions_new_product(q):
+
+        messages = [{"role": "system", "content": ALMA_MISSION}]
+
+        messages.append({
+            "role": "system",
+            "content": _quote_context_block(quote_id)
+        })
+
+        messages.append({
+            "role": "system",
+            "content": (
+                "O utilizador está a referir-se aos itens já existentes no orçamento. "
+                "Não pesquisar novamente no catálogo. "
+                "Usar exclusivamente o orçamento persistente acima."
+            )
+        })
+
+        messages.append({"role": "user", "content": q})
+
+        return messages, {}, False, []
+
+    # ----------------------------------------------------------
+    # fallback normal
+    # ----------------------------------------------------------
+    return _build_messages_prev2(user_id, question, namespace)
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
