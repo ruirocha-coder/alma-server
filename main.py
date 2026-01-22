@@ -5207,6 +5207,112 @@ except Exception:
 # FIM HOTFIX-ADDON
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — Normalização da query do catálogo em modo ORÇAMENTO
+# Objetivo:
+# - Quando o utilizador diz "faz orçamento de X", "junta o X", etc.,
+#   garantir que a query enviada ao catálogo é só o NOME do produto (X),
+#   evitando falsos "Sem dados no catálogo interno".
+# - NÃO mexe em import CSV, variantes, canonical, urls, nem na lógica de orçamento.
+#
+# Colar NO FIM do main.py (depois das defs existentes).
+# =============================================================================
+
+import re
+
+try:
+    _catalog_query_from_question_prev = _catalog_query_from_question
+except Exception:
+    _catalog_query_from_question_prev = None
+
+_STOP_WORDS_PT = {
+    "faz", "fazer", "gera", "gerar", "cria", "criar", "preciso", "quero",
+    "orçamento", "orcamento", "cotação", "cotacao", "proforma", "pro-forma",
+    "preço", "preco", "valor", "valores",
+    "para", "por", "de", "do", "da", "dos", "das", "no", "na", "nos", "nas",
+    "um", "uma", "uns", "umas", "o", "a", "os", "as",
+    "junta", "juntar", "adiciona", "adicionar", "mete", "meter", "inclui", "incluir",
+    "mais", "também", "tb", "se", "sff", "pf", "porfavor", "por-favor", "favor",
+    "ao", "à", "aos", "às",
+    "unidade", "unidades", "quantidade", "qtd", "x",
+}
+
+def _extract_product_terms_pt(text: str) -> str:
+    """
+    Extrai termos do produto de forma determinística.
+    - Se houver um SKU explícito (ex.: ORK.01.03, LINO030, 740021316-2.-AR), devolve isso.
+    - Caso contrário: remove intenção de orçamento/verbos/palavras funcionais e quantidades.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # 1) se houver SKU explícito, usa-o (prioritário)
+    #    aceita formatos com . _ - e combinações alfanuméricas
+    m = re.search(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I)
+    if m:
+        return m.group(1).strip()
+
+    # padrão "2x ORK.01.03" / "2 x ORK.01.03"
+    m = re.search(r"\b\d+\s*x\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I)
+    if m:
+        return m.group(1).strip()
+
+    # padrão "(ORK.01.03)" muito comum na UI
+    m = re.search(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", t, flags=re.I)
+    if m:
+        return m.group(1).strip()
+
+    # 2) normalização leve
+    tt = t.lower()
+
+    # remove pontuação “de comando” mas mantém . _ - dentro de tokens
+    tt = re.sub(r"[,:;!?]", " ", tt)
+    tt = re.sub(r"\s+", " ", tt).strip()
+
+    # remove quantidades soltas (ex.: "1", "2", "3") quando são tokens isolados
+    tokens = [tok for tok in tt.split(" ") if tok and tok not in _STOP_WORDS_PT and not tok.isdigit()]
+
+    # se ficou vazio, devolve o original (fallback)
+    cleaned = " ".join(tokens).strip()
+    return cleaned if cleaned else t.strip()
+
+def _is_quote_like_intent(question: str) -> bool:
+    # usa o detector existente se houver
+    try:
+        return bool(_is_budget_intent_pt(question))
+    except Exception:
+        q = (question or "").lower()
+        return any(k in q for k in ("orçament", "orcament", "cotação", "cotacao", "proforma", "preço", "preco"))
+
+# 3) monkeypatch: quando é pedido de orçamento, a query do catálogo é “limpa”
+def _catalog_query_from_question(question: str) -> str:
+    if _catalog_query_from_question_prev is None:
+        # fallback, caso não exista a original
+        return _extract_product_terms_pt(question)
+
+    q = (question or "").strip()
+    if not q:
+        return ""
+
+    if _is_quote_like_intent(q):
+        return _extract_product_terms_pt(q)
+
+    # comportamento original (fora de orçamento)
+    try:
+        return _catalog_query_from_question_prev(q)
+    except Exception:
+        # fallback seguro
+        return _extract_product_terms_pt(q)
+
+try:
+    log.info("[hotfix-catalog-q] ativo: normalização de query do catálogo em modo orçamento (faz orçamento/junta X -> X).")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
 
 
 # ---------------------------------------------------------------------------------------
