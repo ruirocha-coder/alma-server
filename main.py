@@ -4904,6 +4904,309 @@ except Exception:
 # FIM HOTFIX INCREMENTAL
 # =============================================================================
 
+# =============================================================================
+# HOTFIX-ADDON — Pendentes + “não inventar linhas” + quote_mode sticky por orçamento aberto
+# Colar NO FIM do main.py (DEPOIS do hotfix-quotes existente)
+# =============================================================================
+
+import time, sqlite3, re
+from typing import Optional, Dict, Any, List, Tuple
+
+# --- 1) adicionar tabela de pendentes ------------------------------------------------
+
+def _quotes_init_v2() -> None:
+    # chama o init original e adiciona pendentes
+    try:
+        _quotes_init()
+    except Exception:
+        pass
+
+    try:
+        with _quotes_conn() as c:
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS quote_pending (
+                quote_id     TEXT NOT NULL,
+                pend_id      INTEGER NOT NULL,
+                qty          INTEGER NOT NULL DEFAULT 1,
+                product_name TEXT,
+                hint_url     TEXT,
+                created_at   INTEGER NOT NULL,
+                PRIMARY KEY (quote_id, pend_id)
+            );
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_quote_pending_quote ON quote_pending(quote_id);")
+    except Exception as e:
+        try:
+            log.warning(f"[quotes-v2] init pendentes falhou: {e}")
+        except Exception:
+            pass
+
+def _quote_next_pend_id(quote_id: str) -> int:
+    with _quotes_conn() as c:
+        row = c.execute("SELECT COALESCE(MAX(pend_id),0) AS m FROM quote_pending WHERE quote_id=?", (quote_id,)).fetchone()
+        return int(row["m"] or 0) + 1
+
+def _quote_add_pending(quote_id: str, qty: int, product_name: str, hint_url: str = "") -> None:
+    _quotes_init_v2()
+    qty = int(qty or 1)
+    if qty < 1:
+        qty = 1
+    pname = (product_name or "").strip()
+    if not pname:
+        return
+    try:
+        with _quotes_conn() as c:
+            # evita duplicar pendente pelo mesmo nome
+            exists = c.execute("""
+                SELECT pend_id FROM quote_pending
+                 WHERE quote_id=? AND lower(product_name)=lower(?)
+                 LIMIT 1
+            """, (quote_id, pname)).fetchone()
+            if exists:
+                # incrementa qty
+                c.execute("""
+                    UPDATE quote_pending
+                       SET qty = qty + ?
+                     WHERE quote_id=? AND pend_id=?
+                """, (qty, quote_id, int(exists["pend_id"])))
+            else:
+                pid = _quote_next_pend_id(quote_id)
+                c.execute("""
+                    INSERT INTO quote_pending(quote_id,pend_id,qty,product_name,hint_url,created_at)
+                    VALUES (?,?,?,?,?,?)
+                """, (quote_id, pid, qty, pname, (hint_url or "").strip(), _now_ts()))
+        _quote_touch(quote_id)
+    except Exception as e:
+        try:
+            log.warning(f"[quotes-v2] add_pending falhou: {e}")
+        except Exception:
+            pass
+
+def _quote_list_pending(quote_id: str) -> List[Dict[str, Any]]:
+    try:
+        with _quotes_conn() as c:
+            rows = c.execute("""
+                SELECT pend_id, qty, product_name, hint_url, created_at
+                  FROM quote_pending
+                 WHERE quote_id=?
+                 ORDER BY pend_id ASC
+            """, (quote_id,)).fetchall()
+            return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+def _quote_pending_block_for_llm(quote_id: str) -> str:
+    pend = _quote_list_pending(quote_id)
+    if not pend:
+        return ""
+    lines = ["PENDENTES (pedido sem SKU — NÃO converter em linhas do orçamento):"]
+    for p in pend:
+        qty = p.get("qty") or 1
+        name = p.get("product_name") or "(pendente)"
+        lines.append(f"- QTY={qty}; PRODUTO={name}; AÇÃO: pedir SKU/variante.")
+    lines.append("Regra: pendentes NÃO entram no total. Apenas pedir confirmação de SKU para os converter em linhas.")
+    return "\n".join(lines)
+
+# --- 2) quote_mode “sticky” se houver orçamento aberto recente -----------------------
+
+def _has_recent_open_quote(uid: str, ns: str, age_s: int = 7200) -> Optional[str]:
+    # devolve quote_id se houver orçamento open atualizado recentemente
+    try:
+        _quotes_init_v2()
+        with _quotes_conn() as c:
+            row = c.execute("""
+                SELECT quote_id, updated_at FROM quotes
+                 WHERE user_id=? AND namespace=? AND status='open'
+                 ORDER BY updated_at DESC LIMIT 1
+            """, (uid, ns)).fetchone()
+            if not row:
+                return None
+            if int(row["updated_at"] or 0) >= (_now_ts() - int(age_s)):
+                return row["quote_id"]
+    except Exception:
+        return None
+    return None
+
+def _is_add_to_quote_intent(q: str) -> bool:
+    t = (q or "").lower()
+    # frases típicas quando já há orçamento em curso
+    return any(k in t for k in ("junta", "adiciona", "acrescenta", "mais ", "e mais", "também", "inclui", "mete "))
+
+# --- 3) redefinir _quote_context_block para NÃO mostrar “(sem nome)” -----------------
+
+def _quote_context_block_v2(quote_id: str) -> str:
+    items = _quote_list_items(quote_id)
+    lines = []
+    if items:
+        lines.append("ORÇAMENTO ATIVO (confirmado, persistente) — linhas com SKU (usar exatamente; NÃO inventar novas linhas):")
+        for it in items:
+            ref = it.get("ref") or ""
+            qty = it.get("qty") or 1
+            name = (it.get("name_snapshot") or "").strip()
+            var  = (it.get("variant_snapshot") or "").strip()
+            pr   = it.get("unit_price")
+            pr_s = f"{float(pr):.2f}€" if isinstance(pr, (int, float)) else ""
+            title = " — ".join([x for x in [name, var] if x]) or ref
+            lines.append(f"- QTY={qty}; SKU={ref}; PREÇO_UNIT={pr_s or 'DESCONHECIDO'}; ITEM={title}")
+
+    pend_block = _quote_pending_block_for_llm(quote_id)
+    if pend_block:
+        lines.append(pend_block)
+
+    if not lines:
+        return "ORÇAMENTO ATIVO (persistente): vazio (sem linhas confirmadas; sem pendentes)."
+
+    lines.append("Regra máxima: o orçamento completo só usa as linhas confirmadas; pendentes ficam fora do total.")
+    return "\n".join(lines)
+
+# --- 4) PATCH no build_messages: cria pendente quando há produto mas não há SKU -------
+
+try:
+    _build_messages_prev2 = build_messages
+except Exception:
+    _build_messages_prev2 = None
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q  = (question or "").strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    # quote_mode normal
+    quote_mode = False
+    try:
+        quote_mode = bool(_is_budget_intent_pt(q))
+    except Exception:
+        quote_mode = False
+
+    # sticky: se há orçamento recente e o texto parece “continuar”
+    recent_qid = _has_recent_open_quote(uid, ns)
+    if (not quote_mode) and recent_qid and _is_add_to_quote_intent(q):
+        quote_mode = True
+
+    quote_id = _quote_get_open(uid, ns) if quote_mode else None
+    if quote_id:
+        _quotes_init_v2()
+
+        # 1) se houver SKU explícito, grava como confirmado
+        extracted = _extract_explicit_skus_and_qty(q)
+        for qty, ref in extracted:
+            _quote_add_or_increment_item(quote_id, ns, ref, qty)
+
+        # 2) se NÃO houver SKU explícito, mas houver “produto seed” identificado, grava pendente
+        #    (isto cobre “faz orçamento de 1 zeal laser” antes de escolher variante)
+        if not extracted:
+            try:
+                seed = _seed_row_for_product(q, ns)
+            except Exception:
+                seed = None
+            if seed:
+                pname = (seed.get("name") or "").strip()
+                # tenta qty do texto (“1 zeal laser”, “2 zeal laser”)
+                mqty = re.search(r"\b(\d+)\b", q)
+                qty = int(mqty.group(1)) if mqty else 1
+                hint_url = (seed.get("url") or "").strip()
+                if pname:
+                    _quote_add_pending(quote_id, qty, pname, hint_url)
+
+    # --- daqui para baixo, reaproveita a lógica do hotfix anterior, mas com 2 mudanças:
+    #     A) injeta _quote_context_block_v2
+    #     B) reforça instrução “não criar linhas sem SKU”
+    # -------------------------------------------------------------------------------
+
+    new_facts = extract_contextual_facts_pt(q)
+    for k, v in new_facts.items():
+        mem0_set_fact(uid, k, v)
+
+    short_snippets = _mem0_search(q, user_id=uid, limit=5) or local_search_snippets(uid, limit=5)
+    memory_block = (
+        "Memórias recentes do utilizador (curto prazo):\n"
+        + "\n".join(f"- {s}" for s in (short_snippets or [])[:3])
+        if short_snippets else ""
+    )
+
+    cat_q = _catalog_query_from_question(q)
+    catalog_block = build_catalog_block(cat_q, ns)
+    catalog_variants_block = build_catalog_variants_block(cat_q, ns)
+
+    rag_block = ""
+    rag_used = False
+    rag_hits: List[dict] = []
+    links_block = ""
+    products_block = ""
+
+    if (not quote_mode) and RAG_READY:
+        try:
+            rag_hits = search_chunks(query=q, namespace=ns, top_k=RAG_TOP_K_DEFAULT) or []
+            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
+            rag_used = bool(rag_block)
+        except Exception as e:
+            log.warning(f"[rag] search falhou: {e}")
+            rag_block, rag_used, rag_hits = "", False, []
+
+        links_pairs = _links_from_matches(rag_hits, max_links=8)
+        if links_pairs:
+            lines = ["Links candidatos (do RAG):"]
+            for title, url in links_pairs:
+                lines.append(f"- {title or '-'} — {url}")
+            links_block = "\n".join(lines)
+
+        products_block = build_rag_products_block(q)
+
+    messages = [{"role": "system", "content": ALMA_MISSION}]
+    fb = facts_block_for_user(uid)
+    if fb:
+        messages.append({"role": "system", "content": fb})
+
+    if quote_id:
+        messages.append({"role": "system", "content": _quote_context_block_v2(quote_id)})
+        messages.append({"role": "system", "content": (
+            "REGRA ORÇAMENTO (CRÍTICA): "
+            "Nunca cries linhas no orçamento a partir de nomes de produtos. "
+            "Só entram linhas com SKU confirmado (do ORÇAMENTO ATIVO). "
+            "Se houver pedidos sem SKU, coloca-os em 'Pendentes' e pede o SKU."
+        )})
+        if _is_quote_compile_command(q):
+            messages.append({"role": "system", "content": (
+                "COMANDO: gerar orçamento completo. "
+                "Usa APENAS as linhas confirmadas (SKU) do ORÇAMENTO ATIVO. "
+                "Pendentes aparecem fora do total, como itens a confirmar com SKU. "
+                "Não usar RAG nem links."
+            )})
+
+    if catalog_block:
+        messages.append({"role": "system", "content": catalog_block})
+    if catalog_variants_block:
+        messages.append({"role": "system", "content": catalog_variants_block})
+
+    if rag_block:
+        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG):\n{rag_block}"})
+    if links_block:
+        messages.append({"role": "system", "content": links_block})
+    if products_block:
+        messages.append({"role": "system", "content": products_block})
+
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
+
+    messages.append({"role": "user", "content": q})
+
+    try:
+        if quote_id:
+            log.info(f"[hotfix-quotes-v3] quote_mode={quote_mode} quote_id={quote_id} items={len(_quote_list_items(quote_id))} pending={len(_quote_list_pending(quote_id))}")
+    except Exception:
+        pass
+
+    return messages, new_facts, rag_used, rag_hits
+
+try:
+    log.info("[hotfix-quotes-v3] ativo: pendentes + proibição de linhas sem SKU + quote_mode sticky.")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX-ADDON
+# =============================================================================
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
