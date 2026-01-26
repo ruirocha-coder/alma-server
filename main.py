@@ -5482,168 +5482,159 @@ except Exception as e:
 # =============================================================================
 
 # =============================================================================
-# HOTFIX — Persistir itens do orçamento a partir da RESPOSTA do LLM
-# Motivo: o quotes.db só estava a gravar quando o UTILIZADOR escrevia o SKU.
-# Agora: quando a Alma gera um "Orçamento:" e inclui "SKU(...)" na resposta,
-#        extraímos refs e gravamos no orçamento aberto do user_id+namespace.
-#
-# Colar NO FIM do main.py
+# HOTFIX — Auto-gravar item por NOME em orçamento (quando match é determinístico)
+# - Corrige "junta os dois artigos" -> antes falhava porque só gravava quando o user dava SKU explícito
+# - NÃO mexe no fluxo de variantes: só auto-grava se o item NÃO tiver variantes
 # =============================================================================
 
 import re
-from typing import Any
+from typing import Optional, Dict, Any, List, Tuple
 
-def _extract_skus_from_answer(answer: str):
-    """
-    Extrai refs/SKUs do texto que a Alma devolve.
-    Suporta:
-      - "(SKU:100010)"
-      - "(SKU: LINO0030 + LINO110MA)"
-      - "SKU: ORK.01.03"
-    Retorna lista de refs (strings).
-    """
-    a = (answer or "")
-    if not a:
-        return []
-
-    # Se a resposta diz que "não há dados", não gravamos nada
-    if re.search(r"Sem dados no catálogo interno", a, flags=re.I):
-        return []
-
-    refs = []
-
-    # (SKU: xxxx)
-    for m in re.finditer(r"\(\s*SKU\s*:\s*([^)]+)\)", a, flags=re.I):
-        chunk = m.group(1).strip()
-        # permite "A + B" ou "A,B"
-        parts = re.split(r"\s*(?:\+|,|/|;)\s*", chunk)
-        for p in parts:
-            p = p.strip()
-            if p and re.match(r"^[A-Z0-9][A-Z0-9._\-]{2,}$", p, flags=re.I):
-                refs.append(p)
-
-    # SKU: xxxx (fora de parêntesis)
-    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I):
-        refs.append(m.group(1).strip())
-
-    # dedup mantendo ordem
-    seen = set()
-    out = []
-    for r in refs:
-        ru = r.strip()
-        if ru and ru not in seen:
-            seen.add(ru)
-            out.append(ru)
-    return out
-
-def _extract_qty_from_answer(answer: str) -> int:
-    """
-    Tenta ler qty do cabeçalho tipo "Orçamento: 2x ..." ou "Orçamento para 2x ..."
-    Se não encontrar, devolve 1.
-    """
-    a = (answer or "")
-    m = re.search(r"\b(\d+)\s*x\b", a, flags=re.I)
-    if m:
-        try:
-            q = int(m.group(1))
-            return q if q > 0 else 1
-        except Exception:
-            return 1
-    return 1
-
-def _is_budget_answer(answer: str) -> bool:
-    """
-    Heurística mínima: só gravar se parece mesmo um orçamento.
-    """
-    a = (answer or "")
-    if not a:
-        return False
-    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", a, flags=re.I))
-
-# -----------------------------------------------------------------------------
-# PATCH: envolver o endpoint /ask para pós-processar a resposta
-# -----------------------------------------------------------------------------
 try:
-    _route_ask = None
-    for r in getattr(app, "routes", []):
-        if getattr(r, "path", None) == "/ask" and "POST" in getattr(r, "methods", set()):
-            _route_ask = r
-            break
+    _build_messages_prev2 = build_messages  # guarda a versão atual (hotfix-quotes ou outra)
+except Exception:
+    _build_messages_prev2 = None
 
-    if _route_ask and callable(getattr(_route_ask, "endpoint", None)):
-        _ask_prev_endpoint = _route_ask.endpoint
 
-        async def _ask_wrapped(*args: Any, **kwargs: Any):
-            resp = await _ask_prev_endpoint(*args, **kwargs)
+def _norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    # remove ruído comum em pedidos PT
+    s = re.sub(r"\b(faz|fazes|faz-me|faz\W*me|or[cç]amento|orcamento|para|de|um|uma|uns|umas|o|a|os|as)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-            # resp esperado: dict com "answer"
-            try:
-                if not isinstance(resp, dict):
-                    return resp
-                answer = resp.get("answer") or resp.get("response") or ""
-                if not answer or not _is_budget_answer(answer):
-                    return resp
 
-                # tentar obter request model para user_id/namespace/question
-                req_obj = None
-                if args:
-                    # normalmente o 1º arg é o pydantic model (AskRequest)
-                    req_obj = args[0]
-                if req_obj is None:
-                    # procurar em kwargs
-                    for v in kwargs.values():
-                        if hasattr(v, "question") and hasattr(v, "user_id"):
-                            req_obj = v
-                            break
-
-                user_id = getattr(req_obj, "user_id", None) if req_obj else None
-                namespace = getattr(req_obj, "namespace", None) if req_obj else None
-                question = getattr(req_obj, "question", None) if req_obj else None
-
-                # só em quote_mode
-                try:
-                    if not _is_quote_mode(question or ""):
-                        return resp
-                except Exception:
-                    return resp
-
-                refs = _extract_skus_from_answer(answer)
-                if not refs:
-                    return resp
-
-                qty = _extract_qty_from_answer(answer)
-
-                # gravar no orçamento aberto
-                try:
-                    qid = _quote_get_open(user_id or "anon", (namespace or DEFAULT_NAMESPACE))
-                    for ref in refs:
-                        _quote_add_or_increment_item(qid, (namespace or DEFAULT_NAMESPACE), ref, qty)
-                    try:
-                        log.info(f"[quotes] persisted-from-answer quote_id={qid} refs={refs} qty={qty}")
-                    except Exception:
-                        pass
-                except Exception as e:
-                    try:
-                        log.warning(f"[quotes] persist-from-answer falhou: {e}")
-                    except Exception:
-                        pass
-
-                return resp
-            except Exception:
-                return resp
-
-        # substituir endpoint no route existente (sem criar rota duplicada)
-        _route_ask.endpoint = _ask_wrapped
-        try:
-            log.info("[hotfix-quotes-persist-answer] ativo: /ask wrapped para persistir SKUs a partir da resposta do orçamento.")
-        except Exception:
-            pass
-
-except Exception as e:
+def _catalog_candidates_by_name(ns: str, query_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Tenta encontrar candidatos por nome, com prioridade a match exato (case-insensitive).
+    Não inventa URLs nem SKUs. Só lê do catalog_items.
+    """
+    qn = _norm_name(query_name)
+    if not qn:
+        return []
     try:
-        log.warning(f"[hotfix-quotes-persist-answer] não aplicado: {e}")
+        with _catalog_conn() as c:
+            # 1) match exato (ignorando case e espaços)
+            rows = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_attrs, variant_key, summary
+                FROM catalog_items
+                WHERE namespace=?
+                  AND lower(trim(name)) = lower(trim(?))
+                LIMIT ?
+            """, (ns, query_name.strip(), limit)).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+
+            # 2) match "contém" pelo nome normalizado (robusto para "Lin Wood" etc.)
+            like = f"%{qn}%"
+            rows = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_attrs, variant_key, summary
+                FROM catalog_items
+                WHERE namespace=?
+                  AND lower(name) LIKE ?
+                ORDER BY CASE
+                    WHEN lower(name) = ? THEN 0
+                    WHEN lower(name) LIKE ? THEN 1
+                    ELSE 2
+                END
+                LIMIT ?
+            """, (ns, like, qn, like, limit)).fetchall()
+            return [dict(r) for r in rows] if rows else []
     except Exception:
-        pass
+        return []
+
+
+def _catalog_item_has_variants(ns: str, base_url: str) -> bool:
+    """
+    Detecta se um produto tem variantes: mesma URL base (sem #sku=) com rows variant_attrs preenchido.
+    """
+    try:
+        if not base_url:
+            return False
+        parent = base_url.split("#", 1)[0]
+        with _catalog_conn() as c:
+            row = c.execute("""
+                SELECT COUNT(1) AS n
+                FROM catalog_items
+                WHERE namespace=?
+                  AND (url = ? OR url LIKE ?)
+                  AND COALESCE(trim(variant_attrs),'') <> ''
+            """, (ns, parent, parent + "#%")).fetchone()
+            return bool(row and int(row["n"] or 0) > 0)
+    except Exception:
+        return False
+
+
+def _try_autofix_quote_add_by_name(user_id: str, ns: str, question: str) -> None:
+    """
+    Se o pedido for "faz orçamento de <nome>" e houver 1 candidato determinístico SEM variantes,
+    grava no quote_items como linha confirmada.
+    """
+    try:
+        q = (question or "").strip()
+        if not q:
+            return
+
+        # só em modo orçamento
+        try:
+            quote_mode = bool(_is_budget_intent_pt(q))
+        except Exception:
+            qq = q.lower()
+            quote_mode = any(k in qq for k in ("orçament", "orcament", "cotação", "cotacao", "preço", "preco", "proforma"))
+        if not quote_mode:
+            return
+
+        # se o user já deu SKU explícito, não interferir
+        if _extract_explicit_skus_and_qty(q):
+            return
+
+        quote_id = _quote_get_open(user_id, ns)
+
+        # se já há itens confirmados, também não interferir (evita duplicações)
+        existing = _quote_list_items(quote_id) or []
+        if existing:
+            return
+
+        # tenta obter candidatos por nome (com a string original e também com norm)
+        candidates = _catalog_candidates_by_name(ns, q, limit=5)
+
+        # heurística: ficar só com candidatos que tenham ref preenchido
+        candidates = [c for c in candidates if (c.get("ref") or "").strip()]
+
+        # se houver exatamente 1 candidato, e NÃO tiver variantes -> auto-grava
+        if len(candidates) == 1:
+            c0 = candidates[0]
+            url0 = (c0.get("url") or "").strip()
+            if not _catalog_item_has_variants(ns, url0):
+                _quote_add_or_increment_item(quote_id, ns, c0["ref"], qty=1)
+    except Exception:
+        return
+
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    """
+    Wrapper: antes de montar contexto, tenta auto-gravar item por nome quando determinístico e sem variantes.
+    Depois delega para a build_messages anterior (hotfix-quotes).
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+    q = (question or "").strip()
+
+    # auto-gravar por nome (corrige o caso Lin Wood / Mono Cadeira quando não dás SKU)
+    _try_autofix_quote_add_by_name(uid, ns, q)
+
+    if _build_messages_prev2:
+        return _build_messages_prev2(uid, q, ns)
+
+    # fallback improvável
+    return [{"role": "system", "content": ALMA_MISSION}, {"role": "user", "content": q}], {}, False, []
+
+
+try:
+    log.info("[hotfix-quotes-merge] ativo: auto-gravar item por NOME quando match determinístico e sem variantes.")
+except Exception:
+    pass
 
 # =============================================================================
 # FIM HOTFIX
