@@ -5853,43 +5853,157 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 # =============================================================================
-# HOTFIX v2 — Middleware /ask: reescreve "ver produto" -> "ver <nome>"
-# Corrige crash: remove Content-Length antes de devolver Response nova
+# HOTFIX v3 — Links por item no orçamento (via catalog.db)
+# Objetivo: substituir o único "ver produto" por vários links:
+# - ver Lin Wood
+# - ver Mono Cadeira
+# - ver Zeal Laser
+# NOTA: remove Content-Length para evitar crash do Uvicorn.
 # =============================================================================
 
 import json
 import re
+import sqlite3
 from starlette.responses import Response
 
-def _rewrite_ver_produto_with_name(text: str) -> str:
-    if not text:
-        return text
+def _extract_quote_lines(answer: str):
+    """
+    Extrai (nome, sku) de linhas do tipo:
+      | Lin Wood LIN0030 + LIN0110MA | ...
+      | Mono Cadeira 100010 | ...
+      | Zeal Laser 740021316-2 | ...
+    Tolerante: apanha o "primeiro token SKU-like" na linha.
+    """
+    items = []
+    if not answer:
+        return items
 
-    lines = text.splitlines()
-    out = []
-    last_item_name = None
+    for ln in answer.splitlines():
+        if "|" not in ln:
+            continue
+        # remove bordas
+        raw = ln.strip()
+        if not raw.startswith("|"):
+            continue
+        cols = [c.strip() for c in raw.strip("|").split("|")]
+        if not cols:
+            continue
 
-    for ln in lines:
-        # tenta apanhar o nome do item em linhas tipo:
-        # | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ | ...
-        # | Mono Cadeira | ...
-        m = re.search(r"^\s*\|\s*([^|]+?)\s*(?:\(|\|)", ln)
+        first = cols[0]
+        # ignora headers/separadores
+        if first.lower().startswith("item") or set(first) <= {"-", " "}:
+            continue
+
+        # tenta separar nome e SKU: procura algo com dígitos ou hífen no fim
+        # exemplos: "Lin Wood LIN0030 + LIN0110MA" / "Mono Cadeira 100010" / "Zeal Laser 740021316-2"
+        m = re.search(r"^(?P<name>.*?)(?P<sku>[A-Z0-9][A-Z0-9\-]{3,})\s*$", first)
         if m:
-            last_item_name = m.group(1).strip()
+            name = m.group("name").strip(" -–—:()")
+            sku = m.group("sku").strip()
+            if name and sku:
+                items.append((name, sku))
+                continue
 
-        if re.search(r"\bver produto\b", ln, flags=re.I):
-            if last_item_name:
-                out.append(f"ver {last_item_name}")
-            else:
-                out.append(ln)
+        # fallback: SKU entre parêntesis (SKU:XXXX)
+        m = re.search(r"SKU[:\s]*([A-Z0-9][A-Z0-9\-]{3,})", first, flags=re.I)
+        if m:
+            sku = m.group(1).strip()
+            name = re.sub(r"\(.*?\)", "", first).strip(" -–—:()")
+            if name and sku:
+                items.append((name, sku))
+
+    # dedupe preservando ordem
+    seen = set()
+    out = []
+    for name, sku in items:
+        key = (name.lower(), sku)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, sku))
+    return out
+
+
+def _catalog_url_by_sku(db_path: str, sku: str):
+    """
+    Procura URL no catalog.db por SKU (variantes incluídas).
+    Ajusta o SQL se os teus nomes de coluna forem diferentes.
+    """
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+
+        # Tenta campos comuns: sku, product_url, url, canonical_url, link
+        cur.execute("""
+            SELECT
+              COALESCE(product_url, url, canonical_url, link) AS u
+            FROM catalog
+            WHERE sku = ?
+            LIMIT 1
+        """, (sku,))
+        row = cur.fetchone()
+        if row and row["u"]:
+            return row["u"]
+
+        # fallback: algumas DBs guardam variantes com "variant_sku" ou "ref"
+        cur.execute("""
+            SELECT
+              COALESCE(product_url, url, canonical_url, link) AS u
+            FROM catalog
+            WHERE variant_sku = ?
+            LIMIT 1
+        """, (sku,))
+        row = cur.fetchone()
+        if row and row["u"]:
+            return row["u"]
+
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _inject_item_links(answer: str, db_path: str = "/data/catalog.db"):
+    """
+    Remove/ignora o "— ver produto" único e injeta uma secção de links por item.
+    """
+    if not answer:
+        return answer
+
+    items = _extract_quote_lines(answer)
+    if not items:
+        return answer
+
+    links = []
+    for name, sku in items:
+        url = _catalog_url_by_sku(db_path, sku)
+        if url:
+            # texto distinto por item => o frontend não colapsa num link único
+            links.append(f"- [ver {name}]({url})")
         else:
-            out.append(ln)
+            # se não houver URL, não inventa
+            links.append(f"- ver {name} (sem link)")
 
-    return "\n".join(out)
+    links_block = "Links dos itens:\n" + "\n".join(links)
+
+    # 1) remove o "— ver produto" do título, se existir
+    out_lines = []
+    for ln in answer.splitlines():
+        out_lines.append(re.sub(r"\s*[–—-]\s*\[?ver produto\]?(?:\([^)]+\))?\s*$", "", ln, flags=re.I))
+    out = "\n".join(out_lines).strip()
+
+    # 2) injeta no fim (ou logo após o total, se preferires)
+    out = out + "\n\n" + links_block
+    return out
 
 
 @app.middleware("http")
-async def _hotfix_links_middleware_v2(request, call_next):
+async def _hotfix_links_middleware_v3(request, call_next):
     response = await call_next(request)
 
     if request.url.path != "/ask":
@@ -5900,8 +6014,8 @@ async def _hotfix_links_middleware_v2(request, call_next):
         async for chunk in response.body_iterator:
             body += chunk
 
-        # copia headers MAS remove content-length (e encoding se existir)
         headers = dict(response.headers)
+        # CRÍTICO: remove Content-Length / Encoding para o Starlette recalcular
         headers.pop("content-length", None)
         headers.pop("Content-Length", None)
         headers.pop("content-encoding", None)
@@ -5912,7 +6026,7 @@ async def _hotfix_links_middleware_v2(request, call_next):
         if "application/json" in media_type:
             data = json.loads(body.decode("utf-8", errors="ignore"))
             if isinstance(data, dict) and isinstance(data.get("answer"), str):
-                data["answer"] = _rewrite_ver_produto_with_name(data["answer"])
+                data["answer"] = _inject_item_links(data["answer"], db_path="/data/catalog.db")
                 new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
                 return Response(
                     content=new_body,
@@ -5921,17 +6035,7 @@ async def _hotfix_links_middleware_v2(request, call_next):
                     media_type="application/json",
                 )
 
-        if "text/" in media_type:
-            txt = body.decode("utf-8", errors="ignore")
-            txt2 = _rewrite_ver_produto_with_name(txt)
-            return Response(
-                content=txt2.encode("utf-8"),
-                status_code=response.status_code,
-                headers=headers,
-                media_type=(response.headers.get("content-type") or "text/plain").split(";")[0].strip(),
-            )
-
-        # fallback: devolve igual, mas sem content-length fixo
+        # fallback: devolve igual (sem content-length fixo)
         return Response(
             content=body,
             status_code=response.status_code,
@@ -5941,19 +6045,19 @@ async def _hotfix_links_middleware_v2(request, call_next):
 
     except Exception as e:
         try:
-            log.warning(f"[hotfix-links-v2] middleware falhou: {e}")
+            log.warning(f"[hotfix-links-v3] middleware falhou: {e}")
         except Exception:
             pass
         return response
 
 
 try:
-    log.info("[hotfix-links-v2] ativo: middleware /ask reescreve 'ver produto' -> 'ver <nome>' (sem Content-Length)")
+    log.info("[hotfix-links-v3] ativo: gera links por item (via catalog.db) e remove Content-Length")
 except Exception:
     pass
 
 # =============================================================================
-# FIM HOTFIX v2
+# FIM HOTFIX v3
 # =============================================================================
 
 
