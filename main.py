@@ -5853,12 +5853,13 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 # =========================
-# HOTFIX: quote table + URL column (server-side, no "ver produto")
-# Cole isto NO FIM do main.py
+# HOTFIX (FINAL): remove "— ver produto" + tabela com coluna URL
+# (atua no build_messages real, que é onde o teu pipeline monta a resposta)
+# Cole NO FIM do main.py
 # =========================
 import re
 
-def _hotfix__url_for_ref(catalog_db, ref: str) -> str | None:
+def _hf_url_from_ref(catalog_db, ref: str) -> str | None:
     if not catalog_db or not ref:
         return None
     ref = ref.strip()
@@ -5873,64 +5874,92 @@ def _hotfix__url_for_ref(catalog_db, ref: str) -> str | None:
     url_canonical, url = row
     return (url_canonical or url or None)
 
-def _hotfix__url_for_ref_composto(catalog_db, ref: str) -> str | None:
-    """
-    Para refs tipo: 'LIN0030 + LIN0110MA' → tenta cada parte e devolve o 1º match.
-    """
+def _hf_url_from_ref_composto(catalog_db, ref: str) -> str | None:
     if not ref:
         return None
     ref = ref.strip()
     if "+" in ref:
         for part in [p.strip() for p in ref.split("+") if p.strip()]:
-            u = _hotfix__url_for_ref(catalog_db, part)
+            u = _hf_url_from_ref(catalog_db, part)
             if u:
                 return u
         return None
-    return _hotfix__url_for_ref(catalog_db, ref)
+    return _hf_url_from_ref(catalog_db, ref)
 
-def _hotfix__render_quote_table_with_url(title: str, items: list[dict], total: float | None = None) -> str:
-    # remove "— ver produto" do título (se existir)
-    title = re.sub(r"\s*[—\-–]\s*ver produto\s*$", "", (title or "").strip(), flags=re.IGNORECASE)
+def _hf_strip_ver_produto(text: str) -> str:
+    if not text:
+        return text
+    # remove no título do orçamento
+    text = re.sub(r"(\bOrçamento:\s*[^\n]*?)\s*[—\-–]\s*ver produto\b", r"\1", text, flags=re.IGNORECASE)
+    # remove qualquer "— ver produto" solto (defensivo)
+    text = re.sub(r"\s*[—\-–]\s*ver produto\b", "", text, flags=re.IGNORECASE)
+    return text
 
-    out = [f"**Orçamento: {title}**", ""]
-    out.append("| Item + SKU | URL | Preço unitário (IVA incluído) | Quantidade | Subtotal |")
-    out.append("|---|---|---:|---:|---:|")
-
-    for it in items or []:
-        name = (it.get("name") or "").strip()
-        ref = (it.get("ref") or it.get("sku") or "").strip()
-
-        unit_price = float(it.get("unit_price") or it.get("price_unit") or it.get("unit") or 0)
-        qty = int(it.get("qty") or it.get("quantity") or 0)
-        subtotal = float(it.get("subtotal") or (unit_price * qty))
-
-        url = (it.get("url") or "").strip() or _hotfix__url_for_ref_composto(app.state.catalog_db, ref)  # type: ignore[name-defined]
-        label = f"{name} {ref}".strip()
-
-        out.append(f"| {label} | {url or ''} | {unit_price:,.2f}€ | {qty} | {subtotal:,.2f}€ |")
-
-    if total is not None:
-        out.append("")
-        out.append(f"**Total: {float(total):,.2f}€**")
-        out.append("Preço com IVA incluído; portes não incluídos.")
-
-    return "\n".join(out)
-
-def _hotfix__extract_title_from_answer(answer: str) -> str | None:
-    # tenta apanhar "Orçamento: ..."
+def _hf_parse_quote_table(answer: str) -> list[dict]:
+    """
+    Tenta extrair itens a partir da tabela que já vem no answer do modelo.
+    Aceita linhas tipo:
+    | Lin Wood LIN0030 + LIN0110MA | 861.00€ | 1 | 861.00€ |
+    | Mono Cadeira 100010 | 539.00€ | 2 | 1.078.00€ |
+    """
     if not answer:
-        return None
-    m = re.search(r"Orçamento:\s*(.+)", answer, flags=re.IGNORECASE)
-    if not m:
-        return None
-    # corta no fim da linha
-    line = m.group(1).strip()
-    line = line.split("\n", 1)[0].strip()
-    # remove markdown bold
-    line = line.strip("*").strip()
-    return line or None
+        return []
 
-def _hotfix__extract_total_from_answer(answer: str) -> float | None:
+    lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
+    items = []
+    for ln in lines:
+        if not (ln.startswith("|") and ln.endswith("|")):
+            continue
+        # ignora header/separadores
+        if "Preço unitário" in ln or "Quantidade" in ln or set(ln.replace("|", "").strip()) <= set("-:"):
+            continue
+
+        cols = [c.strip() for c in ln.strip("|").split("|")]
+        if len(cols) < 4:
+            continue
+
+        label = cols[0]
+        unit = cols[1]
+        qty = cols[2]
+        sub = cols[3]
+
+        # extrai refs do fim do label (heurística)
+        # ex: "Lin Wood LIN0030 + LIN0110MA" => ref="LIN0030 + LIN0110MA"
+        # ex: "Mono Cadeira 100010" => ref="100010"
+        ref = ""
+        m = re.search(r"([A-Z]{2,}\d+(?:\s*\+\s*[A-Z]{2,}\d+)*|\d{4,}(?:-\d+)?)\s*$", label)
+        if m:
+            ref = m.group(1).strip()
+
+        def _to_float_eur(s: str) -> float:
+            s = (s or "").strip()
+            s = s.replace("€", "").replace(" ", "")
+            # 1.078.00 -> remove milhares
+            s = s.replace(".", "").replace(",", ".")
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+        def _to_int(s: str) -> int:
+            s = (s or "").strip()
+            s = re.sub(r"[^\d]", "", s)
+            try:
+                return int(s) if s else 0
+            except Exception:
+                return 0
+
+        items.append({
+            "label": label,
+            "ref": ref,
+            "unit_price": _to_float_eur(unit),
+            "qty": _to_int(qty),
+            "subtotal": _to_float_eur(sub),
+        })
+
+    return items
+
+def _hf_extract_total(answer: str) -> float | None:
     if not answer:
         return None
     m = re.search(r"Total:\s*([0-9\.\,]+)\s*€", answer, flags=re.IGNORECASE)
@@ -5942,94 +5971,96 @@ def _hotfix__extract_total_from_answer(answer: str) -> float | None:
     except Exception:
         return None
 
-# 1) Se existir um "quote_store"/estado persistente, usa-o para reconstruir a tabela.
-# 2) Caso não exista, tenta reformatar a resposta atual se tiver "quote_items" no payload.
-#    (Este hotfix assume que /ask devolve dict com "answer".)
-try:
-    _orig__ask = app.dependency_overrides.get("ask_handler")  # se tiveres overrides; pode não existir
-except Exception:
-    _orig__ask = None
+def _hf_render_quote_with_url(answer: str, items: list[dict]) -> str:
+    # tenta extrair título “Orçamento: …”
+    title = ""
+    m = re.search(r"Orçamento:\s*(.+)", answer, flags=re.IGNORECASE)
+    if m:
+        title = m.group(1).split("\n", 1)[0].strip("* ").strip()
+    title = _hf_strip_ver_produto(title)
 
-# Guardamos referência ao handler real do /ask (a maioria dos projetos tem a função ask()).
-# Se a tua função tiver outro nome, ajusta AQUI:
-try:
-    _orig_ask_fn = ask  # type: ignore[name-defined]
-except Exception:
-    _orig_ask_fn = None
+    total = _hf_extract_total(answer)
 
-if _orig_ask_fn:
-    async def ask(*args, **kwargs):  # type: ignore[no-redef]
-        """
-        Wrapper do /ask:
-        - Se estiver em quote_mode e houver itens resolvidos no estado, força resposta com URL em coluna.
-        - Não depende de pós-processamento de links.
-        """
-        res = await _orig_ask_fn(*args, **kwargs)
+    out = []
+    out.append(f"**Orçamento: {title}**" if title else "**Orçamento**")
+    out.append("")
+    out.append("| Item + SKU | URL | Preço unitário (IVA incluído) | Quantidade | Subtotal |")
+    out.append("|---|---|---:|---:|---:|")
 
-        # Espera-se res como dict {"answer": "...", ...}
-        if not isinstance(res, dict):
-            return res
+    # precisa do catalog_db do app.state
+    catalog_db = None
+    try:
+        catalog_db = app.state.catalog_db  # type: ignore[name-defined]
+    except Exception:
+        catalog_db = None
 
-        answer = res.get("answer") or ""
-        quote_id = res.get("quote_id") or None
+    for it in items:
+        label = it.get("label", "")
+        ref = it.get("ref", "")
+        unit_price = float(it.get("unit_price") or 0)
+        qty = int(it.get("qty") or 0)
+        subtotal = float(it.get("subtotal") or (unit_price * qty))
 
-        # Se não parece um orçamento, não mexe
-        if "Orçamento:" not in answer:
-            return res
+        url = _hf_url_from_ref_composto(catalog_db, ref) if (catalog_db and ref) else None
+        out.append(f"| {label} | {url or ''} | {unit_price:,.2f}€ | {qty} | {subtotal:,.2f}€ |")
 
-        # tenta ir buscar itens ao estado persistente (se existir)
-        items = None
-        total = None
-        title = _hotfix__extract_title_from_answer(answer) or ""
+    if total is not None:
+        out.append("")
+        out.append(f"**Total: {float(total):,.2f}€**")
+        out.append("Preço com IVA incluído; portes não incluídos.")
+
+    return "\n".join(out)
+
+# ---- Hook no build_messages REAL (o teu pipeline usa isto) ----
+_orig_build_messages = globals().get("build_messages")
+
+if callable(_orig_build_messages):
+    def build_messages(*args, **kwargs):  # type: ignore[no-redef]
+        res = _orig_build_messages(*args, **kwargs)
+
+        # O teu build_messages pode devolver:
+        # - list de messages (dicts com role/content)
+        # - dict com "messages"
+        # Vamos tratar ambos.
+
+        def _process_text(s: str) -> str:
+            if not s or "Orçamento:" not in s:
+                return s
+            s2 = _hf_strip_ver_produto(s)
+            items = _hf_parse_quote_table(s2)
+            if items:
+                return _hf_render_quote_with_url(s2, items)
+            return s2
 
         try:
-            # Ajusta estes nomes se no teu projeto forem diferentes:
-            # - quote_store: objeto com get(quote_id) ou dict
-            # - state: contém items resolvidos
-            qs = globals().get("quote_store") or globals().get("QUOTE_STORE") or None
-            if qs and quote_id:
-                st = qs.get(quote_id) if hasattr(qs, "get") else qs.get(quote_id, None)
-                if st:
-                    items = st.get("items") or st.get("resolved_items") or st.get("quote_items")
-                    total = st.get("total") or st.get("total_eur") or st.get("grand_total")
+            if isinstance(res, list):
+                for msg in res:
+                    if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                        msg["content"] = _process_text(msg["content"])
+                return res
+
+            if isinstance(res, dict) and isinstance(res.get("messages"), list):
+                for msg in res["messages"]:
+                    if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                        msg["content"] = _process_text(msg["content"])
+                return res
+
         except Exception:
             pass
-
-        # fallback: tenta usar itens já presentes no payload do /ask
-        if items is None:
-            items = res.get("items") or res.get("quote_items") or res.get("resolved_items")
-
-        # fallback: tenta total a partir do answer
-        if total is None:
-            total = _hotfix__extract_total_from_answer(answer)
-
-        if isinstance(items, list) and items:
-            res["answer"] = _hotfix__render_quote_table_with_url(title=title, items=items, total=total)
-        else:
-            # Se não há items, pelo menos remove o "— ver produto" do título no answer atual
-            res["answer"] = re.sub(
-                r"(\bOrçamento:\s*[^\n]*?)\s*[—\-–]\s*ver produto\b",
-                r"\1",
-                answer,
-                flags=re.IGNORECASE,
-            )
 
         return res
 
     try:
         import logging
-        logging.getLogger("alma").info("[hotfix-quote-url-col] ativo: tabela de orçamento inclui coluna URL (server-side).")
+        logging.getLogger("alma").info("[hotfix-quote-url-v2] ativo: build_messages -> remove 'ver produto' + coluna URL no orçamento.")
     except Exception:
         pass
 else:
     try:
         import logging
-        logging.getLogger("alma").warning("[hotfix-quote-url-col] NÃO aplicado: não encontrei a função ask(). Ajusta _orig_ask_fn.")
+        logging.getLogger("alma").warning("[hotfix-quote-url-v2] NÃO aplicado: build_messages não encontrado/callable.")
     except Exception:
         pass
-
-
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
