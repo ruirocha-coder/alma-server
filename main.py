@@ -5853,6 +5853,79 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — link único por item: "ver <nome do produto>"
+# =============================================================================
+
+import re
+
+try:
+    _ask_prev = ask  # função original
+except Exception:
+    _ask_prev = None
+
+
+def _rewrite_ver_produto_with_name(text: str) -> str:
+    """
+    Substitui:
+        ver produto
+    por:
+        ver <nome do item>
+
+    Exemplo:
+        | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ |
+        ver produto
+
+    passa a:
+        ver Lin Wood
+    """
+
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    out = []
+
+    last_item_name = None
+
+    for ln in lines:
+        # tenta capturar nome do item da linha da tabela
+        # | Lin Wood (SKU...) | 861.00€ |
+        m = re.search(r"\|\s*([^|]+?)\s*(?:\(|\|)", ln)
+        if m:
+            last_item_name = m.group(1).strip()
+
+        if re.search(r"\bver produto\b", ln, flags=re.I):
+            if last_item_name:
+                out.append(f"ver {last_item_name}")
+            else:
+                out.append("ver produto")
+        else:
+            out.append(ln)
+
+    return "\n".join(out)
+
+
+# patch do endpoint principal
+if _ask_prev is not None:
+    async def ask(*args, **kwargs):  # type: ignore
+        resp = await _ask_prev(*args, **kwargs)
+        try:
+            if isinstance(resp, dict) and "answer" in resp:
+                resp["answer"] = _rewrite_ver_produto_with_name(resp["answer"])
+            return resp
+        except Exception:
+            return resp
+
+    try:
+        log.info("[hotfix-links] ativo: ver <nome do produto>")
+    except Exception:
+        pass
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
