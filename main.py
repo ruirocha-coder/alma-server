@@ -5852,10 +5852,9 @@ except Exception:
 # =============================================================================
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
-
 # =============================================================================
-# HOTFIX — Middleware para "ver <nome>" em vez de "ver produto"
-# (Funciona mesmo quando o handler /ask já foi registado no FastAPI router.)
+# HOTFIX v2 — Middleware /ask: reescreve "ver produto" -> "ver <nome>"
+# Corrige crash: remove Content-Length antes de devolver Response nova
 # =============================================================================
 
 import json
@@ -5863,11 +5862,6 @@ import re
 from starlette.responses import Response
 
 def _rewrite_ver_produto_with_name(text: str) -> str:
-    """
-    Percorre linhas do answer e substitui "ver produto" por "ver <último item detetado>".
-    Deteta item a partir de linhas tipo tabela:
-      | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ | ...
-    """
     if not text:
         return text
 
@@ -5876,8 +5870,9 @@ def _rewrite_ver_produto_with_name(text: str) -> str:
     last_item_name = None
 
     for ln in lines:
-        # tenta apanhar o nome do item na coluna "Nome + SKU" ou "Item"
-        # padrão: | <nome ...> ( ... ) |  ou  | <nome ...> | ...
+        # tenta apanhar o nome do item em linhas tipo:
+        # | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ | ...
+        # | Mono Cadeira | ...
         m = re.search(r"^\s*\|\s*([^|]+?)\s*(?:\(|\|)", ln)
         if m:
             last_item_name = m.group(1).strip()
@@ -5886,7 +5881,7 @@ def _rewrite_ver_produto_with_name(text: str) -> str:
             if last_item_name:
                 out.append(f"ver {last_item_name}")
             else:
-                out.append(ln)  # fallback: mantém
+                out.append(ln)
         else:
             out.append(ln)
 
@@ -5894,25 +5889,27 @@ def _rewrite_ver_produto_with_name(text: str) -> str:
 
 
 @app.middleware("http")
-async def _hotfix_links_middleware(request, call_next):
+async def _hotfix_links_middleware_v2(request, call_next):
     response = await call_next(request)
 
-    # Só mexe no /ask (para não arriscar outras rotas)
     if request.url.path != "/ask":
         return response
 
     try:
-        # Lê o corpo inteiro
         body = b""
         async for chunk in response.body_iterator:
             body += chunk
 
-        # Recria headers/mediatype
+        # copia headers MAS remove content-length (e encoding se existir)
         headers = dict(response.headers)
-        media_type = headers.get("content-type", "")
+        headers.pop("content-length", None)
+        headers.pop("Content-Length", None)
+        headers.pop("content-encoding", None)
+        headers.pop("Content-Encoding", None)
 
-        # Caso típico: JSON {"answer": "..."}
-        if "application/json" in media_type.lower():
+        media_type = (response.headers.get("content-type") or "").lower()
+
+        if "application/json" in media_type:
             data = json.loads(body.decode("utf-8", errors="ignore"))
             if isinstance(data, dict) and isinstance(data.get("answer"), str):
                 data["answer"] = _rewrite_ver_produto_with_name(data["answer"])
@@ -5924,40 +5921,39 @@ async def _hotfix_links_middleware(request, call_next):
                     media_type="application/json",
                 )
 
-        # Fallback: se for texto
-        if "text/" in media_type.lower():
+        if "text/" in media_type:
             txt = body.decode("utf-8", errors="ignore")
             txt2 = _rewrite_ver_produto_with_name(txt)
             return Response(
                 content=txt2.encode("utf-8"),
                 status_code=response.status_code,
                 headers=headers,
-                media_type=media_type.split(";")[0].strip() or "text/plain",
+                media_type=(response.headers.get("content-type") or "text/plain").split(";")[0].strip(),
             )
 
-        # Se não for JSON/texto, devolve como estava
+        # fallback: devolve igual, mas sem content-length fixo
         return Response(
             content=body,
             status_code=response.status_code,
             headers=headers,
-            media_type=media_type.split(";")[0].strip() if media_type else None,
+            media_type=(response.headers.get("content-type") or "").split(";")[0].strip() or None,
         )
 
     except Exception as e:
         try:
-            log.warning(f"[hotfix-links] middleware falhou: {e}")
+            log.warning(f"[hotfix-links-v2] middleware falhou: {e}")
         except Exception:
             pass
         return response
 
 
 try:
-    log.info("[hotfix-links] ativo: middleware /ask reescreve 'ver produto' -> 'ver <nome>'")
+    log.info("[hotfix-links-v2] ativo: middleware /ask reescreve 'ver produto' -> 'ver <nome>' (sem Content-Length)")
 except Exception:
     pass
 
 # =============================================================================
-# FIM HOTFIX
+# FIM HOTFIX v2
 # =============================================================================
 
 
