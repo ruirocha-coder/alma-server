@@ -5482,96 +5482,172 @@ except Exception as e:
 # =============================================================================
 
 # =============================================================================
-# HOTFIX — orçamento: intent robusto + fallback de query para catálogo
-# (resolve: "fazes-me um orçamento para a mono cadeira?" => encontra produto)
-# Colar no fim do main.py
+# HOTFIX — Persistir itens do orçamento a partir da RESPOSTA do LLM
+# Motivo: o quotes.db só estava a gravar quando o UTILIZADOR escrevia o SKU.
+# Agora: quando a Alma gera um "Orçamento:" e inclui "SKU(...)" na resposta,
+#        extraímos refs e gravamos no orçamento aberto do user_id+namespace.
+#
+# Colar NO FIM do main.py
 # =============================================================================
 
 import re
-from typing import Optional
+from typing import Any
 
-# --- 1) quote_mode mais robusto (não depender só de _is_budget_intent_pt) ---
-try:
-    _is_quote_mode_prev = _is_quote_mode
-except Exception:
-    _is_quote_mode_prev = None
+def _extract_skus_from_answer(answer: str):
+    """
+    Extrai refs/SKUs do texto que a Alma devolve.
+    Suporta:
+      - "(SKU:100010)"
+      - "(SKU: LINO0030 + LINO110MA)"
+      - "SKU: ORK.01.03"
+    Retorna lista de refs (strings).
+    """
+    a = (answer or "")
+    if not a:
+        return []
 
-def _is_quote_mode(question: str) -> bool:
-    q = (question or "").lower()
+    # Se a resposta diz que "não há dados", não gravamos nada
+    if re.search(r"Sem dados no catálogo interno", a, flags=re.I):
+        return []
 
-    # se existir o detector "oficial", usa-o primeiro
-    if _is_quote_mode_prev:
+    refs = []
+
+    # (SKU: xxxx)
+    for m in re.finditer(r"\(\s*SKU\s*:\s*([^)]+)\)", a, flags=re.I):
+        chunk = m.group(1).strip()
+        # permite "A + B" ou "A,B"
+        parts = re.split(r"\s*(?:\+|,|/|;)\s*", chunk)
+        for p in parts:
+            p = p.strip()
+            if p and re.match(r"^[A-Z0-9][A-Z0-9._\-]{2,}$", p, flags=re.I):
+                refs.append(p)
+
+    # SKU: xxxx (fora de parêntesis)
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I):
+        refs.append(m.group(1).strip())
+
+    # dedup mantendo ordem
+    seen = set()
+    out = []
+    for r in refs:
+        ru = r.strip()
+        if ru and ru not in seen:
+            seen.add(ru)
+            out.append(ru)
+    return out
+
+def _extract_qty_from_answer(answer: str) -> int:
+    """
+    Tenta ler qty do cabeçalho tipo "Orçamento: 2x ..." ou "Orçamento para 2x ..."
+    Se não encontrar, devolve 1.
+    """
+    a = (answer or "")
+    m = re.search(r"\b(\d+)\s*x\b", a, flags=re.I)
+    if m:
         try:
-            if bool(_is_quote_mode_prev(question)):
-                return True
+            q = int(m.group(1))
+            return q if q > 0 else 1
+        except Exception:
+            return 1
+    return 1
+
+def _is_budget_answer(answer: str) -> bool:
+    """
+    Heurística mínima: só gravar se parece mesmo um orçamento.
+    """
+    a = (answer or "")
+    if not a:
+        return False
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", a, flags=re.I))
+
+# -----------------------------------------------------------------------------
+# PATCH: envolver o endpoint /ask para pós-processar a resposta
+# -----------------------------------------------------------------------------
+try:
+    _route_ask = None
+    for r in getattr(app, "routes", []):
+        if getattr(r, "path", None) == "/ask" and "POST" in getattr(r, "methods", set()):
+            _route_ask = r
+            break
+
+    if _route_ask and callable(getattr(_route_ask, "endpoint", None)):
+        _ask_prev_endpoint = _route_ask.endpoint
+
+        async def _ask_wrapped(*args: Any, **kwargs: Any):
+            resp = await _ask_prev_endpoint(*args, **kwargs)
+
+            # resp esperado: dict com "answer"
+            try:
+                if not isinstance(resp, dict):
+                    return resp
+                answer = resp.get("answer") or resp.get("response") or ""
+                if not answer or not _is_budget_answer(answer):
+                    return resp
+
+                # tentar obter request model para user_id/namespace/question
+                req_obj = None
+                if args:
+                    # normalmente o 1º arg é o pydantic model (AskRequest)
+                    req_obj = args[0]
+                if req_obj is None:
+                    # procurar em kwargs
+                    for v in kwargs.values():
+                        if hasattr(v, "question") and hasattr(v, "user_id"):
+                            req_obj = v
+                            break
+
+                user_id = getattr(req_obj, "user_id", None) if req_obj else None
+                namespace = getattr(req_obj, "namespace", None) if req_obj else None
+                question = getattr(req_obj, "question", None) if req_obj else None
+
+                # só em quote_mode
+                try:
+                    if not _is_quote_mode(question or ""):
+                        return resp
+                except Exception:
+                    return resp
+
+                refs = _extract_skus_from_answer(answer)
+                if not refs:
+                    return resp
+
+                qty = _extract_qty_from_answer(answer)
+
+                # gravar no orçamento aberto
+                try:
+                    qid = _quote_get_open(user_id or "anon", (namespace or DEFAULT_NAMESPACE))
+                    for ref in refs:
+                        _quote_add_or_increment_item(qid, (namespace or DEFAULT_NAMESPACE), ref, qty)
+                    try:
+                        log.info(f"[quotes] persisted-from-answer quote_id={qid} refs={refs} qty={qty}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        log.warning(f"[quotes] persist-from-answer falhou: {e}")
+                    except Exception:
+                        pass
+
+                return resp
+            except Exception:
+                return resp
+
+        # substituir endpoint no route existente (sem criar rota duplicada)
+        _route_ask.endpoint = _ask_wrapped
+        try:
+            log.info("[hotfix-quotes-persist-answer] ativo: /ask wrapped para persistir SKUs a partir da resposta do orçamento.")
         except Exception:
             pass
 
-    # fallback simples e agressivo: basta conter "orçament" ou "cotação/proforma/preço"
-    return any(k in q for k in ("orçament", "orcament", "cotação", "cotacao", "proforma", "preço", "preco"))
-
-
-# --- 2) fallback do termo de catálogo quando a frase vem em "orçamento para ..." ---
-try:
-    _catalog_query_from_question_prev = _catalog_query_from_question
-except Exception:
-    _catalog_query_from_question_prev = None
-
-_STOPWORDS_BUDGET = {
-    "faz", "fazes", "faz-me", "fazes-me", "fazem", "podes", "pode", "consegues", "queria", "preciso",
-    "um", "uma", "uns", "umas", "_toggle_",  # placeholder
-    "orçamento", "orcamento", "cotação", "cotacao", "proforma", "preço", "preco",
-    "para", "pra", "de", "do", "da", "dos", "das", "a", "o", "as", "os",
-    "por", "favor", "sff", "pf", "me", "mim",
-}
-
-def _budget_fallback_catalog_query(question: str) -> str:
-    # 1) tenta apanhar o que vem depois de "para ..." quando existe
-    q = (question or "").strip()
-    m = re.search(r"\b(?:para|pra)\s+(?:o|a|os|as|um|uma|uns|umas)?\s*(.+)$", q, flags=re.I)
-    tail = (m.group(1) if m else q)
-
-    # 2) limpa pontuação, baixa, e remove stopwords de intenção
-    cleaned = re.sub(r"[^\w\s\-à-úÀ-Ú]", " ", tail, flags=re.UNICODE)
-    toks = [t.strip().lower() for t in cleaned.split() if t.strip()]
-    toks = [t for t in toks if t not in _STOPWORDS_BUDGET]
-
-    # 3) devolve uma query “nome do produto”
-    return " ".join(toks).strip()
-
-def _catalog_query_from_question(question: str) -> str:
-    # usa o extractor existente
-    base = ""
-    if _catalog_query_from_question_prev:
-        try:
-            base = (_catalog_query_from_question_prev(question) or "").strip()
-        except Exception:
-            base = ""
-
-    # se já devolveu algo “útil”, mantém
-    if base and len(base) >= 4:
-        return base
-
-    # fallback: tenta extrair nome do produto removendo intenção
-    fb = _budget_fallback_catalog_query(question)
-
-    # se ficar demasiado curto, cai no original (para não piorar)
-    if len(fb) >= 4:
-        return fb
-
-    return base or (question or "").strip()
-
-
-try:
-    log.info("[hotfix-budget-intent] ativo: quote_mode robusto + fallback _catalog_query_from_question() para 'orçamento para ...'.")
-except Exception:
-    pass
+except Exception as e:
+    try:
+        log.warning(f"[hotfix-quotes-persist-answer] não aplicado: {e}")
+    except Exception:
+        pass
 
 # =============================================================================
 # FIM HOTFIX
 # =============================================================================
-
-
 
 
 # ---------------------------------------------------------------------------------------
