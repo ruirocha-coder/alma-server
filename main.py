@@ -5640,6 +5640,219 @@ except Exception:
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — quote_mode multi-itens: auto-fixar "match único sem variantes"
+# - Resolve pedidos do tipo: "faz orçamento com 1 lin wood, 2 mono cadeira e 1 zeal laser"
+# - Para itens com match único no catálogo e sem variantes: grava logo no quotes.db
+# - Para itens com variantes: não fixa (mantém comportamento atual: listar variantes e pedir SKU)
+# =============================================================================
+import re
+from typing import List, Tuple, Optional, Dict, Any
+
+def _norm_txt(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _extract_multi_items_pt(q: str) -> List[Tuple[int, str]]:
+    """
+    Extrai lista [(qty, termo)] de pedidos multi-itens.
+    Aceita: "1 lin wood, 2 mono cadeira e 1 zeal laser"
+    """
+    if not q:
+        return []
+
+    t = _norm_txt(q)
+
+    # remove prefixos típicos
+    t = re.sub(r"^(faz(?:es)?(?:-me)?\s+)?(um|uma)?\s*(orçamento|orcamento)\s*(com|de|para)?\s*", "", t).strip()
+
+    # normaliza separadores
+    t = t.replace(" e ", ", ")
+    t = t.replace(" + ", ", ")
+    t = re.sub(r"\s*,\s*", ",", t)
+
+    parts = [p.strip() for p in t.split(",") if p.strip()]
+    out: List[Tuple[int, str]] = []
+
+    for p in parts:
+        # padrões: "2x termo" | "2 termo" | "2 unid termo"
+        m = re.match(r"^\s*(\d+)\s*(?:x|unid(?:ades)?|unidade(?:s)?)?\s*(.+?)\s*$", p, flags=re.I)
+        if m:
+            qty = int(m.group(1))
+            term = m.group(2).strip()
+        else:
+            # sem qty explícita -> ignora (para não estragar comportamento)
+            continue
+
+        # limpa artigos e preposições iniciais
+        term = re.sub(r"^(de|do|da|dos|das|um|uma|o|a)\s+", "", term, flags=re.I).strip()
+        if term:
+            out.append((max(1, qty), term))
+
+    # dedup por termo (somando qty)
+    agg: Dict[str, int] = {}
+    for qty, term in out:
+        key = _norm_txt(term)
+        agg[key] = agg.get(key, 0) + qty
+
+    return [(qty, term_key) for term_key, qty in agg.items()]
+
+def _catalog_find_candidates_by_name(ns: str, term_norm: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Procura candidatos no catálogo por nome (primeiro match exato, depois LIKE).
+    term_norm vem normalizado lower.
+    """
+    if not term_norm:
+        return []
+    try:
+        with _catalog_conn() as c:
+            # 1) match exato (case-insensitive)
+            rows = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_key, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND lower(name)=?
+                 LIMIT ?
+            """, (ns, term_norm, limit)).fetchall()
+            exact = [dict(r) for r in rows] if rows else []
+            if exact:
+                return exact
+
+            # 2) fallback LIKE (case-insensitive)
+            like = f"%{term_norm}%"
+            rows2 = c.execute("""
+                SELECT namespace, name, ref, price, url, brand, variant_key, variant_attrs
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND lower(name) LIKE ?
+                 ORDER BY
+                   CASE WHEN lower(name)=? THEN 0 ELSE 1 END,
+                   LENGTH(name) ASC
+                 LIMIT ?
+            """, (ns, like, term_norm, limit)).fetchall()
+            return [dict(r) for r in rows2] if rows2 else []
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-quotes-multi] catalog_find_candidates falhou: {e}")
+        except Exception:
+            pass
+        return []
+
+def _catalog_has_variants_for_url(ns: str, url: str) -> bool:
+    if not url:
+        return False
+    try:
+        with _catalog_conn() as c:
+            row = c.execute("""
+                SELECT COUNT(1) AS n
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND url=?
+                   AND variant_key IS NOT NULL
+            """, (ns, url)).fetchone()
+            return int(row["n"] or 0) > 0
+    except Exception:
+        return False
+
+def _resolve_unique_base_item(ns: str, term_norm: str) -> Optional[Dict[str, Any]]:
+    """
+    Resolve termo para um item base "seguro" para fixar:
+    - tem ref
+    - e NÃO tem variantes (para não estragar comportamento actual)
+    - e match é suficientemente único
+    """
+    cands = _catalog_find_candidates_by_name(ns, term_norm, limit=5)
+    if not cands:
+        return None
+
+    # filtra candidatos com ref e url
+    cands2 = [x for x in cands if (x.get("ref") and x.get("url"))]
+    if not cands2:
+        return None
+
+    # prioridade: nome exato
+    exact = [x for x in cands2 if _norm_txt(x.get("name")) == term_norm]
+    pool = exact or cands2
+
+    # se houver múltiplos, tenta escolher o mais "base" (sem variant_key)
+    base = [x for x in pool if not (x.get("variant_key") or "").strip()]
+    pool2 = base or pool
+
+    # exige unicidade forte: 1 candidato depois do filtro
+    if len(pool2) != 1:
+        return None
+
+    chosen = pool2[0]
+
+    # se o URL tiver variantes associadas, NÃO fixa (mantém regra de listar variantes)
+    if _catalog_has_variants_for_url(ns, chosen.get("url")):
+        return None
+
+    return chosen
+
+# -----------------------------------------------------------------------------
+# PATCH build_messages: em quote_mode, auto-fixa múltiplos itens por nome
+# -----------------------------------------------------------------------------
+try:
+    _build_messages_prev_multi = build_messages
+except Exception:
+    _build_messages_prev_multi = None
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    q  = (question or "").strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    # usa o teu detector existente
+    quote_mode = False
+    try:
+        quote_mode = bool(_is_budget_intent_pt(q))
+    except Exception:
+        qq = q.lower()
+        quote_mode = any(k in qq for k in ("orçament", "orcament", "cotação", "cotacao", "preço", "preco", "proforma"))
+
+    if quote_mode:
+        try:
+            quote_id = _quote_get_open(uid, ns)
+
+            # só tenta resolver por nome quando NÃO há SKU explícito no texto
+            explicit = _extract_explicit_skus_and_qty(q)
+            if not explicit:
+                items = _extract_multi_items_pt(q)
+                fixed = 0
+                for qty, term_norm in items:
+                    chosen = _resolve_unique_base_item(ns, term_norm)
+                    if chosen and chosen.get("ref"):
+                        _quote_add_or_increment_item(quote_id, ns, chosen["ref"], qty)
+                        fixed += 1
+
+                if fixed:
+                    try:
+                        log.info(f"[hotfix-quotes-multi] auto-fixados={fixed} (quote_id={quote_id})")
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                log.warning(f"[hotfix-quotes-multi] falhou: {e}")
+            except Exception:
+                pass
+
+    # delega no build_messages anterior (mantém tudo o resto igual)
+    if _build_messages_prev_multi:
+        return _build_messages_prev_multi(user_id, question, namespace)
+
+    # fallback impossível (mas evita crash)
+    return [{"role":"user","content": q}], {}, False, []
+
+try:
+    log.info("[hotfix-quotes-multi] ativo: auto-fixar multi-itens sem variantes em quote_mode.")
+except Exception:
+    pass
+# =============================================================================
+# FIM HOTFIX — quote_mode multi-itens
+# =============================================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
