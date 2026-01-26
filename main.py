@@ -5853,197 +5853,180 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 # =========================
-# HOTFIX 3 (v4) - Links por item + gzip-safe
+# HOTFIX: quote table + URL column (server-side, no "ver produto")
+# Cole isto NO FIM do main.py
 # =========================
-def apply_hotfix_links_v4(app, catalog_db, logger):
-    import re
-    import json
-    import gzip
-    from starlette.responses import Response
+import re
 
-    if getattr(app.state, "_hotfix_links_v4_applied", False):
-        logger.info("[hotfix-links-v4] já aplicado (skip).")
-        return
+def _hotfix__url_for_ref(catalog_db, ref: str) -> str | None:
+    if not catalog_db or not ref:
+        return None
+    ref = ref.strip()
+    if not ref:
+        return None
+    row = catalog_db.fetchone(
+        "SELECT url_canonical, url FROM catalog_items WHERE ref = ? LIMIT 1",
+        (ref,),
+    )
+    if not row:
+        return None
+    url_canonical, url = row
+    return (url_canonical or url or None)
 
-    # --- helpers ---
-    def _get_url_for_ref(ref: str) -> str | None:
-        if not ref:
-            return None
+def _hotfix__url_for_ref_composto(catalog_db, ref: str) -> str | None:
+    """
+    Para refs tipo: 'LIN0030 + LIN0110MA' → tenta cada parte e devolve o 1º match.
+    """
+    if not ref:
+        return None
+    ref = ref.strip()
+    if "+" in ref:
+        for part in [p.strip() for p in ref.split("+") if p.strip()]:
+            u = _hotfix__url_for_ref(catalog_db, part)
+            if u:
+                return u
+        return None
+    return _hotfix__url_for_ref(catalog_db, ref)
+
+def _hotfix__render_quote_table_with_url(title: str, items: list[dict], total: float | None = None) -> str:
+    # remove "— ver produto" do título (se existir)
+    title = re.sub(r"\s*[—\-–]\s*ver produto\s*$", "", (title or "").strip(), flags=re.IGNORECASE)
+
+    out = [f"**Orçamento: {title}**", ""]
+    out.append("| Item + SKU | URL | Preço unitário (IVA incluído) | Quantidade | Subtotal |")
+    out.append("|---|---|---:|---:|---:|")
+
+    for it in items or []:
+        name = (it.get("name") or "").strip()
+        ref = (it.get("ref") or it.get("sku") or "").strip()
+
+        unit_price = float(it.get("unit_price") or it.get("price_unit") or it.get("unit") or 0)
+        qty = int(it.get("qty") or it.get("quantity") or 0)
+        subtotal = float(it.get("subtotal") or (unit_price * qty))
+
+        url = (it.get("url") or "").strip() or _hotfix__url_for_ref_composto(app.state.catalog_db, ref)  # type: ignore[name-defined]
+        label = f"{name} {ref}".strip()
+
+        out.append(f"| {label} | {url or ''} | {unit_price:,.2f}€ | {qty} | {subtotal:,.2f}€ |")
+
+    if total is not None:
+        out.append("")
+        out.append(f"**Total: {float(total):,.2f}€**")
+        out.append("Preço com IVA incluído; portes não incluídos.")
+
+    return "\n".join(out)
+
+def _hotfix__extract_title_from_answer(answer: str) -> str | None:
+    # tenta apanhar "Orçamento: ..."
+    if not answer:
+        return None
+    m = re.search(r"Orçamento:\s*(.+)", answer, flags=re.IGNORECASE)
+    if not m:
+        return None
+    # corta no fim da linha
+    line = m.group(1).strip()
+    line = line.split("\n", 1)[0].strip()
+    # remove markdown bold
+    line = line.strip("*").strip()
+    return line or None
+
+def _hotfix__extract_total_from_answer(answer: str) -> float | None:
+    if not answer:
+        return None
+    m = re.search(r"Total:\s*([0-9\.\,]+)\s*€", answer, flags=re.IGNORECASE)
+    if not m:
+        return None
+    s = m.group(1).strip().replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+# 1) Se existir um "quote_store"/estado persistente, usa-o para reconstruir a tabela.
+# 2) Caso não exista, tenta reformatar a resposta atual se tiver "quote_items" no payload.
+#    (Este hotfix assume que /ask devolve dict com "answer".)
+try:
+    _orig__ask = app.dependency_overrides.get("ask_handler")  # se tiveres overrides; pode não existir
+except Exception:
+    _orig__ask = None
+
+# Guardamos referência ao handler real do /ask (a maioria dos projetos tem a função ask()).
+# Se a tua função tiver outro nome, ajusta AQUI:
+try:
+    _orig_ask_fn = ask  # type: ignore[name-defined]
+except Exception:
+    _orig_ask_fn = None
+
+if _orig_ask_fn:
+    async def ask(*args, **kwargs):  # type: ignore[no-redef]
+        """
+        Wrapper do /ask:
+        - Se estiver em quote_mode e houver itens resolvidos no estado, força resposta com URL em coluna.
+        - Não depende de pós-processamento de links.
+        """
+        res = await _orig_ask_fn(*args, **kwargs)
+
+        # Espera-se res como dict {"answer": "...", ...}
+        if not isinstance(res, dict):
+            return res
+
+        answer = res.get("answer") or ""
+        quote_id = res.get("quote_id") or None
+
+        # Se não parece um orçamento, não mexe
+        if "Orçamento:" not in answer:
+            return res
+
+        # tenta ir buscar itens ao estado persistente (se existir)
+        items = None
+        total = None
+        title = _hotfix__extract_title_from_answer(answer) or ""
+
         try:
-            row = catalog_db.fetchone(
-                "SELECT url_canonical, url FROM catalog_items WHERE ref = ? LIMIT 1",
-                (ref.strip(),),
-            )
-            if not row:
-                return None
-            url_canonical, url = row
-            return (url_canonical or url or None)
-        except Exception as e:
-            logger.warning(f"[hotfix-links-v4] erro ao obter url para ref={ref}: {e}")
-            return None
+            # Ajusta estes nomes se no teu projeto forem diferentes:
+            # - quote_store: objeto com get(quote_id) ou dict
+            # - state: contém items resolvidos
+            qs = globals().get("quote_store") or globals().get("QUOTE_STORE") or None
+            if qs and quote_id:
+                st = qs.get(quote_id) if hasattr(qs, "get") else qs.get(quote_id, None)
+                if st:
+                    items = st.get("items") or st.get("resolved_items") or st.get("quote_items")
+                    total = st.get("total") or st.get("total_eur") or st.get("grand_total")
+        except Exception:
+            pass
 
-    def _strip_ver_produto(title_line: str) -> str:
-        if not title_line:
-            return title_line
-        # remove "— ver produto" (com variações comuns)
-        return re.sub(r"\s*[—\-–]\s*ver produto\s*$", "", title_line.strip(), flags=re.IGNORECASE)
+        # fallback: tenta usar itens já presentes no payload do /ask
+        if items is None:
+            items = res.get("items") or res.get("quote_items") or res.get("resolved_items")
 
-    def _extract_items_from_answer(answer: str):
-        """
-        Extrai pares (nome, ref_sku_composto) a partir de linhas tipo:
-        | Lin Wood LIN0030 + LIN0110MA | 861.00€ | 1 | 861.00€ |
-        """
-        items = []
-        if not answer:
-            return items
+        # fallback: tenta total a partir do answer
+        if total is None:
+            total = _hotfix__extract_total_from_answer(answer)
 
-        lines = answer.splitlines()
-        for ln in lines:
-            s = ln.strip()
-            if not s.startswith("|"):
-                continue
-            # ignora header/separador
-            if "Item + SKU" in s or re.match(r"^\|\s*-+\s*\|", s):
-                continue
-
-            parts = [p.strip() for p in s.strip("|").split("|")]
-            if not parts:
-                continue
-
-            col0 = parts[0]  # "Nome REF..." (pode ter espaços)
-            # heurística: último "token" com dígitos/maiúsculas/+- é o "ref"
-            # Ex: "Lin Wood LIN0030 + LIN0110MA" -> ref_composto = "LIN0030 + LIN0110MA"
-            m = re.match(r"^(.*?)([A-Za-z0-9][A-Za-z0-9\-\+ ]+)$", col0)
-            if not m:
-                continue
-
-            name = m.group(1).strip()
-            ref_comp = m.group(2).strip()
-
-            # validação mínima: tem de conter pelo menos 1 alfanumérico e não pode ser só nome
-            if not ref_comp or len(ref_comp) < 3:
-                continue
-
-            items.append((name, ref_comp))
-
-        return items
-
-    def _make_links_block(items):
-        """
-        Cria bloco Markdown:
-        Ver produtos:
-        - Lin Wood: <url>
-        - Mono Cadeira: <url>
-        ...
-        """
-        if not items:
-            return ""
-
-        lines = ["\n\n**Ver produtos:**"]
-        for name, ref_comp in items:
-            # se ref composto: tenta primeiro cada ref em separado, senão tenta o composto
-            refs = [r.strip() for r in ref_comp.split("+")] if "+" in ref_comp else [ref_comp]
-            url = None
-            for r in refs:
-                u = _get_url_for_ref(r)
-                if u:
-                    url = u
-                    break
-            if not url:
-                # fallback: tenta o composto inteiro
-                url = _get_url_for_ref(ref_comp)
-
-            if url:
-                label = name if name else ref_comp
-                lines.append(f"- {label}: {url}")
-
-        # se nenhum url encontrado, não acrescenta nada
-        if len(lines) == 1:
-            return ""
-        return "\n".join(lines)
-
-    # --- middleware ---
-    @app.middleware("http")
-    async def _links_middleware_v4(request, call_next):
-        resp = await call_next(request)
-
-        try:
-            path = request.url.path
-            if path != "/ask":
-                return resp
-
-            # lê body bytes
-            body = b""
-            async for chunk in resp.body_iterator:
-                body += chunk
-
-            # headers originais
-            headers = dict(resp.headers)
-            ctype = headers.get("content-type", "") or ""
-            enc = (headers.get("content-encoding", "") or "").lower()
-
-            # só mexe em JSON
-            if "application/json" not in ctype.lower():
-                return Response(content=body, status_code=resp.status_code, headers=headers, media_type=resp.media_type)
-
-            # descomprime se necessário
-            if "gzip" in enc:
-                try:
-                    body = gzip.decompress(body)
-                except Exception as e:
-                    logger.warning(f"[hotfix-links-v4] gzip.decompress falhou: {e}")
-                    # devolve como estava
-                    return Response(content=body, status_code=resp.status_code, headers=headers, media_type=resp.media_type)
-
-            data = json.loads(body.decode("utf-8", errors="replace"))
-
-            answer = data.get("answer") or ""
-            if not isinstance(answer, str) or not answer.strip():
-                # devolve normal
-                headers.pop("content-length", None)
-                headers.pop("content-encoding", None)
-                return Response(
-                    content=json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                    status_code=resp.status_code,
-                    headers=headers,
-                    media_type="application/json",
-                )
-
-            # 1) remover "— ver produto" do título, se existir na 1ª linha
-            lines = answer.splitlines()
-            if lines:
-                lines[0] = _strip_ver_produto(lines[0])
-            answer2 = "\n".join(lines)
-
-            # 2) anexar links por item
-            items = _extract_items_from_answer(answer2)
-            links_block = _make_links_block(items)
-            if links_block:
-                answer2 = answer2 + links_block
-
-            data["answer"] = answer2
-
-            # 3) devolver SEM Content-Encoding/Length (evita mismatch)
-            headers.pop("content-length", None)
-            headers.pop("content-encoding", None)
-
-            logger.info(
-                f"[hotfix-links-v4] /ask patched: enc={enc or 'none'} items={len(items)} links={'yes' if bool(links_block) else 'no'}"
+        if isinstance(items, list) and items:
+            res["answer"] = _hotfix__render_quote_table_with_url(title=title, items=items, total=total)
+        else:
+            # Se não há items, pelo menos remove o "— ver produto" do título no answer atual
+            res["answer"] = re.sub(
+                r"(\bOrçamento:\s*[^\n]*?)\s*[—\-–]\s*ver produto\b",
+                r"\1",
+                answer,
+                flags=re.IGNORECASE,
             )
 
-            return Response(
-                content=json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                status_code=resp.status_code,
-                headers=headers,
-                media_type="application/json",
-            )
+        return res
 
-        except Exception as e:
-            logger.warning(f"[hotfix-links-v4] falhou (fallback sem alteração): {e}")
-            return resp
-
-    app.state._hotfix_links_v4_applied = True
-    logger.info("[hotfix-links-v4] ativo: links por item + gzip-safe + remove 'ver produto' + remove content-encoding/length")
+    try:
+        import logging
+        logging.getLogger("alma").info("[hotfix-quote-url-col] ativo: tabela de orçamento inclui coluna URL (server-side).")
+    except Exception:
+        pass
+else:
+    try:
+        import logging
+        logging.getLogger("alma").warning("[hotfix-quote-url-col] NÃO aplicado: não encontrei a função ask(). Ajusta _orig_ask_fn.")
+    except Exception:
+        pass
 
 
 
