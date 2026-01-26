@@ -5853,12 +5853,16 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 # =============================================================================
-# HOTFIX v3 — Links por item no orçamento (via catalog.db)
+# HOTFIX v3 — Links por item no orçamento (via catalog_items em /data/catalog.db)
 # Objetivo: substituir o único "ver produto" por vários links:
 # - ver Lin Wood
 # - ver Mono Cadeira
 # - ver Zeal Laser
-# NOTA: remove Content-Length para evitar crash do Uvicorn.
+#
+# Fixes:
+# 1) DB real: tabela catalog_items, colunas ref + url/url_canonical (não "catalog"/"sku")
+# 2) Suporta SKU composto: "LIN0030 + LIN0110MA" (tenta cada um)
+# 3) Middleware seguro: remove Content-Length/Encoding e não duplica se colado 2x
 # =============================================================================
 
 import json
@@ -5866,13 +5870,12 @@ import re
 import sqlite3
 from starlette.responses import Response
 
-def _extract_quote_lines(answer: str):
+_HOTFIX_LINKS_V3_APPLIED = globals().get("_HOTFIX_LINKS_V3_APPLIED", False)
+
+def _extract_quote_lines_v3(answer: str):
     """
-    Extrai (nome, sku) de linhas do tipo:
-      | Lin Wood LIN0030 + LIN0110MA | ...
-      | Mono Cadeira 100010 | ...
-      | Zeal Laser 740021316-2 | ...
-    Tolerante: apanha o "primeiro token SKU-like" na linha.
+    Extrai (nome, [skus...]) de linhas do orçamento.
+    Suporta SKUs compostos: "LIN0030 + LIN0110MA".
     """
     items = []
     if not answer:
@@ -5881,180 +5884,213 @@ def _extract_quote_lines(answer: str):
     for ln in answer.splitlines():
         if "|" not in ln:
             continue
-        # remove bordas
         raw = ln.strip()
         if not raw.startswith("|"):
             continue
+
         cols = [c.strip() for c in raw.strip("|").split("|")]
         if not cols:
             continue
 
         first = cols[0]
-        # ignora headers/separadores
-        if first.lower().startswith("item") or set(first) <= {"-", " "}:
+        if not first:
             continue
 
-        # tenta separar nome e SKU: procura algo com dígitos ou hífen no fim
-        # exemplos: "Lin Wood LIN0030 + LIN0110MA" / "Mono Cadeira 100010" / "Zeal Laser 740021316-2"
-        m = re.search(r"^(?P<name>.*?)(?P<sku>[A-Z0-9][A-Z0-9\-]{3,})\s*$", first)
-        if m:
-            name = m.group("name").strip(" -–—:()")
-            sku = m.group("sku").strip()
-            if name and sku:
-                items.append((name, sku))
-                continue
+        low = first.lower()
+        if low.startswith(("item", "nome", "sku")):
+            continue
+        if set(first) <= {"-", " "}:
+            continue
 
-        # fallback: SKU entre parêntesis (SKU:XXXX)
-        m = re.search(r"SKU[:\s]*([A-Z0-9][A-Z0-9\-]{3,})", first, flags=re.I)
-        if m:
-            sku = m.group(1).strip()
-            name = re.sub(r"\(.*?\)", "", first).strip(" -–—:()")
-            if name and sku:
-                items.append((name, sku))
+        # tokens SKU-like dentro da 1ª coluna
+        skus = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", first.upper())
+        if not skus:
+            continue
 
-    # dedupe preservando ordem
+        # nome = texto antes do 1º sku
+        idx = first.upper().find(skus[0])
+        name = first[:idx].strip(" -–—:()") if idx >= 0 else first.strip()
+
+        # se houver '+', preferimos split por '+' (ordem “humana”)
+        if "+" in first:
+            parts = [p.strip() for p in first.split("+")]
+            skus2 = []
+            for p in parts:
+                t = re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", p.upper())
+                if t:
+                    skus2.append(t[-1])
+            if skus2:
+                skus = skus2
+
+        # dedup mantendo ordem
+        seen = set()
+        skus_out = []
+        for s in skus:
+            if s not in seen:
+                seen.add(s)
+                skus_out.append(s)
+
+        if name and skus_out:
+            items.append((name, skus_out))
+
+    # dedupe por (name, tuple(skus))
     seen = set()
     out = []
-    for name, sku in items:
-        key = (name.lower(), sku)
-        if key in seen:
+    for name, skus in items:
+        k = (name.lower(), tuple(skus))
+        if k in seen:
             continue
-        seen.add(key)
-        out.append((name, sku))
+        seen.add(k)
+        out.append((name, skus))
     return out
 
 
-def _catalog_url_by_sku(db_path: str, sku: str):
+def _catalog_url_by_ref_v3(db_path: str, ref: str):
     """
-    Procura URL no catalog.db por SKU (variantes incluídas).
-    Ajusta o SQL se os teus nomes de coluna forem diferentes.
+    Procura URL no catálogo real:
+      - tabela: catalog_items
+      - colunas: ref, url, url_canonical, updated_at
     """
+    con = None
     try:
         con = sqlite3.connect(db_path)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
 
-        # Tenta campos comuns: sku, product_url, url, canonical_url, link
-        cur.execute("""
-            SELECT
-              COALESCE(product_url, url, canonical_url, link) AS u
-            FROM catalog
-            WHERE sku = ?
-            LIMIT 1
-        """, (sku,))
-        row = cur.fetchone()
+        # 1) match direto por ref
+        row = cur.execute("""
+            SELECT COALESCE(url_canonical, url) AS u
+              FROM catalog_items
+             WHERE ref = ?
+             ORDER BY updated_at DESC
+             LIMIT 1
+        """, (ref,)).fetchone()
+
         if row and row["u"]:
             return row["u"]
 
-        # fallback: algumas DBs guardam variantes com "variant_sku" ou "ref"
-        cur.execute("""
-            SELECT
-              COALESCE(product_url, url, canonical_url, link) AS u
-            FROM catalog
-            WHERE variant_sku = ?
-            LIMIT 1
-        """, (sku,))
-        row = cur.fetchone()
-        if row and row["u"]:
-            return row["u"]
+        # 2) fallback: normalização leve (se ref vier com ruído)
+        def norm(x: str) -> str:
+            return re.sub(r"[^A-Z0-9._\-]", "", (x or "").upper())
+
+        ref_n = norm(ref)
+        rows = cur.execute("""
+            SELECT ref, COALESCE(url_canonical, url) AS u
+              FROM catalog_items
+             WHERE ref IS NOT NULL AND ref != ''
+             LIMIT 5000
+        """).fetchall()
+
+        for r in rows:
+            if norm(r["ref"]) == ref_n and r["u"]:
+                return r["u"]
 
         return None
     except Exception:
         return None
     finally:
         try:
-            con.close()
+            if con:
+                con.close()
         except Exception:
             pass
 
 
-def _inject_item_links(answer: str, db_path: str = "/data/catalog.db"):
+def _inject_item_links_v3(answer: str, db_path: str = "/data/catalog.db"):
     """
     Remove/ignora o "— ver produto" único e injeta uma secção de links por item.
     """
     if not answer:
         return answer
 
-    items = _extract_quote_lines(answer)
+    items = _extract_quote_lines_v3(answer)
     if not items:
         return answer
 
     links = []
-    for name, sku in items:
-        url = _catalog_url_by_sku(db_path, sku)
+    for name, skus in items:
+        url = None
+        for sku in (skus or []):
+            url = _catalog_url_by_ref_v3(db_path, sku)
+            if url:
+                break
+
         if url:
-            # texto distinto por item => o frontend não colapsa num link único
             links.append(f"- [ver {name}]({url})")
         else:
-            # se não houver URL, não inventa
             links.append(f"- ver {name} (sem link)")
 
     links_block = "Links dos itens:\n" + "\n".join(links)
 
-    # 1) remove o "— ver produto" do título, se existir
+    # remove "— ver produto" do título, se existir (tolerante)
     out_lines = []
     for ln in answer.splitlines():
-        out_lines.append(re.sub(r"\s*[–—-]\s*\[?ver produto\]?(?:\([^)]+\))?\s*$", "", ln, flags=re.I))
+        out_lines.append(
+            re.sub(r"\s*[–—-]\s*\[?ver produto\]?(?:\([^)]+\))?\s*$", "", ln, flags=re.I)
+        )
     out = "\n".join(out_lines).strip()
 
-    # 2) injeta no fim (ou logo após o total, se preferires)
+    # injeta no fim
     out = out + "\n\n" + links_block
     return out
 
 
-@app.middleware("http")
-async def _hotfix_links_middleware_v3(request, call_next):
-    response = await call_next(request)
+# --- middleware (não duplica se já aplicado) ---
+if not _HOTFIX_LINKS_V3_APPLIED:
 
-    if request.url.path != "/ask":
-        return response
+    @app.middleware("http")
+    async def _hotfix_links_middleware_v3(request, call_next):
+        response = await call_next(request)
 
-    try:
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk
+        if request.url.path != "/ask":
+            return response
 
-        headers = dict(response.headers)
-        # CRÍTICO: remove Content-Length / Encoding para o Starlette recalcular
-        headers.pop("content-length", None)
-        headers.pop("Content-Length", None)
-        headers.pop("content-encoding", None)
-        headers.pop("Content-Encoding", None)
-
-        media_type = (response.headers.get("content-type") or "").lower()
-
-        if "application/json" in media_type:
-            data = json.loads(body.decode("utf-8", errors="ignore"))
-            if isinstance(data, dict) and isinstance(data.get("answer"), str):
-                data["answer"] = _inject_item_links(data["answer"], db_path="/data/catalog.db")
-                new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                return Response(
-                    content=new_body,
-                    status_code=response.status_code,
-                    headers=headers,
-                    media_type="application/json",
-                )
-
-        # fallback: devolve igual (sem content-length fixo)
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=headers,
-            media_type=(response.headers.get("content-type") or "").split(";")[0].strip() or None,
-        )
-
-    except Exception as e:
         try:
-            log.warning(f"[hotfix-links-v3] middleware falhou: {e}")
-        except Exception:
-            pass
-        return response
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
 
+            headers = dict(response.headers)
+            # CRÍTICO: remove Content-Length/Encoding para o Starlette recalcular
+            headers.pop("content-length", None)
+            headers.pop("Content-Length", None)
+            headers.pop("content-encoding", None)
+            headers.pop("Content-Encoding", None)
 
-try:
-    log.info("[hotfix-links-v3] ativo: gera links por item (via catalog.db) e remove Content-Length")
-except Exception:
-    pass
+            media_type = (response.headers.get("content-type") or "").lower()
+
+            if "application/json" in media_type:
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+                if isinstance(data, dict) and isinstance(data.get("answer"), str):
+                    data["answer"] = _inject_item_links_v3(data["answer"], db_path="/data/catalog.db")
+                    new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    return Response(
+                        content=new_body,
+                        status_code=response.status_code,
+                        headers=headers,
+                        media_type="application/json",
+                    )
+
+            # fallback: devolve igual (sem Content-Length fixo)
+            return Response(
+                content=body,
+                status_code=response.status_code,
+                headers=headers,
+                media_type=(response.headers.get("content-type") or "").split(";")[0].strip() or None,
+            )
+
+        except Exception as e:
+            try:
+                log.warning(f"[hotfix-links-v3] middleware falhou: {e}")
+            except Exception:
+                pass
+            return response
+
+    globals()["_HOTFIX_LINKS_V3_APPLIED"] = True
+    try:
+        log.info("[hotfix-links-v3] ativo: links por item via catalog_items(ref->url/url_canonical) + SKU composto + remove Content-Length")
+    except Exception:
+        pass
 
 # =============================================================================
 # FIM HOTFIX v3
