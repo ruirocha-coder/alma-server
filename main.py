@@ -5854,44 +5854,31 @@ except Exception:
 # =============================================================================
 
 # =============================================================================
-# HOTFIX — link único por item: "ver <nome do produto>"
+# HOTFIX — Middleware para "ver <nome>" em vez de "ver produto"
+# (Funciona mesmo quando o handler /ask já foi registado no FastAPI router.)
 # =============================================================================
 
+import json
 import re
-
-try:
-    _ask_prev = ask  # função original
-except Exception:
-    _ask_prev = None
-
+from starlette.responses import Response
 
 def _rewrite_ver_produto_with_name(text: str) -> str:
     """
-    Substitui:
-        ver produto
-    por:
-        ver <nome do item>
-
-    Exemplo:
-        | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ |
-        ver produto
-
-    passa a:
-        ver Lin Wood
+    Percorre linhas do answer e substitui "ver produto" por "ver <último item detetado>".
+    Deteta item a partir de linhas tipo tabela:
+      | Lin Wood (LIN0030 + LIN0110MA) | 861.00€ | ...
     """
-
     if not text:
         return text
 
     lines = text.splitlines()
     out = []
-
     last_item_name = None
 
     for ln in lines:
-        # tenta capturar nome do item da linha da tabela
-        # | Lin Wood (SKU...) | 861.00€ |
-        m = re.search(r"\|\s*([^|]+?)\s*(?:\(|\|)", ln)
+        # tenta apanhar o nome do item na coluna "Nome + SKU" ou "Item"
+        # padrão: | <nome ...> ( ... ) |  ou  | <nome ...> | ...
+        m = re.search(r"^\s*\|\s*([^|]+?)\s*(?:\(|\|)", ln)
         if m:
             last_item_name = m.group(1).strip()
 
@@ -5899,32 +5886,80 @@ def _rewrite_ver_produto_with_name(text: str) -> str:
             if last_item_name:
                 out.append(f"ver {last_item_name}")
             else:
-                out.append("ver produto")
+                out.append(ln)  # fallback: mantém
         else:
             out.append(ln)
 
     return "\n".join(out)
 
 
-# patch do endpoint principal
-if _ask_prev is not None:
-    async def ask(*args, **kwargs):  # type: ignore
-        resp = await _ask_prev(*args, **kwargs)
-        try:
-            if isinstance(resp, dict) and "answer" in resp:
-                resp["answer"] = _rewrite_ver_produto_with_name(resp["answer"])
-            return resp
-        except Exception:
-            return resp
+@app.middleware("http")
+async def _hotfix_links_middleware(request, call_next):
+    response = await call_next(request)
+
+    # Só mexe no /ask (para não arriscar outras rotas)
+    if request.url.path != "/ask":
+        return response
 
     try:
-        log.info("[hotfix-links] ativo: ver <nome do produto>")
-    except Exception:
-        pass
+        # Lê o corpo inteiro
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        # Recria headers/mediatype
+        headers = dict(response.headers)
+        media_type = headers.get("content-type", "")
+
+        # Caso típico: JSON {"answer": "..."}
+        if "application/json" in media_type.lower():
+            data = json.loads(body.decode("utf-8", errors="ignore"))
+            if isinstance(data, dict) and isinstance(data.get("answer"), str):
+                data["answer"] = _rewrite_ver_produto_with_name(data["answer"])
+                new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                return Response(
+                    content=new_body,
+                    status_code=response.status_code,
+                    headers=headers,
+                    media_type="application/json",
+                )
+
+        # Fallback: se for texto
+        if "text/" in media_type.lower():
+            txt = body.decode("utf-8", errors="ignore")
+            txt2 = _rewrite_ver_produto_with_name(txt)
+            return Response(
+                content=txt2.encode("utf-8"),
+                status_code=response.status_code,
+                headers=headers,
+                media_type=media_type.split(";")[0].strip() or "text/plain",
+            )
+
+        # Se não for JSON/texto, devolve como estava
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=media_type.split(";")[0].strip() if media_type else None,
+        )
+
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-links] middleware falhou: {e}")
+        except Exception:
+            pass
+        return response
+
+
+try:
+    log.info("[hotfix-links] ativo: middleware /ask reescreve 'ver produto' -> 'ver <nome>'")
+except Exception:
+    pass
 
 # =============================================================================
 # FIM HOTFIX
 # =============================================================================
+
 
 
 # ---------------------------------------------------------------------------------------
