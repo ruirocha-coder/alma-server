@@ -5852,215 +5852,300 @@ except Exception:
 # =============================================================================
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
-# =========================
-# HOTFIX (FINAL): remove "— ver produto" + tabela com coluna URL
-# (atua no build_messages real, que é onde o teu pipeline monta a resposta)
-# Cole NO FIM do main.py
-# =========================
+# =============================================================================
+# HOTFIX FINAL — Links de orçamento 100% por DB (url_canonical) + patch no /ask
+# Objetivo:
+# - Quando a resposta é um orçamento com VÁRIOS itens, acrescentar no fim uma lista
+#   "Links dos itens" (1 link por SKU) usando APENAS o catálogo SQLite:
+#     catalog_items.url_canonical (fallback: url)
+# - Não depende de RAG nem de LLM “acertar links”
+# - Resolve o teu bug: “só aparece 1 ver produto no topo”
+#
+# Colar NO FIM do main.py (mesmo no fim)
+# =============================================================================
+
 import re
+import sqlite3
+from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
 
-def _hf_url_from_ref(catalog_db, ref: str) -> str | None:
-    if not catalog_db or not ref:
+# ---------- Helpers DB ----------
+def _hf_catalog_conn_any() -> sqlite3.Connection:
+    """
+    Tenta usar _catalog_conn() (se existir e já estiver hotfixed),
+    senão abre via CATALOG_DB_PATH.
+    """
+    try:
+        if "_catalog_conn" in globals() and callable(globals()["_catalog_conn"]):
+            return globals()["_catalog_conn"]()
+    except Exception:
+        pass
+
+    path = globals().get("CATALOG_DB_PATH") or "/data/catalog.db"
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    return con
+
+def _hf_db_url_for_ref(namespace: str, ref: str) -> Optional[str]:
+    ns = (namespace or globals().get("DEFAULT_NAMESPACE") or "default").strip()
+    r  = (ref or "").strip()
+    if not r:
         return None
-    ref = ref.strip()
+    try:
+        with _hf_catalog_conn_any() as c:
+            row = c.execute(
+                """
+                SELECT url_canonical, url
+                  FROM catalog_items
+                 WHERE namespace=? AND ref=?
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                """,
+                (ns, r),
+            ).fetchone()
+            if not row:
+                return None
+            u = (row["url_canonical"] or row["url"] or "").strip()
+            return u or None
+    except Exception:
+        return None
+
+def _hf_db_url_for_ref_composto(namespace: str, ref: str) -> Optional[str]:
+    """
+    Suporta refs do tipo: "LIN0030 + LIN0110MA"
+    -> devolve o primeiro URL canónico que existir.
+    """
     if not ref:
         return None
-    row = catalog_db.fetchone(
-        "SELECT url_canonical, url FROM catalog_items WHERE ref = ? LIMIT 1",
-        (ref,),
-    )
-    if not row:
-        return None
-    url_canonical, url = row
-    return (url_canonical or url or None)
-
-def _hf_url_from_ref_composto(catalog_db, ref: str) -> str | None:
-    if not ref:
-        return None
-    ref = ref.strip()
     if "+" in ref:
-        for part in [p.strip() for p in ref.split("+") if p.strip()]:
-            u = _hf_url_from_ref(catalog_db, part)
+        parts = [p.strip() for p in ref.split("+") if p.strip()]
+        for p in parts:
+            u = _hf_db_url_for_ref(namespace, p)
             if u:
                 return u
         return None
-    return _hf_url_from_ref(catalog_db, ref)
+    return _hf_db_url_for_ref(namespace, ref)
 
-def _hf_strip_ver_produto(text: str) -> str:
+# ---------- Helpers parsing ----------
+_MD_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
+def _hf_is_budget_answer(text: str) -> bool:
+    if not text:
+        return False
+    # mínimo e robusto
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", text, flags=re.I))
+
+def _hf_strip_top_ver_produto(text: str) -> str:
+    """
+    Remove o sufixo “— [ver produto](...)” no topo/título (quando existe),
+    sem tocar na tabela.
+    """
     if not text:
         return text
-    # remove no título do orçamento
-    text = re.sub(r"(\bOrçamento:\s*[^\n]*?)\s*[—\-–]\s*ver produto\b", r"\1", text, flags=re.IGNORECASE)
-    # remove qualquer "— ver produto" solto (defensivo)
-    text = re.sub(r"\s*[—\-–]\s*ver produto\b", "", text, flags=re.IGNORECASE)
+    # remove no título "Orçamento: ... — [ver produto](...)"
+    text = re.sub(
+        r"(\bOrçamento\s*:\s*[^\n]*?)\s*[—\-–]\s*\[?\s*ver\s+produto\s*\]?\([^)]+\)",
+        r"\1",
+        text,
+        flags=re.I,
+    )
+    # remove “— ver produto” sem link (defensivo)
+    text = re.sub(r"\s*[—\-–]\s*ver\s+produto\b", "", text, flags=re.I)
     return text
 
-def _hf_parse_quote_table(answer: str) -> list[dict]:
+def _hf_extract_refs_from_budget_table(answer: str) -> List[str]:
     """
-    Tenta extrair itens a partir da tabela que já vem no answer do modelo.
-    Aceita linhas tipo:
-    | Lin Wood LIN0030 + LIN0110MA | 861.00€ | 1 | 861.00€ |
-    | Mono Cadeira 100010 | 539.00€ | 2 | 1.078.00€ |
+    Extrai refs/SKUs de uma tabela markdown típica do orçamento:
+      | Item (… SKU …) | Preço | Qtd | Subtotal |
+    Heurística: apanhar token final alfanumérico (ou composto com +) no fim do label.
     """
     if not answer:
         return []
-
-    lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
-    items = []
-    for ln in lines:
+    refs: List[str] = []
+    for ln in answer.splitlines():
+        ln = ln.strip()
         if not (ln.startswith("|") and ln.endswith("|")):
             continue
         # ignora header/separadores
-        if "Preço unitário" in ln or "Quantidade" in ln or set(ln.replace("|", "").strip()) <= set("-:"):
+        if "Preço unitário" in ln or "Quantidade" in ln or set(ln.replace("|","").strip()) <= set("-:"):
             continue
-
         cols = [c.strip() for c in ln.strip("|").split("|")]
-        if len(cols) < 4:
+        if len(cols) < 2:
             continue
-
         label = cols[0]
-        unit = cols[1]
-        qty = cols[2]
-        sub = cols[3]
 
-        # extrai refs do fim do label (heurística)
-        # ex: "Lin Wood LIN0030 + LIN0110MA" => ref="LIN0030 + LIN0110MA"
-        # ex: "Mono Cadeira 100010" => ref="100010"
-        ref = ""
-        m = re.search(r"([A-Z]{2,}\d+(?:\s*\+\s*[A-Z]{2,}\d+)*|\d{4,}(?:-\d+)?)\s*$", label)
+        # exemplo: "Lin Wood LIN0030 + LIN0110MA" -> ref = "LIN0030 + LIN0110MA"
+        m = re.search(r"([A-Z0-9][A-Z0-9._\-]{2,}(?:\s*\+\s*[A-Z0-9][A-Z0-9._\-]{2,})*)\s*$", label, flags=re.I)
         if m:
-            ref = m.group(1).strip()
+            refs.append(m.group(1).strip())
 
-        def _to_float_eur(s: str) -> float:
-            s = (s or "").strip()
-            s = s.replace("€", "").replace(" ", "")
-            # 1.078.00 -> remove milhares
-            s = s.replace(".", "").replace(",", ".")
-            try:
-                return float(s)
-            except Exception:
-                return 0.0
+    # dedup mantendo ordem
+    seen = set()
+    out: List[str] = []
+    for r in refs:
+        rr = r.strip()
+        if rr and rr not in seen:
+            seen.add(rr)
+            out.append(rr)
+    return out
 
-        def _to_int(s: str) -> int:
-            s = (s or "").strip()
-            s = re.sub(r"[^\d]", "", s)
-            try:
-                return int(s) if s else 0
-            except Exception:
-                return 0
-
-        items.append({
-            "label": label,
-            "ref": ref,
-            "unit_price": _to_float_eur(unit),
-            "qty": _to_int(qty),
-            "subtotal": _to_float_eur(sub),
-        })
-
-    return items
-
-def _hf_extract_total(answer: str) -> float | None:
+def _hf_extract_refs_from_answer_generic(answer: str) -> List[str]:
+    """
+    Fallback: procura padrões tipo:
+      (SKU: XXX + YYY)
+      SKU: XXX
+    """
     if not answer:
-        return None
-    m = re.search(r"Total:\s*([0-9\.\,]+)\s*€", answer, flags=re.IGNORECASE)
-    if not m:
-        return None
-    s = m.group(1).strip().replace(".", "").replace(",", ".")
+        return []
+    refs: List[str] = []
+
+    for m in re.finditer(r"\(\s*SKU\s*:\s*([^)]+)\)", answer, flags=re.I):
+        chunk = m.group(1).strip()
+        parts = re.split(r"\s*(?:\+|,|/|;)\s*", chunk)
+        # se houver +, voltamos a compor com " + " para ficar igual ao label (opcional)
+        if "+" in chunk:
+            # mantém composto
+            parts2 = [p.strip() for p in chunk.split("+") if p.strip()]
+            if parts2:
+                refs.append(" + ".join(parts2))
+        else:
+            for p in parts:
+                p = p.strip()
+                if p and re.match(r"^[A-Z0-9][A-Z0-9._\-]{2,}$", p, flags=re.I):
+                    refs.append(p)
+
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", answer, flags=re.I):
+        refs.append(m.group(1).strip())
+
+    # dedup
+    seen = set()
+    out: List[str] = []
+    for r in refs:
+        rr = r.strip()
+        if rr and rr not in seen:
+            seen.add(rr)
+            out.append(rr)
+    return out
+
+def _hf_has_links_list_block(answer: str) -> bool:
+    return "Links dos itens" in (answer or "")
+
+def _append_budget_links_from_db(answer: str, namespace: str) -> str:
+    """
+    Regra:
+    - Se for orçamento e tiver >= 2 refs -> acrescenta lista no fim
+    - Se tiver 1 ref -> não força lista (pode já existir link na tabela; mas também podes querer 1)
+    - Sempre por DB (url_canonical/url). Nada de RAG.
+    """
+    if not answer:
+        return answer
+    if not _hf_is_budget_answer(answer):
+        return answer
+    if _hf_has_links_list_block(answer):
+        return answer
+
+    ans = _hf_strip_top_ver_produto(answer)
+
+    refs = _hf_extract_refs_from_budget_table(ans)
+    if len(refs) < 2:
+        # fallback: às vezes não há tabela (ou o LLM respondeu diferente)
+        refs = _hf_extract_refs_from_answer_generic(ans)
+
+    # Se ainda for <2, não mexe (mantém comportamento atual)
+    if len(refs) < 2:
+        return ans
+
+    # resolve URLs por DB
+    pairs = []
+    seen_url = set()
+    for ref in refs[:40]:
+        url = _hf_db_url_for_ref_composto(namespace, ref)
+        if not url:
+            continue
+        key = (ref.lower(), url.lower())
+        if key in seen_url:
+            continue
+        seen_url.add(key)
+        pairs.append((ref, url))
+
+    if not pairs:
+        return ans
+
+    # monta bloco final
+    lines = []
+    lines.append("")
+    lines.append("Links dos itens (catálogo interno):")
+    for ref, url in pairs:
+        # markdown simples
+        lines.append(f"- SKU {ref} — {url}")
+
+    return (ans.rstrip() + "\n" + "\n".join(lines)).strip()
+
+# ---------- Patch do endpoint /ask (sem criar rota nova) ----------
+def _hf_patch_ask_to_append_db_links():
     try:
-        return float(s)
-    except Exception:
-        return None
+        app_obj = globals().get("app")
+        if not app_obj:
+            return False
 
-def _hf_render_quote_with_url(answer: str, items: list[dict]) -> str:
-    # tenta extrair título “Orçamento: …”
-    title = ""
-    m = re.search(r"Orçamento:\s*(.+)", answer, flags=re.IGNORECASE)
-    if m:
-        title = m.group(1).split("\n", 1)[0].strip("* ").strip()
-    title = _hf_strip_ver_produto(title)
+        route = None
+        for r in getattr(app_obj, "routes", []):
+            if getattr(r, "path", None) == "/ask" and "POST" in getattr(r, "methods", set()):
+                route = r
+                break
+        if not route or not callable(getattr(route, "endpoint", None)):
+            return False
 
-    total = _hf_extract_total(answer)
+        prev = route.endpoint
 
-    out = []
-    out.append(f"**Orçamento: {title}**" if title else "**Orçamento**")
-    out.append("")
-    out.append("| Item + SKU | URL | Preço unitário (IVA incluído) | Quantidade | Subtotal |")
-    out.append("|---|---|---:|---:|---:|")
+        async def _ask_wrapped(*args: Any, **kwargs: Any):
+            resp = await prev(*args, **kwargs)
 
-    # precisa do catalog_db do app.state
-    catalog_db = None
-    try:
-        catalog_db = app.state.catalog_db  # type: ignore[name-defined]
-    except Exception:
-        catalog_db = None
+            try:
+                if not isinstance(resp, dict):
+                    return resp
 
-    for it in items:
-        label = it.get("label", "")
-        ref = it.get("ref", "")
-        unit_price = float(it.get("unit_price") or 0)
-        qty = int(it.get("qty") or 0)
-        subtotal = float(it.get("subtotal") or (unit_price * qty))
+                answer = resp.get("answer") or resp.get("response") or ""
+                if not answer:
+                    return resp
 
-        url = _hf_url_from_ref_composto(catalog_db, ref) if (catalog_db and ref) else None
-        out.append(f"| {label} | {url or ''} | {unit_price:,.2f}€ | {qty} | {subtotal:,.2f}€ |")
+                # obter namespace da request (tenta args[0], kwargs, etc.)
+                ns = None
 
-    if total is not None:
-        out.append("")
-        out.append(f"**Total: {float(total):,.2f}€**")
-        out.append("Preço com IVA incluído; portes não incluídos.")
+                req_obj = None
+                if args:
+                    req_obj = args[0]
+                if req_obj is None:
+                    for v in kwargs.values():
+                        if hasattr(v, "namespace") and hasattr(v, "question"):
+                            req_obj = v
+                            break
 
-    return "\n".join(out)
+                if req_obj is not None:
+                    ns = getattr(req_obj, "namespace", None)
 
-# ---- Hook no build_messages REAL (o teu pipeline usa isto) ----
-_orig_build_messages = globals().get("build_messages")
+                ns = (ns or globals().get("DEFAULT_NAMESPACE") or "default").strip()
 
-if callable(_orig_build_messages):
-    def build_messages(*args, **kwargs):  # type: ignore[no-redef]
-        res = _orig_build_messages(*args, **kwargs)
+                # aplica hotfix
+                new_answer = _append_budget_links_from_db(answer, ns)
+                resp["answer"] = new_answer
+                return resp
+            except Exception:
+                return resp
 
-        # O teu build_messages pode devolver:
-        # - list de messages (dicts com role/content)
-        # - dict com "messages"
-        # Vamos tratar ambos.
-
-        def _process_text(s: str) -> str:
-            if not s or "Orçamento:" not in s:
-                return s
-            s2 = _hf_strip_ver_produto(s)
-            items = _hf_parse_quote_table(s2)
-            if items:
-                return _hf_render_quote_with_url(s2, items)
-            return s2
-
+        route.endpoint = _ask_wrapped
         try:
-            if isinstance(res, list):
-                for msg in res:
-                    if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                        msg["content"] = _process_text(msg["content"])
-                return res
-
-            if isinstance(res, dict) and isinstance(res.get("messages"), list):
-                for msg in res["messages"]:
-                    if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                        msg["content"] = _process_text(msg["content"])
-                return res
-
+            globals().get("log").info("[hotfix-db-links] /ask wrapped: lista de links por DB em orçamentos multi-itens.")
         except Exception:
             pass
-
-        return res
-
-    try:
-        import logging
-        logging.getLogger("alma").info("[hotfix-quote-url-v2] ativo: build_messages -> remove 'ver produto' + coluna URL no orçamento.")
+        return True
     except Exception:
-        pass
-else:
-    try:
-        import logging
-        logging.getLogger("alma").warning("[hotfix-quote-url-v2] NÃO aplicado: build_messages não encontrado/callable.")
-    except Exception:
-        pass
+        return False
+
+_hf_patch_ask_to_append_db_links()
+
+# =============================================================================
+# FIM HOTFIX FINAL — Links de orçamento por DB
+# =============================================================================
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
