@@ -5967,195 +5967,227 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 # FIM HOTFIX FINAL
 # =============================================================================
+
 # =============================================================================
-# HOTFIX: Apêndice de links de produtos em respostas de orçamento
+# HOTFIX FINAL DEFINITIVO (robusto)
+# - Garante "Links dos produtos" SEMPRE no fim em respostas de orçamento
+# - NÃO depende do texto do LLM para extrair SKUs
+# - NÃO depende de wraps de rota (funciona com múltiplas /ask)
+# - Usa quotes.db (quote aberto por user_id + namespace)
 # =============================================================================
 
-# Função auxiliar: verifica se uma dada resposta parece ser um orçamento (pela presença de palavras-chave)
-def _looks_like_budget_answer(text: str) -> bool:
-    """
-    Heurística simples para identificar respostas de orçamento.
-    Verifica se contém a palavra 'Orçamento' (ou 'orcamento') indicando resposta de orçamento.
-    """
-    t = text or ""
-    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
+import json
+import re
+from typing import Any, Dict, List, Tuple, Optional
 
-# Função auxiliar: extrai referências (SKUs) de produtos mencionados no texto de um orçamento
-def _extract_all_skus_from_budget_text(text: str) -> List[str]:
-    """
-    Extrai todas as referências (códigos SKU) presentes no texto do orçamento.
-    Suporta formatos como:
-      - Listagem após 'SKU:' (ex: SKU: PROD001, PROD002 + PROD003)
-      - Códigos numéricos entre parênteses (ex: (12345))
-    Retorna uma lista de SKUs encontrados, na ordem em que aparecem no texto, sem duplicatas.
-    """
-    t = text or ""
-    if not t:
-        return []
-    candidates: List[Tuple[int, str, str]] = []
-    # Encontrar todos os segmentos 'SKU: ...' e guardar posição e conteúdo
-    for m in re.finditer(r"\bSKU:?\s*([A-Z0-9_-]+(?:(?:\s*[\+,]\s*)(?:[A-Z0-9_-]+))*)", t, flags=re.I):
-        sku_block = m.group(1) or ""
-        candidates.append((m.start(), 'sku', sku_block))
-    # Encontrar todos os códigos numéricos (5+ dígitos) entre parênteses e guardar posição e conteúdo
-    for m in re.finditer(r"\((\d{5,})\)", t):
-        num_code = m.group(1) or ""
-        candidates.append((m.start(), 'num', num_code))
-    # Ordenar todos os achados pela posição em que aparecem no texto
-    candidates.sort(key=lambda x: x[0])
-    sku_list: List[str] = []
-    seen_codes: Set[str] = set()
-    # Iterar em ordem e extrair códigos individuais, evitando duplicatas
-    for _, code_type, content in candidates:
-        if code_type == 'sku':
-            # Pode conter múltiplos códigos separados por '+' ou ',' no mesmo segmento
-            for code in re.split(r"\s*[\+,]\s*", content):
-                code = code.strip()
-                if code and code not in seen_codes:
-                    seen_codes.add(code)
-                    sku_list.append(code)
-        elif code_type == 'num':
-            code = content.strip()
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                sku_list.append(code)
-    return sku_list
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
-# Função principal do hotfix: anexa os links dos produtos ao final da resposta de orçamento
-def _append_links_block_from_catalog(answer: str, namespace: str) -> str:
-    """
-    Se a resposta for de um orçamento, insere ao final um bloco com os links dos produtos referenciados.
-    Formato do bloco inserido:
-    Links dos produtos:
-    - Nome do Produto — SKU
-      https://link-do-produto
-    """
+def _hf_is_budget_intent(question: str, answer: str) -> bool:
+    q = (question or "").strip().lower()
+    a = (answer or "").strip().lower()
+    # Heurística simples e prática: orçamento/quote/preço
+    return (
+        ("orçament" in q) or ("orcament" in q) or ("cotação" in q) or ("cotacao" in q) or ("proforma" in q) or ("preço" in q) or ("preco" in q)
+        or ("orçament" in a) or ("orcament" in a)
+    )
+
+def _hf_append_links_from_open_quote(answer: str, user_id: str, namespace: str) -> str:
     if not answer:
         return answer
-    # Evita duplicar se o bloco de links já foi adicionado previamente
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I|re.M):
-        return answer
-    # Verifica se o conteúdo se parece com um orçamento; se não, não insere nada
-    if not _looks_like_budget_answer(answer):
+
+    # evita duplicação
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
         return answer
 
     ns = (namespace or DEFAULT_NAMESPACE).strip()
-    # Extrai todos os SKUs mencionados no texto do orçamento
-    refs = _extract_all_skus_from_budget_text(answer)
-    if not refs:
+    uid = (user_id or "anon").strip() or "anon"
+
+    # Só tenta se houver quote aberto; NÃO criar quotes vazios aqui
+    try:
+        qid = _quote_has_open(uid, ns)
+    except Exception:
+        qid = None
+
+    if not qid:
+        return answer
+
+    try:
+        items = _quote_list_items(qid) or []
+    except Exception:
+        items = []
+
+    if not items:
         return answer
 
     links: List[Tuple[str, str]] = []
     seen = set()
-    for ref in refs:
-        try:
-            # Tenta obter dados do produto pelo ref/SKU a partir do catálogo interno
-            cat = _catalog_get_by_ref(ns, ref) if ref else None
-        except Exception:
-            cat = None
-        if not cat:
-            continue
-        # Obtém URL e nome do produto do catálogo (preferencialmente URL canônica)
-        url = (cat.get("url_canonical") or cat.get("url") or "").strip()
-        name = (cat.get("name") or "").strip()
+
+    for it in items:
+        ref = (it.get("ref") or "").strip()
+        name = (it.get("name_snapshot") or "").strip()
+        url = (it.get("url_snapshot") or "").strip()
+
+        # fallback catálogo (se o quote tiver ref mas não tiver url_snapshot)
+        if (not url) and ref:
+            try:
+                cat = _catalog_get_by_ref(ns, ref)
+                if cat:
+                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                    if not name:
+                        name = (cat.get("name") or "").strip()
+            except Exception:
+                pass
+
         if not url:
             continue
-        # Normaliza URL para formato padrão (por ex., se for link interno da plataforma)
+
         try:
             url = _canon_ig_url(url)
         except Exception:
             pass
-        # Prepara rótulo no formato "Nome — REF"
-        label = name or ref
-        if ref and ref not in label:
+
+        label = name or ref or "Produto"
+        if ref and (ref not in label):
             label = f"{label} — {ref}"
-        # Evita adicionar links duplicados (mesmo rótulo e URL já utilizados)
+
         key = (label.lower(), url.lower())
         if key in seen:
             continue
         seen.add(key)
         links.append((label, url))
+
+    # Se não encontrou URLs, não inventa bloco
     if not links:
         return answer
 
-    # Monta o bloco de links a anexar no final da resposta
-    block_lines = ["", "Links dos produtos:"]
-    # Limita a no máximo 20 produtos listados para evitar excesso de comprimento
-    for label, url in links[:20]:
-        block_lines.append(f"- {label}")
-        block_lines.append(f"  {url}")
-    # Retorna a resposta original seguida do bloco de links dos produtos
-    return answer.rstrip() + "\n" + "\n".join(block_lines)
+    block = ["", "Links dos produtos:"]
+    for label, url in links[:30]:
+        block.append(f"- {label}")
+        block.append(f"  {url}")
 
-# Envolve a rota principal de resposta (/ask) para inserir os links de produtos automaticamente
-def _hotfix_wrap_ask_append_budget_links():
-    """
-    Hotfix: Envolver a rota /ask (POST) para adicionar automaticamente o bloco "Links dos produtos"
-    ao final da resposta, quando a resposta gerar um orçamento com produtos referenciados.
-    """
+    return answer.rstrip() + "\n" + "\n".join(block)
+
+class _HotfixAskLinksMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Só intercepta POST /ask
+        if request.method != "POST" or request.url.path != "/ask":
+            return await call_next(request)
+
+        # Ler body (e repor para o endpoint ler também)
+        body_bytes = await request.body()
+        async def _receive():
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        request._receive = _receive  # noqa: SLF001 (hotfix intencional)
+
+        # Parse request json (para user_id/namespace/question)
+        user_id = "anon"
+        namespace = None
+        question = ""
+        try:
+            data = json.loads(body_bytes.decode("utf-8") or "{}") if body_bytes else {}
+            if isinstance(data, dict):
+                user_id = (data.get("user_id") or "").strip() or "anon"
+                namespace = (data.get("namespace") or "").strip() or None
+                question = (data.get("question") or "").strip()
+        except Exception:
+            pass
+
+        # Chama o endpoint
+        response = await call_next(request)
+
+        # Só mexe em JSON
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            return response
+
+        # Ler corpo da response (StreamingResponse-safe)
+        try:
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+            resp_body = b"".join(chunks)
+        except Exception:
+            return response
+
+        try:
+            payload = json.loads(resp_body.decode("utf-8") or "{}")
+        except Exception:
+            # repõe resposta original
+            return Response(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        if not isinstance(payload, dict):
+            return Response(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        # Extrair texto da resposta
+        answer = payload.get("answer") or payload.get("response") or ""
+        if not isinstance(answer, str) or not answer.strip():
+            return Response(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        # Só aplica em contexto de orçamento (pergunta OU resposta)
+        if not _hf_is_budget_intent(question, answer):
+            return Response(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        fixed = _hf_append_links_from_open_quote(answer, user_id, namespace or DEFAULT_NAMESPACE)
+        if fixed != answer:
+            if "answer" in payload:
+                payload["answer"] = fixed
+            elif "response" in payload:
+                payload["response"] = fixed
+            else:
+                payload["answer"] = fixed
+
+        new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        # Reconstroi resposta mantendo status e headers (ajusta content-length)
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+
+        return Response(
+            content=new_body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type or "application/json",
+        )
+
+# Instalar middleware (evita instalar 2x)
+try:
+    already = getattr(app.state, "_hf_ask_links_mw", False)
+except Exception:
+    already = False
+
+if not already:
+    app.add_middleware(_HotfixAskLinksMiddleware)
     try:
-        target_routes = []
-        # Identifica rotas correspondentes ao endpoint de perguntas ("/ask") na aplicação
-        for r in getattr(app, "routes", []):
-            if getattr(r, "path", None) == "/ask":
-                methods = getattr(r, "methods", set()) or set()
-                # Filtra apenas rotas POST (chamada de pergunta ao assistente)
-                if "POST" in methods and callable(getattr(r, "endpoint", None)):
-                    target_routes.append(r)
-        wrapped_count = 0
-        # Envolve cada rota alvo com um wrapper que insere os links de produtos no resultado
-        for route in target_routes:
-            original_ep = route.endpoint
-            # Evita envolver novamente se já foi marcado anteriormente
-            if getattr(original_ep, "_hf_budget_links_wrapped", False):
-                continue
-            # Define função wrapper assíncrona para chamar o endpoint original e pós-processar a resposta
-            async def _endpoint_wrapper(*args: Any, __orig_ep=original_ep, **kwargs: Any):
-                response = await __orig_ep(*args, **kwargs)
-                try:
-                    # Garante que estamos lidando com a resposta padrão em formato de dicionário
-                    if not isinstance(response, dict):
-                        return response
-                    # Extrai o texto da resposta do assistente (pode ser chave "answer" ou "response")
-                    answer_text = response.get("answer") or response.get("response") or ""
-                    if not answer_text:
-                        return response
-                    # Obtém o namespace atual (se presente na resposta do RAG; senão usa padrão)
-                    try:
-                        ns = ((response.get("rag") or {}).get("namespace")) or None
-                    except Exception:
-                        ns = None
-                    ns = ns or DEFAULT_NAMESPACE
-                    # Aplica a lógica de inserção de links de produtos no texto da resposta
-                    fixed_answer = _append_links_block_from_catalog(answer_text, ns)
-                    # Se o texto foi modificado (links adicionados), atualiza a resposta antes de retornar
-                    if fixed_answer != answer_text:
-                        if "answer" in response:
-                            response["answer"] = fixed_answer
-                        else:
-                            response["response"] = fixed_answer
-                    return response
-                except Exception:
-                    # Em caso de qualquer erro no post-processamento, retorna a resposta original sem alterações
-                    return response
-            # Marca o wrapper para não aplicar múltiplas vezes
-            _endpoint_wrapper._hf_budget_links_wrapped = True
-            # Mantém atributos essenciais do endpoint original (ex.: dependências do FastAPI) se existirem
-            try:
-                for attr in ("dependents", "dependencies"):
-                    setattr(_endpoint_wrapper, attr, getattr(original_ep, attr, None))
-            except Exception:
-                pass
-            # Substitui o endpoint original pela função wrapper modificada
-            route.endpoint = _endpoint_wrapper
-            wrapped_count += 1
-        if wrapped_count:
-            print(f"[Hotfix] Apêndice de links de produtos ativo em {wrapped_count} rota(s).")
-    except Exception as e:
-        print(f"[Hotfix] Falha ao aplicar apêndice de links de produtos: {e}")
+        app.state._hf_ask_links_mw = True
+        log.info("[hotfix] middleware /ask links instalado (quotes.db -> Links dos produtos).")
+    except Exception:
+        pass
 
-# Aplica o hotfix ao iniciar o servidor, garantindo que links de produtos sejam sempre anexados
-_hotfix_wrap_ask_append_budget_links()
+# =============================================================================
+# FIM HOTFIX FINAL DEFINITIVO
+# =============================================================================
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
