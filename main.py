@@ -5967,211 +5967,195 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 # FIM HOTFIX FINAL
 # =============================================================================
-
 # =============================================================================
-# HOTFIX FINAL — Links sempre no fim do ORÇAMENTO (multi-itens)
-# - NÃO depende de quotes.db nem de user_id
-# - Extrai TODOS os SKUs do texto do orçamento e resolve via catalog_items.ref
-# - Anexa um bloco final com 1 link por SKU (dedup)
-# - Não altera o corpo do orçamento, só acrescenta no fim
+# HOTFIX: Apêndice de links de produtos em respostas de orçamento
 # =============================================================================
 
-import re
-from typing import Any, Dict, List, Tuple, Optional
-
+# Função auxiliar: verifica se uma dada resposta parece ser um orçamento (pela presença de palavras-chave)
 def _looks_like_budget_answer(text: str) -> bool:
-    t = (text or "")
-    # heurística simples: aparece "Orçamento" e uma estrutura de tabela/total
-    if not re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I):
-        return False
-    return True
+    """
+    Heurística simples para identificar respostas de orçamento.
+    Verifica se contém a palavra 'Orçamento' (ou 'orcamento') indicando resposta de orçamento.
+    """
+    t = text or ""
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
 
+# Função auxiliar: extrai referências (SKUs) de produtos mencionados no texto de um orçamento
 def _extract_all_skus_from_budget_text(text: str) -> List[str]:
     """
-    Extrai refs/SKUs do texto do orçamento.
-    Suporta:
-      - (100010)
-      - (SKU: LINO0030 + LINO110MA)
-      - SKU: ORK.03.01
-      - tokens tipo 740021316-2-AR
-    Dedup mantendo ordem.
+    Extrai todas as referências (códigos SKU) presentes no texto do orçamento.
+    Suporta formatos como:
+      - Listagem após 'SKU:' (ex: SKU: PROD001, PROD002 + PROD003)
+      - Códigos numéricos entre parênteses (ex: (12345))
+    Retorna uma lista de SKUs encontrados, na ordem em que aparecem no texto, sem duplicatas.
     """
-    t = (text or "")
+    t = text or ""
     if not t:
         return []
+    candidates: List[Tuple[int, str, str]] = []
+    # Encontrar todos os segmentos 'SKU: ...' e guardar posição e conteúdo
+    for m in re.finditer(r"\bSKU:?\s*([A-Z0-9_-]+(?:(?:\s*[\+,]\s*)(?:[A-Z0-9_-]+))*)", t, flags=re.I):
+        sku_block = m.group(1) or ""
+        candidates.append((m.start(), 'sku', sku_block))
+    # Encontrar todos os códigos numéricos (5+ dígitos) entre parênteses e guardar posição e conteúdo
+    for m in re.finditer(r"\((\d{5,})\)", t):
+        num_code = m.group(1) or ""
+        candidates.append((m.start(), 'num', num_code))
+    # Ordenar todos os achados pela posição em que aparecem no texto
+    candidates.sort(key=lambda x: x[0])
+    sku_list: List[str] = []
+    seen_codes: Set[str] = set()
+    # Iterar em ordem e extrair códigos individuais, evitando duplicatas
+    for _, code_type, content in candidates:
+        if code_type == 'sku':
+            # Pode conter múltiplos códigos separados por '+' ou ',' no mesmo segmento
+            for code in re.split(r"\s*[\+,]\s*", content):
+                code = code.strip()
+                if code and code not in seen_codes:
+                    seen_codes.add(code)
+                    sku_list.append(code)
+        elif code_type == 'num':
+            code = content.strip()
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                sku_list.append(code)
+    return sku_list
 
-    refs: List[str] = []
-
-    # 1) (SKU: ....)
-    for m in re.finditer(r"\(\s*SKU\s*:\s*([^)]+)\)", t, flags=re.I):
-        chunk = m.group(1).strip()
-        parts = re.split(r"\s*(?:\+|,|/|;)\s*", chunk)
-        for p in parts:
-            p = p.strip()
-            if p and re.match(r"^[A-Z0-9][A-Z0-9._\-]{2,}$", p, flags=re.I):
-                refs.append(p)
-
-    # 2) SKU: XXXX (fora de parêntesis)
-    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
-        refs.append(m.group(1).strip())
-
-    # 3) (XXXX) comum nas tuas linhas (Mono Cadeira (100010), etc.)
-    for m in re.finditer(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", t, flags=re.I):
-        refs.append(m.group(1).strip())
-
-    # 4) fallback: tokens “tipo SKU” em linhas do orçamento (evita apanhar palavras normais)
-    #    só apanha se tiver pelo menos 1 dígito (reduz falsos positivos)
-    for m in re.finditer(r"\b([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
-        tok = m.group(1).strip()
-        if re.search(r"\d", tok):  # tem dígito => mais provável ser SKU/ref
-            refs.append(tok)
-
-    # dedup mantendo ordem
-    seen = set()
-    out: List[str] = []
-    for r in refs:
-        ru = r.strip()
-        if not ru:
-            continue
-        if ru in seen:
-            continue
-        seen.add(ru)
-        out.append(ru)
-
-    return out
-
+# Função principal do hotfix: anexa os links dos produtos ao final da resposta de orçamento
 def _append_links_block_from_catalog(answer: str, namespace: str) -> str:
     """
-    Resolve SKUs via catalog_items.ref (match exato) e anexa bloco final.
+    Se a resposta for de um orçamento, insere ao final um bloco com os links dos produtos referenciados.
+    Formato do bloco inserido:
+    Links dos produtos:
+    - Nome do Produto — SKU
+      https://link-do-produto
     """
     if not answer:
         return answer
-
-    # evita duplicar
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+    # Evita duplicar se o bloco de links já foi adicionado previamente
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I|re.M):
         return answer
-
+    # Verifica se o conteúdo se parece com um orçamento; se não, não insere nada
     if not _looks_like_budget_answer(answer):
         return answer
 
     ns = (namespace or DEFAULT_NAMESPACE).strip()
+    # Extrai todos os SKUs mencionados no texto do orçamento
     refs = _extract_all_skus_from_budget_text(answer)
-
     if not refs:
         return answer
 
     links: List[Tuple[str, str]] = []
     seen = set()
-
     for ref in refs:
         try:
+            # Tenta obter dados do produto pelo ref/SKU a partir do catálogo interno
             cat = _catalog_get_by_ref(ns, ref) if ref else None
         except Exception:
             cat = None
-
         if not cat:
             continue
-
+        # Obtém URL e nome do produto do catálogo (preferencialmente URL canônica)
         url = (cat.get("url_canonical") or cat.get("url") or "").strip()
         name = (cat.get("name") or "").strip()
-
         if not url:
             continue
-
+        # Normaliza URL para formato padrão (por ex., se for link interno da plataforma)
         try:
             url = _canon_ig_url(url)
         except Exception:
             pass
-
+        # Prepara rótulo no formato "Nome — REF"
         label = name or ref
         if ref and ref not in label:
             label = f"{label} — {ref}"
-
+        # Evita adicionar links duplicados (mesmo rótulo e URL já utilizados)
         key = (label.lower(), url.lower())
         if key in seen:
             continue
         seen.add(key)
         links.append((label, url))
-
     if not links:
         return answer
 
-    block = ["", "Links dos produtos:"]
+    # Monta o bloco de links a anexar no final da resposta
+    block_lines = ["", "Links dos produtos:"]
+    # Limita a no máximo 20 produtos listados para evitar excesso de comprimento
     for label, url in links[:20]:
-        block.append(f"- [{label}]({url})")
+        block_lines.append(f"- {label}")
+        block_lines.append(f"  {url}")
+    # Retorna a resposta original seguida do bloco de links dos produtos
+    return answer.rstrip() + "\n" + "\n".join(block_lines)
 
-    return answer.rstrip() + "\n" + "\n".join(block)
-
+# Envolve a rota principal de resposta (/ask) para inserir os links de produtos automaticamente
 def _hotfix_wrap_ask_append_budget_links():
     """
-    Envolve a rota /ask (POST) existente para:
-      - manter a resposta original
-      - anexar Links dos produtos no fim quando for orçamento
+    Hotfix: Envolver a rota /ask (POST) para adicionar automaticamente o bloco "Links dos produtos"
+    ao final da resposta, quando a resposta gerar um orçamento com produtos referenciados.
     """
     try:
         target_routes = []
+        # Identifica rotas correspondentes ao endpoint de perguntas ("/ask") na aplicação
         for r in getattr(app, "routes", []):
             if getattr(r, "path", None) == "/ask":
                 methods = getattr(r, "methods", set()) or set()
+                # Filtra apenas rotas POST (chamada de pergunta ao assistente)
                 if "POST" in methods and callable(getattr(r, "endpoint", None)):
                     target_routes.append(r)
-
-        wrapped = 0
-        for r in target_routes:
-            ep = r.endpoint
-            if getattr(ep, "_hf_budget_links_wrapped", False):
+        wrapped_count = 0
+        # Envolve cada rota alvo com um wrapper que insere os links de produtos no resultado
+        for route in target_routes:
+            original_ep = route.endpoint
+            # Evita envolver novamente se já foi marcado anteriormente
+            if getattr(original_ep, "_hf_budget_links_wrapped", False):
                 continue
-
-            async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
-                resp = await __ep(*args, **kwargs)
+            # Define função wrapper assíncrona para chamar o endpoint original e pós-processar a resposta
+            async def _endpoint_wrapper(*args: Any, __orig_ep=original_ep, **kwargs: Any):
+                response = await __orig_ep(*args, **kwargs)
                 try:
-                    if not isinstance(resp, dict):
-                        return resp
-                    ans = resp.get("answer") or resp.get("response") or ""
-                    if not ans:
-                        return resp
-
-                    # tenta namespace pelo payload já devolvido
-                    ns = None
+                    # Garante que estamos lidando com a resposta padrão em formato de dicionário
+                    if not isinstance(response, dict):
+                        return response
+                    # Extrai o texto da resposta do assistente (pode ser chave "answer" ou "response")
+                    answer_text = response.get("answer") or response.get("response") or ""
+                    if not answer_text:
+                        return response
+                    # Obtém o namespace atual (se presente na resposta do RAG; senão usa padrão)
                     try:
-                        ns = ((resp.get("rag") or {}).get("namespace")) or None
+                        ns = ((response.get("rag") or {}).get("namespace")) or None
                     except Exception:
                         ns = None
                     ns = ns or DEFAULT_NAMESPACE
-
-                    fixed = _append_links_block_from_catalog(ans, ns)
-                    if fixed != ans:
-                        # preserva chave existente
-                        if "answer" in resp:
-                            resp["answer"] = fixed
+                    # Aplica a lógica de inserção de links de produtos no texto da resposta
+                    fixed_answer = _append_links_block_from_catalog(answer_text, ns)
+                    # Se o texto foi modificado (links adicionados), atualiza a resposta antes de retornar
+                    if fixed_answer != answer_text:
+                        if "answer" in response:
+                            response["answer"] = fixed_answer
                         else:
-                            resp["response"] = fixed
-                    return resp
+                            response["response"] = fixed_answer
+                    return response
                 except Exception:
-                    return resp
-
-            _ep_wrapped._hf_budget_links_wrapped = True
-            r.endpoint = _ep_wrapped
-            wrapped += 1
-
-        try:
-            log.info(f"[hotfix-budget-links] aplicado: /ask routes wrapped={wrapped}")
-        except Exception:
-            pass
-
-        return True
+                    # Em caso de qualquer erro no post-processamento, retorna a resposta original sem alterações
+                    return response
+            # Marca o wrapper para não aplicar múltiplas vezes
+            _endpoint_wrapper._hf_budget_links_wrapped = True
+            # Mantém atributos essenciais do endpoint original (ex.: dependências do FastAPI) se existirem
+            try:
+                for attr in ("dependents", "dependencies"):
+                    setattr(_endpoint_wrapper, attr, getattr(original_ep, attr, None))
+            except Exception:
+                pass
+            # Substitui o endpoint original pela função wrapper modificada
+            route.endpoint = _endpoint_wrapper
+            wrapped_count += 1
+        if wrapped_count:
+            print(f"[Hotfix] Apêndice de links de produtos ativo em {wrapped_count} rota(s).")
     except Exception as e:
-        try:
-            log.warning(f"[hotfix-budget-links] falhou: {e}")
-        except Exception:
-            pass
-        return False
+        print(f"[Hotfix] Falha ao aplicar apêndice de links de produtos: {e}")
 
+# Aplica o hotfix ao iniciar o servidor, garantindo que links de produtos sejam sempre anexados
 _hotfix_wrap_ask_append_budget_links()
-# =============================================================================
-# FIM HOTFIX FINAL
-# =============================================================================
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
