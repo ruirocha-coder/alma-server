@@ -5968,6 +5968,249 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # FIM HOTFIX FINAL
 # =============================================================================
 
+# =============================================================================
+# HOTFIX FINAL — Links de TODOS os itens no fim (quotes.db -> url_snapshot | catálogo por ref/SKU)
+# - Não depende de RAG
+# - Funciona mesmo com múltiplas rotas /ask (embrulha TODAS)
+# - Não depende de CURRENT_USER_ID (usa request.state)
+# - Garante multi-links (nunca "só o último")
+# =============================================================================
+
+import re
+from typing import Any, List, Tuple
+
+# -----------------------------
+# 0) Middleware: guardar user_id/namespace em request.state sem quebrar request.json()
+# -----------------------------
+try:
+    from starlette.requests import Request as StarletteRequest
+except Exception:
+    StarletteRequest = None  # type: ignore
+
+def _install_ask_state_middleware():
+    try:
+        if not StarletteRequest:
+            return False
+
+        # evitar instalar 2x
+        if getattr(app.state, "_hf_ask_state_mw", False):
+            return True
+
+        @app.middleware("http")
+        async def _hf_capture_ask_state(request: StarletteRequest, call_next):
+            try:
+                if request.url.path == "/ask" and request.method.upper() == "POST":
+                    body = await request.body()  # consome
+                    # repõe para endpoints que fazem await request.json()
+                    try:
+                        request._body = body  # starlette internal, mas é o truque clássico
+                    except Exception:
+                        pass
+
+                    try:
+                        import json
+                        data = json.loads(body.decode("utf-8") or "{}") if body else {}
+                    except Exception:
+                        data = {}
+
+                    uid = (data.get("user_id") or "").strip() or "anon"
+                    ns = (data.get("namespace") or "").strip() or None
+                    request.state._hf_user_id = uid
+                    request.state._hf_namespace = ns
+            except Exception:
+                pass
+
+            return await call_next(request)
+
+        app.state._hf_ask_state_mw = True
+        try:
+            log.info("[hotfix-links] middleware /ask state instalado")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-links] middleware falhou: {e}")
+        except Exception:
+            pass
+        return False
+
+_install_ask_state_middleware()
+
+
+# -----------------------------
+# 1) Função: anexar bloco final com TODOS os links do quote aberto
+# -----------------------------
+def _append_all_quote_links(answer: str, user_id: str, namespace: str) -> str:
+    if not answer:
+        return answer
+
+    # evita duplicação
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+        return answer
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    # obter quote aberto
+    try:
+        # se existir _quote_has_open no teu runtime, usa; senão vai direto ao get_open
+        qid = None
+        try:
+            qid = _quote_has_open(uid, ns)
+        except Exception:
+            qid = None
+        if not qid:
+            qid = _quote_get_open(uid, ns)
+        if not qid:
+            return answer
+
+        items = _quote_list_items(qid) or []
+        if not items:
+            return answer
+    except Exception:
+        return answer
+
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    for it in items:
+        ref = (it.get("ref") or "").strip()  # ref == SKU
+        name = (it.get("name_snapshot") or "").strip()
+        url = (it.get("url_snapshot") or "").strip()
+
+        # fallback catálogo por SKU/ref
+        if (not url) and ref:
+            try:
+                cat = _catalog_get_by_ref(ns, ref)
+                if cat:
+                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                    if not name:
+                        name = (cat.get("name") or "").strip()
+            except Exception:
+                pass
+
+        if not url:
+            continue
+
+        # normalizar url (se existir helper)
+        try:
+            url = _canon_ig_url(url)
+        except Exception:
+            pass
+
+        label = name or ref or "Produto"
+        if ref and ref not in label:
+            label = f"{label} — {ref}"
+
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
+
+    if not links:
+        return answer
+
+    block = ["", "Links dos produtos:"]
+    for label, url in links[:20]:
+        block.append(f"- [{label}]({url})")
+
+    return answer.rstrip() + "\n" + "\n".join(block)
+
+
+# -----------------------------
+# 2) Wrapper: embrulhar TODAS as rotas /ask e anexar links no fim
+# -----------------------------
+def _wrap_all_ask_routes_append_links():
+    try:
+        wrapped = 0
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+
+            # evita double-wrap
+            if getattr(ep, "_hf_append_links_wrapped", False):
+                continue
+
+            async def _endpoint_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    answer = resp.get("answer") or resp.get("response") or ""
+                    if not answer:
+                        return resp
+
+                    # 1) tentar obter Request (Starlette/FastAPI) e ler state
+                    user_id = None
+                    namespace = None
+
+                    req_obj = None
+                    if args:
+                        # normalmente o 1º arg em endpoints Request-based é o request
+                        req_obj = args[0]
+
+                    if req_obj is None:
+                        # fallback: procurar nos kwargs
+                        for v in kwargs.values():
+                            if hasattr(v, "url") and hasattr(v, "method"):
+                                req_obj = v
+                                break
+
+                    if req_obj is not None and hasattr(req_obj, "state"):
+                        user_id = getattr(req_obj.state, "_hf_user_id", None)
+                        namespace = getattr(req_obj.state, "_hf_namespace", None)
+
+                    # 2) fallback: tentar no próprio payload de resposta (se existir)
+                    if not namespace:
+                        try:
+                            namespace = ((resp.get("rag") or {}).get("namespace"))  # teu payload já devolve isto
+                        except Exception:
+                            pass
+
+                    fixed = _append_all_quote_links(answer, user_id or "anon", namespace or DEFAULT_NAMESPACE)
+                    if fixed != answer:
+                        resp["answer"] = fixed
+
+                except Exception:
+                    return resp
+
+                return resp
+
+            _endpoint_wrapped._hf_append_links_wrapped = True
+            r.endpoint = _endpoint_wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-links] aplicado: /ask routes wrapped={wrapped}")
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-links] wrap falhou: {e}")
+        except Exception:
+            pass
+        return False
+
+_wrap_all_ask_routes_append_links()
+
+# =============================================================================
+# FIM HOTFIX FINAL — Links multi-itens garantidos
+# =============================================================================
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
