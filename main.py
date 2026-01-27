@@ -5968,160 +5968,287 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # FIM HOTFIX FINAL
 # =============================================================================
 # =============================================================================
-# HOTFIX 2025 — Links completos de TODOS os itens no final do orçamento
-# Usa quotes.db como fonte única — ignora o que o LLM escreveu
+# HOTFIX FINAL DEFINITIVO
+# Multi-links no fim do orçamento (sem inventar URLs)
+# - Remove o "ver produto" (link único) injetado pelo postprocess antigo
+# - Anexa "Links dos produtos" com 1 link por item (quotes.db -> catálogo)
+# - NUNCA inventa links (ex.: "#sku=..."), só usa URLs reais
+# - Funciona com /ask que recebe fastapi.Request (JSON)
 # =============================================================================
 
 import re
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-def _get_all_quote_item_links(uid: str, ns: str) -> List[Tuple[str, str]]:
-    """ Devolve lista (label, url) de todos os itens no orçamento aberto """
-    links = []
-    seen = set()
-    
-    quote_id = _quote_has_open(uid, ns) or _quote_get_open(uid, ns)
-    if not quote_id:
-        return links
-        
-    items = _quote_list_items(quote_id) or []
-    for item in items:
-        ref = (item.get("ref") or "").strip()
-        name = (item.get("name_snapshot") or "").strip()
-        url = (item.get("url_snapshot") or "").strip()
-        
-        # fallback catálogo se faltar url_snapshot
-        if not url and ref:
-            cat = _catalog_get_by_ref(ns, ref)
-            if cat:
-                url = cat.get("url") or cat.get("url_canonical") or ""
-                if not name:
-                    name = cat.get("name") or ""
-        
-        if not url:
+# --- 1) detetar se a resposta é um orçamento (heurística simples e robusta)
+def _hf_is_budget_answer(text: str) -> bool:
+    t = text or ""
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
+
+# --- 2) limpar "ver produto" antigo (não queremos link único nem linhas soltas)
+_VER_PROD_MD_RE = re.compile(r"\s*—\s*\[ver produto\]\([^)]+\)\s*", re.I)
+_VER_PROD_LINE_RE = re.compile(r"^\s*\[?ver produto\]?(?:\([^)]+\))?\s*$", re.I | re.M)
+
+def _hf_strip_single_ver_produto(answer: str) -> str:
+    if not answer:
+        return answer
+    out = _VER_PROD_MD_RE.sub("", answer)
+    # remove linhas que sejam só "ver produto" ou "[ver produto](...)"
+    lines = out.splitlines()
+    cleaned = []
+    for ln in lines:
+        if _VER_PROD_LINE_RE.match(ln.strip()):
             continue
-            
-        url = _canon_ig_url(url) or url
-        label = name or ref or f"Produto {ref}"
-        if ref and ref not in label:
-            label = f"{label} — {ref}"
-            
-        key = (label.lower(), url.lower())
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+# --- 3) extrair SKUs do texto do orçamento (fallback quando quotes.db não tem url_snapshot)
+# apanha tokens típicos: ORK.03.01, 740021316-2, LINO030, etc. e também "A + B"
+_HF_SKU_TOKEN_RE = re.compile(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", re.I)
+
+def _hf_extract_candidate_refs(answer: str) -> List[str]:
+    """
+    Extrai refs possíveis do texto final do orçamento.
+    - recolhe tokens
+    - mantém ordem
+    - dedup
+    Nota: se aparecer "LINO030 + LINO110MA" apanha ambos e tenta ambos.
+    """
+    if not answer:
+        return []
+    # foco nas linhas da tabela: normalmente têm pipes ou "SKU"
+    lines = answer.splitlines()
+    candidates: List[str] = []
+    for ln in lines:
+        l = ln.strip()
+        if not l:
+            continue
+        if ("|" in l) or ("sku" in l.lower()):
+            for tok in _HF_SKU_TOKEN_RE.findall(l):
+                candidates.append(tok.strip())
+
+    # dedup preservando ordem
+    seen = set()
+    out = []
+    for c in candidates:
+        cu = c.strip()
+        if not cu:
+            continue
+        key = cu.upper()
         if key in seen:
             continue
         seen.add(key)
-        links.append((label, url))
-    
+        out.append(cu)
+    return out
+
+def _hf_is_real_url(u: str) -> bool:
+    if not u:
+        return False
+    us = u.strip()
+    # recusa “inventos” tipo "#sku=..."
+    if us.startswith("#") or us.lower().startswith("javascript:"):
+        return False
+    return us.startswith("http://") or us.startswith("https://")
+
+# --- 4) coletar links seguros (quotes.db primeiro; depois catálogo por ref)
+def _hf_collect_links(user_id: str, namespace: str, answer: str) -> List[Tuple[str, str]]:
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    # 4.1) quotes.db (fonte preferencial)
+    try:
+        qid = None
+        try:
+            qid = _quote_has_open(uid, ns)  # se existir
+        except Exception:
+            qid = None
+        if not qid:
+            try:
+                qid = _quote_get_open(uid, ns)
+            except Exception:
+                qid = None
+
+        if qid:
+            items = _quote_list_items(qid) or []
+            for it in items:
+                ref = (it.get("ref") or "").strip()
+                name = (it.get("name_snapshot") or "").strip()
+                url = (it.get("url_snapshot") or "").strip()
+
+                # se url_snapshot não for URL real, ignorar (não inventar)
+                if url and not _hf_is_real_url(url):
+                    url = ""
+
+                if not url and ref:
+                    # fallback catálogo por ref, mas só se houver URL real
+                    try:
+                        cat = _catalog_get_by_ref(ns, ref)
+                    except Exception:
+                        cat = None
+                    if cat:
+                        cu = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                        if _hf_is_real_url(cu):
+                            url = cu
+                        if not name:
+                            name = (cat.get("name") or "").strip()
+
+                if not url:
+                    continue
+
+                label = name or ref or "Produto"
+                if ref and ref not in label:
+                    label = f"{label} — {ref}"
+
+                key = (label.lower(), url.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                links.append((label, url))
+    except Exception:
+        pass
+
+    # 4.2) fallback: extrair refs do texto e mapear ao catálogo (só URLs reais)
+    try:
+        refs = _hf_extract_candidate_refs(answer)
+        for ref in refs:
+            # já temos este ref via quotes? evita duplicar por URL/label
+            try:
+                cat = _catalog_get_by_ref(ns, ref)
+            except Exception:
+                cat = None
+            if not cat:
+                continue
+            url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+            if not _hf_is_real_url(url):
+                continue
+            name = (cat.get("name") or "").strip()
+            label = name or ref
+            if ref and ref not in label:
+                label = f"{label} — {ref}"
+
+            key = (label.lower(), url.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append((label, url))
+    except Exception:
+        pass
+
     return links
 
-
-def _append_all_products_links_block(answer: str, user_id: str, namespace: str) -> str:
-    """ Adiciona bloco final com TODOS os links — só se for orçamento """
-    if not answer or "Links dos produtos:" in answer:
+# --- 5) anexar bloco final (sem markdown "ver produto" e sem repetir urls)
+def _hf_append_links_block(answer: str, links: List[Tuple[str, str]]) -> str:
+    if not answer:
         return answer
-        
-    # Deteta se é resposta de orçamento (pergunta ou resposta)
-    is_budget = any(kw in (user_query.lower() + answer.lower()) for kw in [
-        "orçament", "orcament", "cotação", "cotacao", "proforma", "orçamento completo"
-    ])
-    if not is_budget:
-        return answer
-    
-    links = _get_all_quote_item_links(user_id, namespace)
     if not links:
         return answer
-    
-    block = ["", "**Links dos produtos no orçamento:**"]
-    for label, url in links:
-        block.append(f"- [{label}]({url})")
-    
-    return answer.rstrip() + "\n\n" + "\n".join(block)
+    # evita duplicação
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+        return answer
 
+    block = ["", "Links dos produtos:"]
+    for label, url in links[:25]:
+        # formato simples e clicável (raw URL)
+        block.append(f"- {label}")
+        block.append(f"  {url}")
 
-# =============================================================================
-# Middleware FINAL (substitui ou complementa o anterior)
-# =============================================================================
+    return answer.rstrip() + "\n" + "\n".join(block)
 
-class _FinalLinksBudgetMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method != "POST" or request.url.path not in ("/ask", "/ask_get"):
-            return await call_next(request)
-            
-        body_bytes = await request.body()
-        async def _receive():
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-        request._receive = _receive  # type: ignore
-        
-        user_id = "anon"
-        namespace = DEFAULT_NAMESPACE
-        question = ""
+# --- 6) WRAP /ask POST (Request JSON) e pós-processar resposta
+def _hf_wrap_all_ask_routes_multi_links():
+    try:
+        wrapped = 0
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+            if getattr(ep, "_hf_multi_links_wrapped", False):
+                continue
+
+            async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    answer = resp.get("answer") or resp.get("response") or ""
+                    if not answer:
+                        return resp
+
+                    # só mexe em orçamentos
+                    if not _hf_is_budget_answer(answer):
+                        return resp
+
+                    # obter Request e JSON para user_id/namespace
+                    user_id = "anon"
+                    namespace = None
+                    req = None
+                    for a in args:
+                        # fastapi.Request tem atributo "json" coroutine e "scope"
+                        if hasattr(a, "json") and hasattr(a, "scope"):
+                            req = a
+                            break
+                    if req is None:
+                        for v in kwargs.values():
+                            if hasattr(v, "json") and hasattr(v, "scope"):
+                                req = v
+                                break
+                    if req is not None:
+                        try:
+                            data = await req.json()
+                            if isinstance(data, dict):
+                                user_id = (data.get("user_id") or "").strip() or "anon"
+                                namespace = (data.get("namespace") or "").strip() or None
+                        except Exception:
+                            pass
+
+                    ns = namespace or DEFAULT_NAMESPACE
+
+                    # 1) remover link único "ver produto" antigo
+                    fixed = _hf_strip_single_ver_produto(answer)
+
+                    # 2) anexar bloco final com multi-links seguros (sem inventar)
+                    links = _hf_collect_links(user_id, ns, fixed)
+                    fixed2 = _hf_append_links_block(fixed, links)
+
+                    if fixed2 != answer:
+                        if "answer" in resp:
+                            resp["answer"] = fixed2
+                        else:
+                            resp["response"] = fixed2
+
+                    return resp
+                except Exception:
+                    return resp
+
+            _ep_wrapped._hf_multi_links_wrapped = True
+            r.endpoint = _ep_wrapped
+            wrapped += 1
+
         try:
-            data = json.loads(body_bytes.decode("utf-8", errors="ignore") or "{}")
-            user_id = data.get("user_id", "anon").strip()
-            namespace = data.get("namespace", DEFAULT_NAMESPACE).strip()
-            question = data.get("question", "").strip()
-        except:
+            log.info(f"[hotfix-multi-links] aplicado: /ask routes wrapped={wrapped}")
+        except Exception:
             pass
-        
-        response = await call_next(request)
-        
-        if "application/json" not in response.headers.get("content-type", "").lower():
-            return response
-            
+
+        return True
+    except Exception as e:
         try:
-            chunks = [chunk async for chunk in response.body_iterator]
-            body = b"".join(chunks)
-            payload = json.loads(body.decode("utf-8", errors="ignore"))
-        except:
-            # repõe resposta original se falhar
-            return Response(
-                content=body,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-        
-        answer_key = next((k for k in ("answer", "response") if k in payload), None)
-        if not answer_key:
-            return Response(content=body, status_code=response.status_code, headers=dict(response.headers))
-            
-        original_answer = payload[answer_key]
-        if not isinstance(original_answer, str):
-            return Response(content=body, status_code=response.status_code, headers=dict(response.headers))
-        
-        fixed_answer = _append_all_products_links_block(
-            original_answer,
-            user_id,
-            namespace
-        )
-        
-        if fixed_answer != original_answer:
-            payload[answer_key] = fixed_answer
-            new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers = dict(response.headers)
-            headers["content-length"] = str(len(new_body))
-            return Response(
-                content=new_body,
-                status_code=response.status_code,
-                headers=headers,
-                media_type="application/json"
-            )
-        
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type="application/json"
-        )
+            log.warning(f"[hotfix-multi-links] falhou: {e}")
+        except Exception:
+            pass
+        return False
 
-
-# Instalar (evita duplicar)
-try:
-    if not getattr(app.state, "_final_links_mw_installed", False):
-        app.add_middleware(_FinalLinksBudgetMiddleware)
-        app.state._final_links_mw_installed = True
-        log.info("[HOTFIX 2025] Links completos de TODOS os itens no final do orçamento ativado via middleware")
-except Exception as e:
-    log.warning(f"[HOTFIX] Erro ao instalar middleware final de links: {e}")
+_hf_wrap_all_ask_routes_multi_links()
+# =============================================================================
+# FIM HOTFIX FINAL DEFINITIVO
+# =============================================================================
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
