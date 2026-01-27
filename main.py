@@ -5969,222 +5969,176 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 
 # =============================================================================
-# HOTFIX FINAL DEFINITIVO — links no fim do orçamento (multi-itens)
-# - Funciona com /ask que recebe Pydantic (AskRequest) OU starlette Request JSON
-# - Não depende de CURRENT_USER_ID
-# - Não usa RAG; fonte = quotes.db (quote_items.url_snapshot) + fallback catálogo por ref
+# HOTFIX FINAL (sem wraps)
+# Orçamento: anexar SEMPRE links de TODOS os SKUs no fim (fonte: catalog_items)
+# - Aproveita o facto de o orçamento final já conter os SKUs na tabela
+# - Não depende de quotes.db nem de CURRENT_USER_ID
+# - Não interfere em respostas não-orçamento
 # =============================================================================
 
 import re
-from typing import Any, Dict, List, Tuple, Optional
+from typing import List, Tuple
 
-try:
-    from starlette.requests import Request as StarletteRequest
-except Exception:
-    StarletteRequest = None  # type: ignore
-
-def _is_budget_answer_text(text: str) -> bool:
+def _hf_answer_looks_like_budget(text: str) -> bool:
     t = (text or "")
-    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b|\bOrçamento Atualizado\b|\bOrçamento Atual\b", t, flags=re.I))
 
-def _append_links_from_open_quote(answer: str, user_id: str, namespace: str) -> str:
-    if not answer:
-        return answer
+def _hf_extract_skus_from_answer(answer: str) -> List[str]:
+    """
+    Extrai SKUs/refs a partir do texto do orçamento.
+    Cobre:
+      - SKU: XXX
+      - (XXX)
+      - refs em linhas de tabela
+      - refs numéricas (ex.: 100010) mas evita preços (ex.: 2876.00€)
+    """
+    a = (answer or "")
+    if not a:
+        return []
 
-    # evita duplicar
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
-        return answer
-
-    # só faz sentido em respostas de orçamento
-    if not _is_budget_answer_text(answer):
-        return answer
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    uid = (user_id or "anon").strip() or "anon"
-
-    try:
-        qid = None
-        try:
-            qid = _quote_has_open(uid, ns)  # se existir
-        except Exception:
-            qid = None
-        if not qid:
-            qid = _quote_get_open(uid, ns)  # cria se não existir (mas só se for mesmo quote_mode)
-        items = _quote_list_items(qid) or []
-    except Exception:
-        return answer
-
-    if not items:
-        return answer
-
-    links: List[Tuple[str, str]] = []
+    found: List[str] = []
     seen = set()
 
-    for it in items:
-        ref = (it.get("ref") or "").strip()
-        name = (it.get("name_snapshot") or "").strip()
-        url = (it.get("url_snapshot") or "").strip()
+    def add(x: str):
+        x = (x or "").strip()
+        if not x:
+            return
+        # evitar apanhar preços / valores
+        if re.fullmatch(r"\d+([.,]\d+)?", x):
+            return
+        k = x.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        found.append(x)
 
-        # fallback catálogo por ref (SKU)
-        if (not url) and ref:
+    # 1) "SKU: REF"
+    for m in re.finditer(r"\bSKU\s*[:\-]\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I):
+        add(m.group(1))
+
+    # 2) "(REF)" (muito comum no teu output)
+    for m in re.finditer(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", a, flags=re.I):
+        add(m.group(1))
+
+    # 3) refs numéricas (>=4 dígitos) não seguidas de ponto/virgula (evita preços)
+    #    ex.: "100010" apanha; "2876.00" não apanha
+    for m in re.finditer(r"\b(\d{4,})(?![.,]\d)\b", a):
+        add(m.group(1))
+
+    # 4) tokens tipo SKU em linhas de tabela (com hífen/dot/underscore)
+    #    mas filtra tokens que sejam claramente dinheiro (acabam em € ou têm ,xx€)
+    for line in a.splitlines():
+        if "|" not in line:
+            continue
+        for tok in re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", line, flags=re.I):
+            if "€" in tok:
+                continue
+            add(tok)
+
+    return found
+
+def _hf_catalog_url_for_ref(namespace: str, ref: str) -> Tuple[str, str]:
+    """
+    Retorna (name, url) para um ref.
+    Usa _catalog_get_by_ref (já existe no teu main).
+    """
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    r = (ref or "").strip()
+    if not r:
+        return ("", "")
+    try:
+        cat = _catalog_get_by_ref(ns, r)
+        if not cat:
+            return ("", "")
+        name = (cat.get("name") or "").strip()
+        url = (cat.get("url") or "").strip()
+        if url:
             try:
-                cat = _catalog_get_by_ref(ns, ref)
-                if cat:
-                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
-                    if not name:
-                        name = (cat.get("name") or "").strip()
+                url = _canon_ig_url(url)
             except Exception:
                 pass
+        return (name, url)
+    except Exception:
+        return ("", "")
 
-        if not url:
-            continue
+# guarda o original
+try:
+    _force_links_block__prev = _force_links_block
+except Exception:
+    _force_links_block__prev = None
 
-        try:
-            url = _canon_ig_url(url)
-        except Exception:
-            url = url.strip()
-
-        label = name or ref or "Produto"
-        if ref and ref not in label:
-            label = f"{label} — {ref}"
-
-        key = (label.lower(), url.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        links.append((label, url))
-
-    if not links:
+def _force_links_block(answer: str, rag_hits: list, min_links: int = 3) -> str:
+    """
+    Override do _force_links_block:
+      - Se NÃO for orçamento: mantém comportamento antigo (RAG)
+      - Se for orçamento: anexa "Links dos produtos" com TODOS os SKUs encontrados no texto
+    """
+    # 1) se não for orçamento, deixa tudo como estava
+    if not _hf_answer_looks_like_budget(answer):
+        if callable(_force_links_block__prev):
+            return _force_links_block__prev(answer, rag_hits, min_links=min_links)
         return answer
 
-    block = ["", "Links dos produtos:"]
-    for label, url in links[:25]:
-        block.append(f"- {label}")
-        block.append(f"  {url}")
-
-    return answer.rstrip() + "\n" + "\n".join(block)
-
-async def _extract_req_fields(args: Any, kwargs: Any) -> Tuple[str, str, str]:
-    """
-    Devolve (user_id, namespace, question).
-    Suporta:
-      - Pydantic AskRequest: .user_id .namespace .question
-      - Starlette Request JSON: {"user_id","namespace","question"}
-    """
-    user_id = "anon"
-    namespace = DEFAULT_NAMESPACE
-    question = ""
-
-    # 1) tentar pydantic (args[0] costuma ser o model)
-    req_obj = None
-    if args:
-        req_obj = args[0]
-
-    # procurar também em kwargs
-    if req_obj is None:
-        for v in kwargs.values():
-            if hasattr(v, "question") and hasattr(v, "user_id"):
-                req_obj = v
-                break
-
-    if req_obj is not None and hasattr(req_obj, "question"):
-        try:
-            question = (getattr(req_obj, "question", "") or "").strip()
-            user_id = (getattr(req_obj, "user_id", "") or "").strip() or "anon"
-            namespace = (getattr(req_obj, "namespace", "") or "").strip() or DEFAULT_NAMESPACE
-            return user_id, namespace, question
-        except Exception:
-            pass
-
-    # 2) tentar starlette Request
-    if StarletteRequest is not None:
-        try:
-            # procurar um Request nos args/kwargs
-            req = None
-            if args:
-                for a in args:
-                    if isinstance(a, StarletteRequest):
-                        req = a
-                        break
-            if req is None:
-                for v in kwargs.values():
-                    if isinstance(v, StarletteRequest):
-                        req = v
-                        break
-
-            if req is not None:
-                data = await req.json()  # é cacheado; o endpoint pode chamar outra vez
-                question = (data.get("question") or "").strip()
-                user_id = (data.get("user_id") or "").strip() or "anon"
-                namespace = (data.get("namespace") or "").strip() or DEFAULT_NAMESPACE
-                return user_id, namespace, question
-        except Exception:
-            pass
-
-    return user_id, namespace, question
-
-def _apply_hotfix_links_on_ask():
+    # 2) orçamento: construir bloco final de links por SKU (a partir do próprio texto)
     try:
-        route = None
-        for r in getattr(app, "routes", []):
-            if getattr(r, "path", None) == "/ask" and "POST" in (getattr(r, "methods", set()) or set()):
-                route = r
-                break
-        if not route or not callable(getattr(route, "endpoint", None)):
-            return False
+        skus = _hf_extract_skus_from_answer(answer)
+        if not skus:
+            # fallback: se não apanhou nada, deixa o comportamento antigo (se existir)
+            if callable(_force_links_block__prev):
+                return _force_links_block__prev(answer, rag_hits, min_links=min_links)
+            return answer
 
-        ep = route.endpoint
-        if getattr(ep, "_hf_links_final_wrapped", False):
-            return True
-
-        async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
-            resp = await __ep(*args, **kwargs)
-
-            # só mexe em dicts com answer/response
-            if not isinstance(resp, dict):
-                return resp
-
-            ans = resp.get("answer") or resp.get("response") or ""
-            if not ans:
-                return resp
-
-            # extrair user/ns/question (robusto)
-            uid, ns, q = await _extract_req_fields(args, kwargs)
-
-            # só anexar em quote_mode (evita “poluir” respostas normais)
-            try:
-                if not _is_quote_mode(q or ""):
-                    return resp
-            except Exception:
-                return resp
-
-            fixed = _append_links_from_open_quote(ans, uid, ns)
-            if fixed != ans:
-                resp["answer"] = fixed
-            return resp
-
-        _ep_wrapped._hf_links_final_wrapped = True
-        route.endpoint = _ep_wrapped
-
+        ns = DEFAULT_NAMESPACE
+        # tenta inferir namespace se o teu código a tiver “em global”; senão fica DEFAULT
         try:
-            log.info("[hotfix-links-final] aplicado: /ask wrapped (pydantic+request.json) + links do quotes.db no fim.")
+            # se existir uma forma óbvia no runtime
+            ns = (globals().get("CURRENT_NAMESPACE") or ns)
         except Exception:
             pass
 
-        return True
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix-links-final] falhou: {e}")
-        except Exception:
-            pass
-        return False
+        links: List[Tuple[str, str]] = []
+        seen = set()
 
-_apply_hotfix_links_on_ask()
+        for ref in skus:
+            name, url = _hf_catalog_url_for_ref(ns, ref)
+            if not url:
+                continue
+            label = name or ref
+            if ref and ref not in label:
+                label = f"{label} — {ref}"
+            key = (label.lower(), url.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append((label, url))
+
+        if not links:
+            # nada no catálogo → não inventar
+            return answer
+
+        # evita duplicar
+        if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+            return answer
+
+        block = ["", "Links dos produtos:"]
+        for label, url in links[:15]:
+            block.append(f"- [{label}]({url})")
+
+        return answer.rstrip() + "\n" + "\n".join(block)
+    except Exception:
+        # em caso de falha, não rebenta o /ask
+        if callable(_force_links_block__prev):
+            return _force_links_block__prev(answer, rag_hits, min_links=min_links)
+        return answer
+
+try:
+    log.info("[hotfix] _force_links_block override: orçamentos passam a listar links por SKU no fim.")
+except Exception:
+    pass
+
 # =============================================================================
 # FIM HOTFIX
 # =============================================================================
-
-
 
 # ---------------------------------------------------------------------------------------
 # Local run
