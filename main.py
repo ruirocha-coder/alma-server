@@ -5968,6 +5968,223 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # FIM HOTFIX FINAL
 # =============================================================================
 
+# =============================================================================
+# HOTFIX FINAL DEFINITIVO — links no fim do orçamento (multi-itens)
+# - Funciona com /ask que recebe Pydantic (AskRequest) OU starlette Request JSON
+# - Não depende de CURRENT_USER_ID
+# - Não usa RAG; fonte = quotes.db (quote_items.url_snapshot) + fallback catálogo por ref
+# =============================================================================
+
+import re
+from typing import Any, Dict, List, Tuple, Optional
+
+try:
+    from starlette.requests import Request as StarletteRequest
+except Exception:
+    StarletteRequest = None  # type: ignore
+
+def _is_budget_answer_text(text: str) -> bool:
+    t = (text or "")
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
+
+def _append_links_from_open_quote(answer: str, user_id: str, namespace: str) -> str:
+    if not answer:
+        return answer
+
+    # evita duplicar
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+        return answer
+
+    # só faz sentido em respostas de orçamento
+    if not _is_budget_answer_text(answer):
+        return answer
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    try:
+        qid = None
+        try:
+            qid = _quote_has_open(uid, ns)  # se existir
+        except Exception:
+            qid = None
+        if not qid:
+            qid = _quote_get_open(uid, ns)  # cria se não existir (mas só se for mesmo quote_mode)
+        items = _quote_list_items(qid) or []
+    except Exception:
+        return answer
+
+    if not items:
+        return answer
+
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    for it in items:
+        ref = (it.get("ref") or "").strip()
+        name = (it.get("name_snapshot") or "").strip()
+        url = (it.get("url_snapshot") or "").strip()
+
+        # fallback catálogo por ref (SKU)
+        if (not url) and ref:
+            try:
+                cat = _catalog_get_by_ref(ns, ref)
+                if cat:
+                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                    if not name:
+                        name = (cat.get("name") or "").strip()
+            except Exception:
+                pass
+
+        if not url:
+            continue
+
+        try:
+            url = _canon_ig_url(url)
+        except Exception:
+            url = url.strip()
+
+        label = name or ref or "Produto"
+        if ref and ref not in label:
+            label = f"{label} — {ref}"
+
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
+
+    if not links:
+        return answer
+
+    block = ["", "Links dos produtos:"]
+    for label, url in links[:25]:
+        block.append(f"- {label}")
+        block.append(f"  {url}")
+
+    return answer.rstrip() + "\n" + "\n".join(block)
+
+async def _extract_req_fields(args: Any, kwargs: Any) -> Tuple[str, str, str]:
+    """
+    Devolve (user_id, namespace, question).
+    Suporta:
+      - Pydantic AskRequest: .user_id .namespace .question
+      - Starlette Request JSON: {"user_id","namespace","question"}
+    """
+    user_id = "anon"
+    namespace = DEFAULT_NAMESPACE
+    question = ""
+
+    # 1) tentar pydantic (args[0] costuma ser o model)
+    req_obj = None
+    if args:
+        req_obj = args[0]
+
+    # procurar também em kwargs
+    if req_obj is None:
+        for v in kwargs.values():
+            if hasattr(v, "question") and hasattr(v, "user_id"):
+                req_obj = v
+                break
+
+    if req_obj is not None and hasattr(req_obj, "question"):
+        try:
+            question = (getattr(req_obj, "question", "") or "").strip()
+            user_id = (getattr(req_obj, "user_id", "") or "").strip() or "anon"
+            namespace = (getattr(req_obj, "namespace", "") or "").strip() or DEFAULT_NAMESPACE
+            return user_id, namespace, question
+        except Exception:
+            pass
+
+    # 2) tentar starlette Request
+    if StarletteRequest is not None:
+        try:
+            # procurar um Request nos args/kwargs
+            req = None
+            if args:
+                for a in args:
+                    if isinstance(a, StarletteRequest):
+                        req = a
+                        break
+            if req is None:
+                for v in kwargs.values():
+                    if isinstance(v, StarletteRequest):
+                        req = v
+                        break
+
+            if req is not None:
+                data = await req.json()  # é cacheado; o endpoint pode chamar outra vez
+                question = (data.get("question") or "").strip()
+                user_id = (data.get("user_id") or "").strip() or "anon"
+                namespace = (data.get("namespace") or "").strip() or DEFAULT_NAMESPACE
+                return user_id, namespace, question
+        except Exception:
+            pass
+
+    return user_id, namespace, question
+
+def _apply_hotfix_links_on_ask():
+    try:
+        route = None
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) == "/ask" and "POST" in (getattr(r, "methods", set()) or set()):
+                route = r
+                break
+        if not route or not callable(getattr(route, "endpoint", None)):
+            return False
+
+        ep = route.endpoint
+        if getattr(ep, "_hf_links_final_wrapped", False):
+            return True
+
+        async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+            resp = await __ep(*args, **kwargs)
+
+            # só mexe em dicts com answer/response
+            if not isinstance(resp, dict):
+                return resp
+
+            ans = resp.get("answer") or resp.get("response") or ""
+            if not ans:
+                return resp
+
+            # extrair user/ns/question (robusto)
+            uid, ns, q = await _extract_req_fields(args, kwargs)
+
+            # só anexar em quote_mode (evita “poluir” respostas normais)
+            try:
+                if not _is_quote_mode(q or ""):
+                    return resp
+            except Exception:
+                return resp
+
+            fixed = _append_links_from_open_quote(ans, uid, ns)
+            if fixed != ans:
+                resp["answer"] = fixed
+            return resp
+
+        _ep_wrapped._hf_links_final_wrapped = True
+        route.endpoint = _ep_wrapped
+
+        try:
+            log.info("[hotfix-links-final] aplicado: /ask wrapped (pydantic+request.json) + links do quotes.db no fim.")
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-links-final] falhou: {e}")
+        except Exception:
+            pass
+        return False
+
+_apply_hotfix_links_on_ask()
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
