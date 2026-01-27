@@ -5969,135 +5969,129 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 
 # =============================================================================
-# HOTFIX FINAL — Links de TODOS os itens no fim (quotes.db -> url_snapshot | catálogo por ref/SKU)
-# - Não depende de RAG
-# - Funciona mesmo com múltiplas rotas /ask (embrulha TODAS)
-# - Não depende de CURRENT_USER_ID (usa request.state)
-# - Garante multi-links (nunca "só o último")
+# HOTFIX FINAL (colocar NO FIM do main.py)
+# Objetivo: em respostas de ORÇAMENTO, anexar SEMPRE no fim os links de TODOS os
+# produtos (1 ou N), sem depender do RAG, usando:
+#   1) quotes.db (quote_items.url_snapshot/name_snapshot/ref)
+#   2) fallback: extrair SKUs do texto do orçamento e ir ao catálogo por ref
+#
+# Funciona mesmo com rotas /ask duplicadas: embrulha TODAS as POST /ask.
 # =============================================================================
 
 import re
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# -----------------------------
-# 0) Middleware: guardar user_id/namespace em request.state sem quebrar request.json()
-# -----------------------------
-try:
-    from starlette.requests import Request as StarletteRequest
-except Exception:
-    StarletteRequest = None  # type: ignore
+_MD_LINK_RE = re.compile(r"\[[^\]]+\]\((https?://[^)]+)\)")
+_BUDGET_RE  = re.compile(r"\bOrçamento\b|\bOrcamento\b|\bOrçamento Atual\b|\bOrçamento Atualizado\b", re.I)
 
-def _install_ask_state_middleware():
+def _answer_looks_like_budget(text: str) -> bool:
+    return bool(_BUDGET_RE.search(text or ""))
+
+def _split_possible_multi_ref(ref: str) -> List[str]:
+    # ex: "LIN0030 + LIN0110MA" -> ["LIN0030", "LIN0110MA"]
+    if not ref:
+        return []
+    parts = re.split(r"[^A-Z0-9._\-]+", ref.upper())
+    return [p.strip() for p in parts if p.strip() and len(p.strip()) >= 3]
+
+def _extract_refs_from_budget_text(text: str) -> List[str]:
+    """
+    Tenta apanhar refs que aparecem no orçamento:
+      - dentro de parêntesis: (ORK.03.01) ou (740021316-2-AR) ou (LIN0030 + LIN0110MA)
+      - padrões SKU: XXX
+    """
+    if not text:
+        return []
+
+    refs: List[str] = []
+
+    # 1) tudo o que está entre (...) e parece ref
+    for m in re.finditer(r"\(([^)]+)\)", text):
+        chunk = (m.group(1) or "").strip()
+        # filtra "IVA incluído" etc
+        if len(chunk) < 3:
+            continue
+        # parte em múltiplos
+        refs.extend(_split_possible_multi_ref(chunk))
+
+    # 2) padrões "SKU: XXX"
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", text, flags=re.I):
+        refs.extend(_split_possible_multi_ref(m.group(1)))
+
+    # dedup mantendo ordem
+    seen = set()
+    out = []
+    for r in refs:
+        rr = r.strip().upper()
+        if rr and rr not in seen:
+            seen.add(rr)
+            out.append(rr)
+    return out[:30]
+
+def _canon_url_safe(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
     try:
-        if not StarletteRequest:
-            return False
+        return _canon_ig_url(u)  # se existir
+    except Exception:
+        return u
 
-        # evitar instalar 2x
-        if getattr(app.state, "_hf_ask_state_mw", False):
-            return True
-
-        @app.middleware("http")
-        async def _hf_capture_ask_state(request: StarletteRequest, call_next):
-            try:
-                if request.url.path == "/ask" and request.method.upper() == "POST":
-                    body = await request.body()  # consome
-                    # repõe para endpoints que fazem await request.json()
-                    try:
-                        request._body = body  # starlette internal, mas é o truque clássico
-                    except Exception:
-                        pass
-
-                    try:
-                        import json
-                        data = json.loads(body.decode("utf-8") or "{}") if body else {}
-                    except Exception:
-                        data = {}
-
-                    uid = (data.get("user_id") or "").strip() or "anon"
-                    ns = (data.get("namespace") or "").strip() or None
-                    request.state._hf_user_id = uid
-                    request.state._hf_namespace = ns
-            except Exception:
-                pass
-
-            return await call_next(request)
-
-        app.state._hf_ask_state_mw = True
-        try:
-            log.info("[hotfix-links] middleware /ask state instalado")
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix-links] middleware falhou: {e}")
-        except Exception:
-            pass
-        return False
-
-_install_ask_state_middleware()
-
-
-# -----------------------------
-# 1) Função: anexar bloco final com TODOS os links do quote aberto
-# -----------------------------
-def _append_all_quote_links(answer: str, user_id: str, namespace: str) -> str:
-    if not answer:
-        return answer
-
-    # evita duplicação
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
-        return answer
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    uid = (user_id or "anon").strip() or "anon"
-
-    # obter quote aberto
+def _get_cat_by_ref_safe(ns: str, ref: str) -> Optional[Dict[str, Any]]:
     try:
-        # se existir _quote_has_open no teu runtime, usa; senão vai direto ao get_open
+        return _catalog_get_by_ref(ns, ref)  # já tens no código
+    except Exception:
+        return None
+
+def _get_open_quote_items_safe(user_id: str, namespace: str) -> List[Dict[str, Any]]:
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        uid = (user_id or "anon").strip() or "anon"
+        # há hotfixes teus com _quote_has_open; se não existir, ignora
         qid = None
         try:
-            qid = _quote_has_open(uid, ns)
+            qid = _quote_has_open(uid, ns)  # type: ignore
         except Exception:
             qid = None
         if not qid:
             qid = _quote_get_open(uid, ns)
-        if not qid:
-            return answer
-
-        items = _quote_list_items(qid) or []
-        if not items:
-            return answer
+        return _quote_list_items(qid) or []
     except Exception:
-        return answer
+        return []
 
+def _build_links_from_items(items: List[Dict[str, Any]], ns: str) -> List[Tuple[str, str]]:
     links: List[Tuple[str, str]] = []
     seen = set()
 
-    for it in items:
-        ref = (it.get("ref") or "").strip()  # ref == SKU
+    for it in (items or []):
+        ref  = (it.get("ref") or "").strip()
         name = (it.get("name_snapshot") or "").strip()
-        url = (it.get("url_snapshot") or "").strip()
+        url  = (it.get("url_snapshot") or "").strip()
 
-        # fallback catálogo por SKU/ref
-        if (not url) and ref:
-            try:
-                cat = _catalog_get_by_ref(ns, ref)
+        # se ref tiver múltiplos, tenta primeiro manter o "ref cru" para label,
+        # mas o URL tem de existir; se não existir, tentamos por cada subref
+        if not url and ref:
+            # tenta catálogo pelo ref inteiro
+            cat = _get_cat_by_ref_safe(ns, ref)
+            if cat:
+                url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                if not name:
+                    name = (cat.get("name") or "").strip()
+
+        if not url and ref:
+            # tenta por subrefs (LIN0030 + LIN0110MA etc)
+            for subref in _split_possible_multi_ref(ref):
+                cat = _get_cat_by_ref_safe(ns, subref)
                 if cat:
                     url = (cat.get("url_canonical") or cat.get("url") or "").strip()
                     if not name:
                         name = (cat.get("name") or "").strip()
-            except Exception:
-                pass
+                    # label fica com o ref original (mais informativo no orçamento)
+                    break
 
+        url = _canon_url_safe(url)
         if not url:
             continue
-
-        # normalizar url (se existir helper)
-        try:
-            url = _canon_ig_url(url)
-        except Exception:
-            pass
 
         label = name or ref or "Produto"
         if ref and ref not in label:
@@ -6109,6 +6103,57 @@ def _append_all_quote_links(answer: str, user_id: str, namespace: str) -> str:
         seen.add(key)
         links.append((label, url))
 
+    return links
+
+def _build_links_from_text_fallback(answer: str, ns: str) -> List[Tuple[str, str]]:
+    refs = _extract_refs_from_budget_text(answer)
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    for ref in refs:
+        cat = _get_cat_by_ref_safe(ns, ref)
+        if not cat:
+            continue
+        url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+        url = _canon_url_safe(url)
+        if not url:
+            continue
+        name = (cat.get("name") or "").strip() or ref
+        label = f"{name} — {ref}" if ref not in name else name
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
+
+    return links
+
+def _append_links_block_always(answer: str, user_id: str, namespace: str) -> str:
+    """
+    Em orçamento: garante um bloco final com links por item.
+    Não remove links existentes (ex.: "— ver produto"), mas garante o bloco final.
+    """
+    if not answer:
+        return answer
+
+    # já tem o bloco final?
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+        return answer
+
+    if not _answer_looks_like_budget(answer):
+        return answer
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    uid = (user_id or "anon").strip() or "anon"
+
+    items = _get_open_quote_items_safe(uid, ns)
+    links = _build_links_from_items(items, ns)
+
+    # fallback: se o orçamento foi “multi-pedido de uma vez” e o quotes.db não ficou completo,
+    # tenta extrair refs do próprio texto do orçamento
+    if not links:
+        links = _build_links_from_text_fallback(answer, ns)
+
     if not links:
         return answer
 
@@ -6118,11 +6163,12 @@ def _append_all_quote_links(answer: str, user_id: str, namespace: str) -> str:
 
     return answer.rstrip() + "\n" + "\n".join(block)
 
-
-# -----------------------------
-# 2) Wrapper: embrulhar TODAS as rotas /ask e anexar links no fim
-# -----------------------------
-def _wrap_all_ask_routes_append_links():
+# -----------------------------------------------------------------------------
+# WRAP: embrulhar TODAS as rotas POST /ask
+# - Se o endpoint recebe Request e lê json(), nós preservamos o body (senão o
+#   body fica “consumido”).
+# -----------------------------------------------------------------------------
+def _wrap_all_ask_routes_force_links():
     try:
         wrapped = 0
         for r in getattr(app, "routes", []):
@@ -6135,79 +6181,69 @@ def _wrap_all_ask_routes_append_links():
             ep = getattr(r, "endpoint", None)
             if not callable(ep):
                 continue
-
-            # evita double-wrap
-            if getattr(ep, "_hf_append_links_wrapped", False):
+            if getattr(ep, "_hf_force_links_wrapped", False):
                 continue
 
             async def _endpoint_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                # tentar capturar user_id/namespace a partir do request (sem quebrar o endpoint)
+                user_id = "anon"
+                namespace = None
+
+                # 1) FastAPI Request: guardar body e repor
+                try:
+                    req = args[0] if args else None
+                    if req is not None and hasattr(req, "body"):
+                        body = await req.body()
+                        # repor para o endpoint original conseguir ler json() outra vez
+                        try:
+                            req._body = body  # starlette Request
+                        except Exception:
+                            pass
+                        try:
+                            import json
+                            data = json.loads(body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body))
+                            user_id = (data.get("user_id") or "anon").strip() or "anon"
+                            namespace = (data.get("namespace") or "").strip() or None
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 resp = await __ep(*args, **kwargs)
 
                 try:
                     if not isinstance(resp, dict):
                         return resp
-
                     answer = resp.get("answer") or resp.get("response") or ""
                     if not answer:
                         return resp
 
-                    # 1) tentar obter Request (Starlette/FastAPI) e ler state
-                    user_id = None
-                    namespace = None
-
-                    req_obj = None
-                    if args:
-                        # normalmente o 1º arg em endpoints Request-based é o request
-                        req_obj = args[0]
-
-                    if req_obj is None:
-                        # fallback: procurar nos kwargs
-                        for v in kwargs.values():
-                            if hasattr(v, "url") and hasattr(v, "method"):
-                                req_obj = v
-                                break
-
-                    if req_obj is not None and hasattr(req_obj, "state"):
-                        user_id = getattr(req_obj.state, "_hf_user_id", None)
-                        namespace = getattr(req_obj.state, "_hf_namespace", None)
-
-                    # 2) fallback: tentar no próprio payload de resposta (se existir)
-                    if not namespace:
-                        try:
-                            namespace = ((resp.get("rag") or {}).get("namespace"))  # teu payload já devolve isto
-                        except Exception:
-                            pass
-
-                    fixed = _append_all_quote_links(answer, user_id or "anon", namespace or DEFAULT_NAMESPACE)
+                    fixed = _append_links_block_always(answer, user_id, namespace or DEFAULT_NAMESPACE)
                     if fixed != answer:
                         resp["answer"] = fixed
-
+                    return resp
                 except Exception:
                     return resp
 
-                return resp
-
-            _endpoint_wrapped._hf_append_links_wrapped = True
+            _endpoint_wrapped._hf_force_links_wrapped = True
             r.endpoint = _endpoint_wrapped
             wrapped += 1
 
         try:
-            log.info(f"[hotfix-links] aplicado: /ask routes wrapped={wrapped}")
+            log.info(f"[hotfix-force-links] aplicado: /ask routes wrapped={wrapped}")
         except Exception:
             pass
-
         return True
     except Exception as e:
         try:
-            log.warning(f"[hotfix-links] wrap falhou: {e}")
+            log.warning(f"[hotfix-force-links] falhou: {e}")
         except Exception:
             pass
         return False
 
-_wrap_all_ask_routes_append_links()
-
+_wrap_all_ask_routes_force_links()
 # =============================================================================
-# FIM HOTFIX FINAL — Links multi-itens garantidos
+# FIM HOTFIX
 # =============================================================================
 
 
