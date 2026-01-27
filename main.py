@@ -1111,7 +1111,8 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
     out = resolver.smart_fix_text(out, url_by_term_conf)
 
     # 5) se ainda não houver nenhum link IG, tenta injetar 1 com maior confiança
-    if IG_HOST not in out.lower() and url_by_term_conf:
+
+	    if url_by_term_conf:
         best_t = max(url_by_term_conf.items(), key=lambda kv: kv[1][1])  # maior confiança
         best_url = best_t[1][0]
         lines = out.splitlines()
