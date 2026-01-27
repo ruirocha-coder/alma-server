@@ -1109,17 +1109,21 @@ def _inject_links_from_rag(text: str, user_query: str, namespace: Optional[str],
 
     # 4) corrige URLs IG errados (apenas se confiança >= min_conf)
     out = resolver.smart_fix_text(out, url_by_term_conf)
-
-    # 5) se ainda não houver nenhum link IG, tenta injetar 1 com maior confiança
-
-	    if url_by_term_conf:
-        best_t = max(url_by_term_conf.items(), key=lambda kv: kv[1][1])  # maior confiança
+   
+	# 5) se ainda não houver nenhum link IG, tenta injetar 1 com maior confiança
+    if url_by_term_conf:
+        best_t = max(
+            url_by_term_conf.items(),
+            key=lambda kv: kv[1][1]  # maior confiança
+        )
         best_url = best_t[1][0]
+
         lines = out.splitlines()
         for i, l in enumerate(lines):
             if not _MD_LINK_RE.search(l):
                 lines[i] = l + f" — [ver produto]({best_url})"
-                out = "\n".join(lines); break
+                out = "\n".join(lines)
+                break
 
     # 6) reforço para pedidos de orçamento: linka nomes dos itens
     if "orçament" in (user_query or "").lower() and url_by_term_conf:
