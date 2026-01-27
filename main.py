@@ -5860,7 +5860,113 @@ except Exception:
 # FIM HOTFIX — quote_mode multi-itens
 # =============================================================================
 
+# =============================================================================
+# HOTFIX FINAL DEFINITIVO
+# Links de produtos sempre no fim do orçamento (fonte: quotes.db)
+# =============================================================================
 
+def _append_quote_links_final(answer: str, user_id: str, namespace: str) -> str:
+    """
+    Acrescenta no fim da resposta:
+
+    Links dos produtos:
+    - Nome — SKU
+      https://...
+
+    Fonte única: quote aberto em quotes.db
+    """
+
+    if not answer:
+        return answer
+
+    # evita duplicação
+    if "Links dos produtos:" in answer:
+        return answer
+
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        uid = (user_id or "anon").strip() or "anon"
+
+        quote_id = _quote_has_open(uid, ns) or _quote_get_open(uid, ns)
+        if not quote_id:
+            return answer
+
+        items = _quote_list_items(quote_id) or []
+        if len(items) < 1:
+            return answer
+
+    except Exception:
+        return answer
+
+    links = []
+    seen = set()
+
+    for it in items:
+        ref = (it.get("ref") or "").strip()
+        name = (it.get("name_snapshot") or "").strip()
+        url = (it.get("url_snapshot") or "").strip()
+
+        # fallback catálogo
+        if not url and ref:
+            try:
+                cat = _catalog_get_by_ref(ns, ref)
+                if cat:
+                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+                    if not name:
+                        name = (cat.get("name") or "").strip()
+            except Exception:
+                pass
+
+        if not url:
+            continue
+
+        try:
+            url = _canon_ig_url(url)
+        except Exception:
+            pass
+
+        label = name or ref or "Produto"
+        if ref and ref not in label:
+            label = f"{label} — {ref}"
+
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+
+        seen.add(key)
+        links.append((label, url))
+
+    if not links:
+        return answer
+
+    block = ["", "Links dos produtos:"]
+    for label, url in links:
+        block.append(f"- {label}")
+        block.append(f"  {url}")
+
+    return answer.rstrip() + "\n" + "\n".join(block)
+
+
+# -----------------------------------------------------------------------------
+# PATCH DIRETO DO PIPELINE /ask
+# -----------------------------------------------------------------------------
+
+_original_postprocess_answer = _postprocess_answer
+
+def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_top_k: int):
+    text = _original_postprocess_answer(answer, user_query, namespace, decided_top_k)
+
+    # tenta obter user_id do último request (já existe no teu runtime)
+    try:
+        user_id = CURRENT_USER_ID
+    except Exception:
+        user_id = "anon"
+
+    return _append_quote_links_final(text, user_id, namespace)
+
+# =============================================================================
+# FIM HOTFIX FINAL
+# =============================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
