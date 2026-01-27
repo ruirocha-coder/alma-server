@@ -5967,227 +5967,161 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 # FIM HOTFIX FINAL
 # =============================================================================
-
 # =============================================================================
-# HOTFIX FINAL DEFINITIVO (robusto)
-# - Garante "Links dos produtos" SEMPRE no fim em respostas de orçamento
-# - NÃO depende do texto do LLM para extrair SKUs
-# - NÃO depende de wraps de rota (funciona com múltiplas /ask)
-# - Usa quotes.db (quote aberto por user_id + namespace)
+# HOTFIX 2025 — Links completos de TODOS os itens no final do orçamento
+# Usa quotes.db como fonte única — ignora o que o LLM escreveu
 # =============================================================================
 
-import json
 import re
-from typing import Any, Dict, List, Tuple, Optional
+from typing import List, Tuple
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-
-def _hf_is_budget_intent(question: str, answer: str) -> bool:
-    q = (question or "").strip().lower()
-    a = (answer or "").strip().lower()
-    # Heurística simples e prática: orçamento/quote/preço
-    return (
-        ("orçament" in q) or ("orcament" in q) or ("cotação" in q) or ("cotacao" in q) or ("proforma" in q) or ("preço" in q) or ("preco" in q)
-        or ("orçament" in a) or ("orcament" in a)
-    )
-
-def _hf_append_links_from_open_quote(answer: str, user_id: str, namespace: str) -> str:
-    if not answer:
-        return answer
-
-    # evita duplicação
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
-        return answer
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    uid = (user_id or "anon").strip() or "anon"
-
-    # Só tenta se houver quote aberto; NÃO criar quotes vazios aqui
-    try:
-        qid = _quote_has_open(uid, ns)
-    except Exception:
-        qid = None
-
-    if not qid:
-        return answer
-
-    try:
-        items = _quote_list_items(qid) or []
-    except Exception:
-        items = []
-
-    if not items:
-        return answer
-
-    links: List[Tuple[str, str]] = []
+def _get_all_quote_item_links(uid: str, ns: str) -> List[Tuple[str, str]]:
+    """ Devolve lista (label, url) de todos os itens no orçamento aberto """
+    links = []
     seen = set()
-
-    for it in items:
-        ref = (it.get("ref") or "").strip()
-        name = (it.get("name_snapshot") or "").strip()
-        url = (it.get("url_snapshot") or "").strip()
-
-        # fallback catálogo (se o quote tiver ref mas não tiver url_snapshot)
-        if (not url) and ref:
-            try:
-                cat = _catalog_get_by_ref(ns, ref)
-                if cat:
-                    url = (cat.get("url_canonical") or cat.get("url") or "").strip()
-                    if not name:
-                        name = (cat.get("name") or "").strip()
-            except Exception:
-                pass
-
+    
+    quote_id = _quote_has_open(uid, ns) or _quote_get_open(uid, ns)
+    if not quote_id:
+        return links
+        
+    items = _quote_list_items(quote_id) or []
+    for item in items:
+        ref = (item.get("ref") or "").strip()
+        name = (item.get("name_snapshot") or "").strip()
+        url = (item.get("url_snapshot") or "").strip()
+        
+        # fallback catálogo se faltar url_snapshot
+        if not url and ref:
+            cat = _catalog_get_by_ref(ns, ref)
+            if cat:
+                url = cat.get("url") or cat.get("url_canonical") or ""
+                if not name:
+                    name = cat.get("name") or ""
+        
         if not url:
             continue
-
-        try:
-            url = _canon_ig_url(url)
-        except Exception:
-            pass
-
-        label = name or ref or "Produto"
-        if ref and (ref not in label):
+            
+        url = _canon_ig_url(url) or url
+        label = name or ref or f"Produto {ref}"
+        if ref and ref not in label:
             label = f"{label} — {ref}"
-
+            
         key = (label.lower(), url.lower())
         if key in seen:
             continue
         seen.add(key)
         links.append((label, url))
+    
+    return links
 
-    # Se não encontrou URLs, não inventa bloco
+
+def _append_all_products_links_block(answer: str, user_id: str, namespace: str) -> str:
+    """ Adiciona bloco final com TODOS os links — só se for orçamento """
+    if not answer or "Links dos produtos:" in answer:
+        return answer
+        
+    # Deteta se é resposta de orçamento (pergunta ou resposta)
+    is_budget = any(kw in (user_query.lower() + answer.lower()) for kw in [
+        "orçament", "orcament", "cotação", "cotacao", "proforma", "orçamento completo"
+    ])
+    if not is_budget:
+        return answer
+    
+    links = _get_all_quote_item_links(user_id, namespace)
     if not links:
         return answer
+    
+    block = ["", "**Links dos produtos no orçamento:**"]
+    for label, url in links:
+        block.append(f"- [{label}]({url})")
+    
+    return answer.rstrip() + "\n\n" + "\n".join(block)
 
-    block = ["", "Links dos produtos:"]
-    for label, url in links[:30]:
-        block.append(f"- {label}")
-        block.append(f"  {url}")
 
-    return answer.rstrip() + "\n" + "\n".join(block)
+# =============================================================================
+# Middleware FINAL (substitui ou complementa o anterior)
+# =============================================================================
 
-class _HotfixAskLinksMiddleware(BaseHTTPMiddleware):
+class _FinalLinksBudgetMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Só intercepta POST /ask
-        if request.method != "POST" or request.url.path != "/ask":
+        if request.method != "POST" or request.url.path not in ("/ask", "/ask_get"):
             return await call_next(request)
-
-        # Ler body (e repor para o endpoint ler também)
+            
         body_bytes = await request.body()
         async def _receive():
             return {"type": "http.request", "body": body_bytes, "more_body": False}
-        request._receive = _receive  # noqa: SLF001 (hotfix intencional)
-
-        # Parse request json (para user_id/namespace/question)
+        request._receive = _receive  # type: ignore
+        
         user_id = "anon"
-        namespace = None
+        namespace = DEFAULT_NAMESPACE
         question = ""
         try:
-            data = json.loads(body_bytes.decode("utf-8") or "{}") if body_bytes else {}
-            if isinstance(data, dict):
-                user_id = (data.get("user_id") or "").strip() or "anon"
-                namespace = (data.get("namespace") or "").strip() or None
-                question = (data.get("question") or "").strip()
-        except Exception:
+            data = json.loads(body_bytes.decode("utf-8", errors="ignore") or "{}")
+            user_id = data.get("user_id", "anon").strip()
+            namespace = data.get("namespace", DEFAULT_NAMESPACE).strip()
+            question = data.get("question", "").strip()
+        except:
             pass
-
-        # Chama o endpoint
+        
         response = await call_next(request)
-
-        # Só mexe em JSON
-        ctype = (response.headers.get("content-type") or "").lower()
-        if "application/json" not in ctype:
+        
+        if "application/json" not in response.headers.get("content-type", "").lower():
             return response
-
-        # Ler corpo da response (StreamingResponse-safe)
+            
         try:
-            chunks = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk)
-            resp_body = b"".join(chunks)
-        except Exception:
-            return response
-
-        try:
-            payload = json.loads(resp_body.decode("utf-8") or "{}")
-        except Exception:
-            # repõe resposta original
+            chunks = [chunk async for chunk in response.body_iterator]
+            body = b"".join(chunks)
+            payload = json.loads(body.decode("utf-8", errors="ignore"))
+        except:
+            # repõe resposta original se falhar
             return Response(
-                content=resp_body,
+                content=body,
                 status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
+                headers=dict(response.headers)
             )
-
-        if not isinstance(payload, dict):
+        
+        answer_key = next((k for k in ("answer", "response") if k in payload), None)
+        if not answer_key:
+            return Response(content=body, status_code=response.status_code, headers=dict(response.headers))
+            
+        original_answer = payload[answer_key]
+        if not isinstance(original_answer, str):
+            return Response(content=body, status_code=response.status_code, headers=dict(response.headers))
+        
+        fixed_answer = _append_all_products_links_block(
+            original_answer,
+            user_id,
+            namespace
+        )
+        
+        if fixed_answer != original_answer:
+            payload[answer_key] = fixed_answer
+            new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers = dict(response.headers)
+            headers["content-length"] = str(len(new_body))
             return Response(
-                content=resp_body,
+                content=new_body,
                 status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
+                headers=headers,
+                media_type="application/json"
             )
-
-        # Extrair texto da resposta
-        answer = payload.get("answer") or payload.get("response") or ""
-        if not isinstance(answer, str) or not answer.strip():
-            return Response(
-                content=resp_body,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
-            )
-
-        # Só aplica em contexto de orçamento (pergunta OU resposta)
-        if not _hf_is_budget_intent(question, answer):
-            return Response(
-                content=resp_body,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
-            )
-
-        fixed = _hf_append_links_from_open_quote(answer, user_id, namespace or DEFAULT_NAMESPACE)
-        if fixed != answer:
-            if "answer" in payload:
-                payload["answer"] = fixed
-            elif "response" in payload:
-                payload["response"] = fixed
-            else:
-                payload["answer"] = fixed
-
-        new_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-        # Reconstroi resposta mantendo status e headers (ajusta content-length)
-        headers = dict(response.headers)
-        headers.pop("content-length", None)
-
+        
         return Response(
-            content=new_body,
+            content=body,
             status_code=response.status_code,
-            headers=headers,
-            media_type=response.media_type or "application/json",
+            headers=dict(response.headers),
+            media_type="application/json"
         )
 
-# Instalar middleware (evita instalar 2x)
+
+# Instalar (evita duplicar)
 try:
-    already = getattr(app.state, "_hf_ask_links_mw", False)
-except Exception:
-    already = False
-
-if not already:
-    app.add_middleware(_HotfixAskLinksMiddleware)
-    try:
-        app.state._hf_ask_links_mw = True
-        log.info("[hotfix] middleware /ask links instalado (quotes.db -> Links dos produtos).")
-    except Exception:
-        pass
-
-# =============================================================================
-# FIM HOTFIX FINAL DEFINITIVO
-# =============================================================================
+    if not getattr(app.state, "_final_links_mw_installed", False):
+        app.add_middleware(_FinalLinksBudgetMiddleware)
+        app.state._final_links_mw_installed = True
+        log.info("[HOTFIX 2025] Links completos de TODOS os itens no final do orçamento ativado via middleware")
+except Exception as e:
+    log.warning(f"[HOTFIX] Erro ao instalar middleware final de links: {e}")
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
