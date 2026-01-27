@@ -5969,175 +5969,207 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # =============================================================================
 
 # =============================================================================
-# HOTFIX FINAL (sem wraps)
-# Orçamento: anexar SEMPRE links de TODOS os SKUs no fim (fonte: catalog_items)
-# - Aproveita o facto de o orçamento final já conter os SKUs na tabela
-# - Não depende de quotes.db nem de CURRENT_USER_ID
-# - Não interfere em respostas não-orçamento
+# HOTFIX FINAL — Links sempre no fim do ORÇAMENTO (multi-itens)
+# - NÃO depende de quotes.db nem de user_id
+# - Extrai TODOS os SKUs do texto do orçamento e resolve via catalog_items.ref
+# - Anexa um bloco final com 1 link por SKU (dedup)
+# - Não altera o corpo do orçamento, só acrescenta no fim
 # =============================================================================
 
 import re
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-def _hf_answer_looks_like_budget(text: str) -> bool:
+def _looks_like_budget_answer(text: str) -> bool:
     t = (text or "")
-    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b|\bOrçamento Atualizado\b|\bOrçamento Atual\b", t, flags=re.I))
+    # heurística simples: aparece "Orçamento" e uma estrutura de tabela/total
+    if not re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I):
+        return False
+    return True
 
-def _hf_extract_skus_from_answer(answer: str) -> List[str]:
+def _extract_all_skus_from_budget_text(text: str) -> List[str]:
     """
-    Extrai SKUs/refs a partir do texto do orçamento.
-    Cobre:
-      - SKU: XXX
-      - (XXX)
-      - refs em linhas de tabela
-      - refs numéricas (ex.: 100010) mas evita preços (ex.: 2876.00€)
+    Extrai refs/SKUs do texto do orçamento.
+    Suporta:
+      - (100010)
+      - (SKU: LINO0030 + LINO110MA)
+      - SKU: ORK.03.01
+      - tokens tipo 740021316-2-AR
+    Dedup mantendo ordem.
     """
-    a = (answer or "")
-    if not a:
+    t = (text or "")
+    if not t:
         return []
 
-    found: List[str] = []
+    refs: List[str] = []
+
+    # 1) (SKU: ....)
+    for m in re.finditer(r"\(\s*SKU\s*:\s*([^)]+)\)", t, flags=re.I):
+        chunk = m.group(1).strip()
+        parts = re.split(r"\s*(?:\+|,|/|;)\s*", chunk)
+        for p in parts:
+            p = p.strip()
+            if p and re.match(r"^[A-Z0-9][A-Z0-9._\-]{2,}$", p, flags=re.I):
+                refs.append(p)
+
+    # 2) SKU: XXXX (fora de parêntesis)
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
+        refs.append(m.group(1).strip())
+
+    # 3) (XXXX) comum nas tuas linhas (Mono Cadeira (100010), etc.)
+    for m in re.finditer(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", t, flags=re.I):
+        refs.append(m.group(1).strip())
+
+    # 4) fallback: tokens “tipo SKU” em linhas do orçamento (evita apanhar palavras normais)
+    #    só apanha se tiver pelo menos 1 dígito (reduz falsos positivos)
+    for m in re.finditer(r"\b([A-Z0-9][A-Z0-9._\-]{2,})\b", t, flags=re.I):
+        tok = m.group(1).strip()
+        if re.search(r"\d", tok):  # tem dígito => mais provável ser SKU/ref
+            refs.append(tok)
+
+    # dedup mantendo ordem
     seen = set()
-
-    def add(x: str):
-        x = (x or "").strip()
-        if not x:
-            return
-        # evitar apanhar preços / valores
-        if re.fullmatch(r"\d+([.,]\d+)?", x):
-            return
-        k = x.lower()
-        if k in seen:
-            return
-        seen.add(k)
-        found.append(x)
-
-    # 1) "SKU: REF"
-    for m in re.finditer(r"\bSKU\s*[:\-]\s*([A-Z0-9][A-Z0-9._\-]{2,})\b", a, flags=re.I):
-        add(m.group(1))
-
-    # 2) "(REF)" (muito comum no teu output)
-    for m in re.finditer(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", a, flags=re.I):
-        add(m.group(1))
-
-    # 3) refs numéricas (>=4 dígitos) não seguidas de ponto/virgula (evita preços)
-    #    ex.: "100010" apanha; "2876.00" não apanha
-    for m in re.finditer(r"\b(\d{4,})(?![.,]\d)\b", a):
-        add(m.group(1))
-
-    # 4) tokens tipo SKU em linhas de tabela (com hífen/dot/underscore)
-    #    mas filtra tokens que sejam claramente dinheiro (acabam em € ou têm ,xx€)
-    for line in a.splitlines():
-        if "|" not in line:
+    out: List[str] = []
+    for r in refs:
+        ru = r.strip()
+        if not ru:
             continue
-        for tok in re.findall(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", line, flags=re.I):
-            if "€" in tok:
-                continue
-            add(tok)
+        if ru in seen:
+            continue
+        seen.add(ru)
+        out.append(ru)
 
-    return found
+    return out
 
-def _hf_catalog_url_for_ref(namespace: str, ref: str) -> Tuple[str, str]:
+def _append_links_block_from_catalog(answer: str, namespace: str) -> str:
     """
-    Retorna (name, url) para um ref.
-    Usa _catalog_get_by_ref (já existe no teu main).
+    Resolve SKUs via catalog_items.ref (match exato) e anexa bloco final.
     """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    r = (ref or "").strip()
-    if not r:
-        return ("", "")
-    try:
-        cat = _catalog_get_by_ref(ns, r)
-        if not cat:
-            return ("", "")
-        name = (cat.get("name") or "").strip()
-        url = (cat.get("url") or "").strip()
-        if url:
-            try:
-                url = _canon_ig_url(url)
-            except Exception:
-                pass
-        return (name, url)
-    except Exception:
-        return ("", "")
-
-# guarda o original
-try:
-    _force_links_block__prev = _force_links_block
-except Exception:
-    _force_links_block__prev = None
-
-def _force_links_block(answer: str, rag_hits: list, min_links: int = 3) -> str:
-    """
-    Override do _force_links_block:
-      - Se NÃO for orçamento: mantém comportamento antigo (RAG)
-      - Se for orçamento: anexa "Links dos produtos" com TODOS os SKUs encontrados no texto
-    """
-    # 1) se não for orçamento, deixa tudo como estava
-    if not _hf_answer_looks_like_budget(answer):
-        if callable(_force_links_block__prev):
-            return _force_links_block__prev(answer, rag_hits, min_links=min_links)
+    if not answer:
         return answer
 
-    # 2) orçamento: construir bloco final de links por SKU (a partir do próprio texto)
-    try:
-        skus = _hf_extract_skus_from_answer(answer)
-        if not skus:
-            # fallback: se não apanhou nada, deixa o comportamento antigo (se existir)
-            if callable(_force_links_block__prev):
-                return _force_links_block__prev(answer, rag_hits, min_links=min_links)
-            return answer
+    # evita duplicar
+    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
+        return answer
 
-        ns = DEFAULT_NAMESPACE
-        # tenta inferir namespace se o teu código a tiver “em global”; senão fica DEFAULT
+    if not _looks_like_budget_answer(answer):
+        return answer
+
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    refs = _extract_all_skus_from_budget_text(answer)
+
+    if not refs:
+        return answer
+
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    for ref in refs:
         try:
-            # se existir uma forma óbvia no runtime
-            ns = (globals().get("CURRENT_NAMESPACE") or ns)
+            cat = _catalog_get_by_ref(ns, ref) if ref else None
+        except Exception:
+            cat = None
+
+        if not cat:
+            continue
+
+        url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+        name = (cat.get("name") or "").strip()
+
+        if not url:
+            continue
+
+        try:
+            url = _canon_ig_url(url)
         except Exception:
             pass
 
-        links: List[Tuple[str, str]] = []
-        seen = set()
+        label = name or ref
+        if ref and ref not in label:
+            label = f"{label} — {ref}"
 
-        for ref in skus:
-            name, url = _hf_catalog_url_for_ref(ns, ref)
-            if not url:
-                continue
-            label = name or ref
-            if ref and ref not in label:
-                label = f"{label} — {ref}"
-            key = (label.lower(), url.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            links.append((label, url))
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
 
-        if not links:
-            # nada no catálogo → não inventar
-            return answer
-
-        # evita duplicar
-        if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
-            return answer
-
-        block = ["", "Links dos produtos:"]
-        for label, url in links[:15]:
-            block.append(f"- [{label}]({url})")
-
-        return answer.rstrip() + "\n" + "\n".join(block)
-    except Exception:
-        # em caso de falha, não rebenta o /ask
-        if callable(_force_links_block__prev):
-            return _force_links_block__prev(answer, rag_hits, min_links=min_links)
+    if not links:
         return answer
 
-try:
-    log.info("[hotfix] _force_links_block override: orçamentos passam a listar links por SKU no fim.")
-except Exception:
-    pass
+    block = ["", "Links dos produtos:"]
+    for label, url in links[:20]:
+        block.append(f"- [{label}]({url})")
 
+    return answer.rstrip() + "\n" + "\n".join(block)
+
+def _hotfix_wrap_ask_append_budget_links():
+    """
+    Envolve a rota /ask (POST) existente para:
+      - manter a resposta original
+      - anexar Links dos produtos no fim quando for orçamento
+    """
+    try:
+        target_routes = []
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) == "/ask":
+                methods = getattr(r, "methods", set()) or set()
+                if "POST" in methods and callable(getattr(r, "endpoint", None)):
+                    target_routes.append(r)
+
+        wrapped = 0
+        for r in target_routes:
+            ep = r.endpoint
+            if getattr(ep, "_hf_budget_links_wrapped", False):
+                continue
+
+            async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+                    ans = resp.get("answer") or resp.get("response") or ""
+                    if not ans:
+                        return resp
+
+                    # tenta namespace pelo payload já devolvido
+                    ns = None
+                    try:
+                        ns = ((resp.get("rag") or {}).get("namespace")) or None
+                    except Exception:
+                        ns = None
+                    ns = ns or DEFAULT_NAMESPACE
+
+                    fixed = _append_links_block_from_catalog(ans, ns)
+                    if fixed != ans:
+                        # preserva chave existente
+                        if "answer" in resp:
+                            resp["answer"] = fixed
+                        else:
+                            resp["response"] = fixed
+                    return resp
+                except Exception:
+                    return resp
+
+            _ep_wrapped._hf_budget_links_wrapped = True
+            r.endpoint = _ep_wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-budget-links] aplicado: /ask routes wrapped={wrapped}")
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-budget-links] falhou: {e}")
+        except Exception:
+            pass
+        return False
+
+_hotfix_wrap_ask_append_budget_links()
 # =============================================================================
-# FIM HOTFIX
+# FIM HOTFIX FINAL
 # =============================================================================
 
 # ---------------------------------------------------------------------------------------
