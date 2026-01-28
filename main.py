@@ -6421,315 +6421,158 @@ _hotfix_v2_wrap_all_ask_routes_budget_cleanup()
 # =============================================================================
 # FIM HOTFIX EXTRA v2
 # =============================================================================
+
 # =============================================================================
-# HOTFIX — Fallback semântico (ORÇAMENTOS): encontrar produto por nome incompleto
-# Objetivo:
-# - Em modo orçamento, se a pesquisa SQL por LIKE falhar ("Sem dados no catálogo"),
-#   faz matching semântico (token overlap, accent-insensitive) para escolher um seed.
-# - Isso permite listar SEMPRE TODAS as variantes quando o SKU não está totalmente definido.
-#
-# Colar no FIM do main.py
+# HOTFIX — Seed semântica robusta (acentos + tokens + scoring) para variantes/orçamentos
+# Cola no FIM do main.py
+# Objetivo: quando o user pede "faz orçamento <produto>" sem SKU, conseguir SEMPRE
+#           ancorar o produto correto e assim listar TODAS as variantes.
 # =============================================================================
 
 import re
 import unicodedata
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Dict, Any, List, Tuple
 
-try:
-    _hf_prev_seed_row_for_product = _seed_row_for_product
-except Exception:
-    _hf_prev_seed_row_for_product = None
-
-def _hf_norm(s: str) -> str:
-    s = (s or "").strip().lower()
+def _hf_strip_accents(s: str) -> str:
     if not s:
         return ""
-    # remove acentos
-    s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
-    # normaliza separadores e remove pontuação (mantém . _ - para SKUs)
-    s = re.sub(r"[’'`´]", "", s)
-    s = re.sub(r"[^a-z0-9\.\-_]+", " ", s)
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
+
+def _hf_norm_loose(s: str) -> str:
+    s = (s or "").strip()
+    s = _hf_strip_accents(s)
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s\-\.]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def _hf_tokens_for_product_query(question: str) -> List[str]:
-    q = _extract_product_terms_pt(question) if " _extract_product_terms_pt" else (question or "")
-    nq = _hf_norm(q)
-
-    # remove termos “de intenção” comuns (mesmo que escapem ao extractor)
-    nq = re.sub(r"\b(faz|fazer|gera|gerar|cria|criar|orcamento|orçamento|cotacao|cotação|preco|preço|proforma|pro-forma|junta|adiciona|inclui)\b", " ", nq)
-    nq = re.sub(r"\b(\d+)\b", " ", nq)  # remove quantidades soltas
-    nq = re.sub(r"\s+", " ", nq).strip()
-
-    toks = [t for t in nq.split(" ") if len(t) >= 3]
-    # evita tokens demasiado genéricos
-    stop = {"sofa", "cama", "mesa", "cadeira", "base"}  # ajusta se quiseres
+def _hf_tokens(s: str) -> List[str]:
+    n = _hf_norm_loose(s)
+    toks = [t for t in n.split() if len(t) >= 3]
+    # remove palavras muito genéricas (ajusta se quiseres)
+    stop = {"com", "sem", "para", "uma", "uns", "umas", "the", "and", "or", "dos", "das", "por"}
     toks = [t for t in toks if t not in stop]
-    return toks[:12]
+    return toks[:10]
 
-def _hf_semantic_seed_from_catalog(namespace: str, question: str) -> Optional[Tuple[str, str, str, str, Any]]:
-    """
-    Devolve (ref, name, url, variant_name, price) ou None.
-    Faz scoring por overlap de tokens em (name + variant_name + ref).
-    """
-    toks = _hf_tokens_for_product_query(question)
-    if not toks:
-        return None
-
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-
-    # carrega um conjunto razoável de candidatos (namespace inteiro)
-    # Nota: se o catálogo for ENORME, depois otimizamos com um WHERE por token.
-    rows = []
-    try:
-        with sqlite3.connect(CATALOG_DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT ref, name, url, url_canonical, variant_name, price
-                FROM catalog_items
-                WHERE namespace = ?
-                """,
-                (ns,)
-            )
-            rows = cur.fetchall()
-    except Exception:
-        return None
-
-    best = None
-    best_score = 0
-
-    for ref, name, url, url_canon, vname, price in rows:
-        blob = " ".join([str(ref or ""), str(name or ""), str(vname or "")])
-        nblob = _hf_norm(blob)
-        if not nblob:
-            continue
-
-        # score: tokens contidos + bónus se começar por token + bónus se ref bate
-        score = 0
-        for t in toks:
-            if t in nblob:
-                score += 3
-            if nblob.startswith(t):
-                score += 1
-
-        # bónus se algum token aparecer inteiro no name (mais forte)
-        nname = _hf_norm(name or "")
-        for t in toks:
-            if t in nname:
-                score += 2
-
-        if score > best_score:
-            # URL: preferir canonical, depois url
-            chosen_url = (url_canon or url or "") or ""
-            best = (str(ref or ""), str(name or ""), chosen_url, str(vname or ""), price)
-            best_score = score
-
-    # threshold mínimo: evita matches absurdos
-    if best and best_score >= 6:
-        return best
-    return None
-
-def _hf_is_quote_intent(question: str) -> bool:
-    try:
-        return bool(_is_budget_intent_pt(question))
-    except Exception:
-        q = (question or "").lower()
-        return any(k in q for k in ("orçament", "orcament", "cotação", "cotacao", "proforma", "preço", "preco"))
-
-def _seed_row_for_product(namespace: str, question: str):
-    """
-    Wrapper:
-    - tenta a versão anterior (rápida)
-    - se falhar e for ORÇAMENTO/QUOTE, aplica fallback semântico
-    """
-    # 1) tenta comportamento anterior
-    if _hf_prev_seed_row_for_product:
-        try:
-            got = _hf_prev_seed_row_for_product(namespace, question)
-            if got:
-                return got
-        except Exception:
-            pass
-
-    # 2) fallback semântico só em quote/orçamento
-    if _hf_is_quote_intent(question):
-        try:
-            sem = _hf_semantic_seed_from_catalog(namespace, question)
-            if sem:
-                return sem
-        except Exception:
-            pass
-
-    return None
-
-try:
-    log.info("[hotfix-semantic-quote] ativo: fallback semântico para seed de produto em modo orçamento.")
-except Exception:
-    pass
-
-# =============================================================================
-# FIM HOTFIX
-# =============================================================================
-
-# =============================================================================
-# HOTFIX — Fallback semântico (sem LLM) para lookup por NOME em orçamentos/variantes
-# - Resolve falhas por acentos ("sofá" vs "sofa") e rigidez de matching
-# - Mantém o resto do sistema intacto: só entra quando o lookup por nome falha
-# - Objetivo: quando pedido de orçamento não vem totalmente definido -> listar SEMPRE variantes (todas)
-# =============================================================================
-
-from typing import Any, Dict, List, Optional, Tuple
-import time
-import re
-import json
-
-_HF_NAME_INDEX: Dict[str, Dict[str, Any]] = {}  # ns -> {"ts":..., "rows":[...]}
-_HF_NAME_INDEX_TTL_SEC = 15 * 60  # 15 min (ajusta se quiseres)
-
-def _hf_is_budgetish(text: str) -> bool:
-    t = (text or "").lower()
-    return ("orçamento" in t) or ("orcamento" in t) or ("proforma" in t)
-
-def _hf_norm(s: str) -> str:
-    # usa a tua normalização "forte" (remove acentos) se existir
-    try:
-        return _norm_txt(s or "")
-    except Exception:
-        return (s or "").strip().lower()
-
-def _hf_load_name_index(namespace: str) -> List[Dict[str, Any]]:
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    now = time.time()
-
-    cached = _HF_NAME_INDEX.get(ns)
-    if cached and (now - cached.get("ts", 0) < _HF_NAME_INDEX_TTL_SEC):
-        return cached.get("rows", [])
-
-    rows: List[Dict[str, Any]] = []
-    try:
-        conn = _catalog_conn(ns)  # usa a tua função existente
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT ref, name, url, url_canonical, variants_json
-            FROM catalog_items
-            WHERE namespace = ?
-        """, (ns,))
-        for ref, name, url, url_canonical, variants_json in cur.fetchall():
-            ref_s = (ref or "").strip()
-            name_s = (name or "").strip()
-            rows.append({
-                "ref": ref_s,
-                "name": name_s,
-                "url": (url or "").strip(),
-                "url_canonical": (url_canonical or "").strip(),
-                "variants_json": variants_json,
-                "_n_ref": _hf_norm(ref_s),
-                "_n_name": _hf_norm(name_s),
-            })
-    except Exception:
-        # se falhar, deixa vazio (não rebenta runtime)
-        rows = []
-
-    _HF_NAME_INDEX[ns] = {"ts": now, "rows": rows}
-    return rows
-
-def _hf_score_name(query_norm: str, item: Dict[str, Any]) -> float:
-    q = (query_norm or "").strip()
-    if not q:
+def _hf_score(query_norm: str, cand_norm: str) -> float:
+    # score simples: proporção de tokens do query presentes no candidato
+    q_toks = set(query_norm.split())
+    if not q_toks:
         return 0.0
+    hits = sum(1 for t in q_toks if t in cand_norm)
+    return hits / max(1, len(q_toks))
 
-    nname = item.get("_n_name", "") or ""
-    nref  = item.get("_n_ref", "") or ""
-
-    # match direto
-    if q == nname or q == nref:
-        return 100.0
-
-    score = 0.0
-
-    # substring forte
-    if q and q in nname:
-        score += 40.0
-        # quanto mais próximo do início melhor
-        if nname.startswith(q):
-            score += 10.0
-
-    # overlap de tokens
-    qtoks = [t for t in re.split(r"\s+", q) if t]
-    if qtoks:
-        hits = sum(1 for t in qtoks if t in nname)
-        score += 6.0 * hits
-
-        # penaliza queries muito genéricas
-        if len(qtoks) == 1 and len(qtoks[0]) <= 3:
-            score -= 8.0
-
-    # pequena ajuda se a ref aparece
-    if q and q in nref:
-        score += 20.0
-
-    return score
-
-def _hf_fuzzy_candidates_by_name(namespace: str, term: str, limit: int = 25) -> List[Dict[str, Any]]:
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    qn = _hf_norm(term)
-
-    rows = _hf_load_name_index(ns)
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for it in rows:
-        sc = _hf_score_name(qn, it)
-        if sc > 0:
-            scored.append((sc, it))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    out: List[Dict[str, Any]] = []
-    for sc, it in scored[:limit]:
-        out.append({
-            "ref": it.get("ref"),
-            "name": it.get("name"),
-            "url": it.get("url"),
-            "url_canonical": it.get("url_canonical"),
-            "variants_json": it.get("variants_json"),
-            "score": float(sc),
-        })
-    return out
-
-# -----------------------------------------------------------------------------
-# Monkeypatch: quando o lookup SQL por nome falhar (ou vier vazio), usa fallback semântico
-# -----------------------------------------------------------------------------
-try:
-    _hf_orig_catalog_find_candidates_by_name = _catalog_find_candidates_by_name
-except Exception:
-    _hf_orig_catalog_find_candidates_by_name = None
-
-def _catalog_find_candidates_by_name(namespace: str, term_norm: str, limit: int = 25) -> List[Dict[str, Any]]:
+def _seed_row_for_product(question: str, ns: str) -> Optional[Dict[str, Any]]:
     """
-    Override seguro:
-    - tenta a função original (se existir)
-    - se vier vazio, aplica fallback semântico (accent-proof)
-    NOTA: aqui 'term_norm' pode já vir normalizado por _norm_txt; o fallback trabalha bem com isso.
+    Substitui a seed rígida por um fallback robusto:
+    1) LIKE com a pergunta original (acentos preservados)
+    2) LIKE por tokens (AND) para contornar acentos/normalizações
+    3) Scoring em Python (strip accents) em candidatos recentes
     """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    term = (term_norm or "").strip()
+    q_raw = (question or "").strip()
+    if not q_raw:
+        return None
 
-    # 1) tenta original
-    if _hf_orig_catalog_find_candidates_by_name:
+    try:
+        with _catalog_conn() as c:
+            # ------------------------------------------------------------
+            # 1) tentativa: LIKE com texto original (mínima sanitização)
+            # ------------------------------------------------------------
+            like_raw = f"%{_sanitize_like(q_raw[:120])}%"
+            row = c.execute("""
+                SELECT *
+                  FROM catalog_items
+                 WHERE namespace=?
+                   AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
+                 ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                          updated_at DESC
+                 LIMIT 1
+            """, (ns, like_raw, like_raw, like_raw)).fetchone()
+            if row:
+                return dict(row)
+
+            # ------------------------------------------------------------
+            # 2) tentativa: AND de tokens "bons" (evita depender de acentos)
+            # ------------------------------------------------------------
+            toks = _hf_tokens(q_raw)
+            if toks:
+                where_parts = []
+                params: List[Any] = [ns]
+                # exigimos que vários tokens existam no name/summary
+                for t in toks[:6]:
+                    where_parts.append("(name LIKE ? OR summary LIKE ?)")
+                    like_t = f"%{_sanitize_like(t)}%"
+                    params.extend([like_t, like_t])
+
+                sql = f"""
+                    SELECT *
+                      FROM catalog_items
+                     WHERE namespace=?
+                       AND {" AND ".join(where_parts)}
+                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END),
+                              updated_at DESC
+                     LIMIT 30
+                """
+                rows = c.execute(sql, params).fetchall() or []
+                if rows:
+                    # escolhe o melhor por score (python, sem acentos)
+                    qn = _hf_norm_loose(q_raw)
+                    best = None
+                    best_sc = -1.0
+                    for r in rows:
+                        d = dict(r)
+                        cand = " ".join([(d.get("name") or ""), (d.get("summary") or ""), (d.get("ref") or "")])
+                        sc = _hf_score(qn, _hf_norm_loose(cand))
+                        if sc > best_sc:
+                            best_sc = sc
+                            best = d
+                    if best:
+                        return best
+
+            # ------------------------------------------------------------
+            # 3) fallback final: procura nos mais recentes e faz scoring
+            # (isto “salva” casos em que LIKE falha por completo)
+            # ------------------------------------------------------------
+            rows = c.execute("""
+                SELECT *
+                  FROM catalog_items
+                 WHERE namespace=?
+                 ORDER BY updated_at DESC
+                 LIMIT 400
+            """, (ns,)).fetchall() or []
+
+            if not rows:
+                return None
+
+            qn = _hf_norm_loose(q_raw)
+            best = None
+            best_sc = -1.0
+            for r in rows:
+                d = dict(r)
+                cand = " ".join([(d.get("name") or ""), (d.get("summary") or ""), (d.get("ref") or "")])
+                sc = _hf_score(qn, _hf_norm_loose(cand))
+                if sc > best_sc:
+                    best_sc = sc
+                    best = d
+
+            # exige um mínimo para evitar “inventar”
+            if best and best_sc >= 0.34:
+                return best
+
+            return None
+
+    except Exception as e:
         try:
-            res = _hf_orig_catalog_find_candidates_by_name(ns, term, limit=limit)
-            if isinstance(res, list) and len(res) > 0:
-                return res
+            log.warning(f"[hotfix-seed-flex] seed_row falhou: {e}")
         except Exception:
             pass
-
-    # 2) fallback semântico
-    try:
-        return _hf_fuzzy_candidates_by_name(ns, term, limit=limit)
-    except Exception:
-        return []
+        return None
 
 try:
-    log.info("[hotfix] fallback semântico por nome ativo (accent-proof) para orçamentos/variantes.")
+    log.info("[hotfix-seed-flex] seed_row_for_product agora é robusta (acentos+tokens+scoring).")
 except Exception:
     pass
 
