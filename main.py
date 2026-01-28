@@ -6422,6 +6422,279 @@ _hotfix_v2_wrap_all_ask_routes_budget_cleanup()
 # FIM HOTFIX EXTRA v2
 # =============================================================================
 
+# =============================================================================
+# HOTFIX EXTRA — Semântica super flexível + listar SEMPRE TODAS as variantes
+# Quando o utilizador pede ORÇAMENTO mas NÃO especifica SKU/variante:
+#   - Se o fluxo atual responder "Sem dados no catálogo..." (ou equivalente),
+#   - o servidor procura no catalog_items por nome (fuzzy) e devolve TODAS as variantes.
+# Não altera o hotfix base de links; só corrige a seleção/listagem de variantes.
+# Colar no FIM do main.py
+# =============================================================================
+
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+def _hf_quote_intent_loose(q: str) -> bool:
+    qq = (q or "").lower()
+    return any(k in qq for k in ("orçament", "orcament", "cotação", "cotacao", "proforma", "preço", "preco"))
+
+def _hf_has_explicit_sku(q: str) -> bool:
+    # tenta usar o teu parser se existir
+    try:
+        if "_extract_explicit_skus_and_qty" in globals() and callable(globals()["_extract_explicit_skus_and_qty"]):
+            return bool(globals()["_extract_explicit_skus_and_qty"](q))
+    except Exception:
+        pass
+    # fallback: padrões típicos SKU/ref
+    return bool(re.search(r"\bSKU\s*:\s*[A-Z0-9][A-Z0-9.\-_]{2,}\b|\b[A-Z]{2,}\.[A-Z0-9.\-_]{2,}\b|\b\d{5,}(?:-[A-Z0-9]{1,6})?\b", q or "", flags=re.I))
+
+def _hf_norm_name_loose(s: str) -> str:
+    t = (s or "").strip().lower()
+    t = re.sub(r"[^\w\s\.-]+", " ", t, flags=re.UNICODE)
+    t = re.sub(r"\s+", " ", t).strip()
+    # remove ruído muito comum em PT
+    t = re.sub(r"\b(faz|fazes|faz-me|faz\W*me|or[cç]amento|orcamento|cotacao|cotação|preco|preço|proforma|para|de|do|da|dos|das|um|uma|uns|umas|o|a|os|as|com|junta|adiciona)\b", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def _hf_answer_looks_like_no_catalog(ans: str) -> bool:
+    a = (ans or "").lower()
+    return (
+        ("sem dados no catálogo" in a) or
+        ("sem dados no catalogo" in a) or
+        ("forneça o sku" in a) or
+        ("forneca o sku" in a) or
+        ("não constam variantes" in a) or
+        ("nao constam variantes" in a)
+    )
+
+def _hf_extract_product_name_hint(question: str, answer: str) -> str:
+    """
+    Tenta extrair o nome do produto:
+    - primeiro da pergunta (removendo ruído),
+    - se falhar, tenta do texto "Sem dados ... para 'XYZ'".
+    """
+    qn = _hf_norm_name_loose(question or "")
+    if qn:
+        return qn
+
+    m = re.search(r"para\s+[\"“']([^\"”']+)[\"”']", answer or "", flags=re.I)
+    if m:
+        return _hf_norm_name_loose(m.group(1))
+    return ""
+
+def _hf_catalog_fuzzy_find_all(ns: str, name_hint: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Procura MUITO flexível:
+    - tokeniza name_hint e faz AND de tokens (>=3 chars) em lower(name)
+    - fallback para OR se AND não devolver nada
+    """
+    hint = _hf_norm_name_loose(name_hint)
+    if not hint:
+        return []
+
+    tokens = [t for t in hint.split() if len(t) >= 3]
+    if not tokens:
+        tokens = [hint] if hint else []
+
+    try:
+        with _catalog_conn() as c:
+            # AND de tokens (mais preciso)
+            where = " AND ".join(["lower(name) LIKE ?"] * len(tokens))
+            params = [f"%{t}%" for t in tokens]
+            rows = c.execute(
+                f"""
+                SELECT namespace, name, ref, price, url, url_canonical, brand, variant_key, variant_attrs
+                FROM catalog_items
+                WHERE namespace=? AND {where}
+                LIMIT ?
+                """,
+                [ns] + params + [limit]
+            ).fetchall()
+            out = [dict(r) for r in rows] if rows else []
+
+            if out:
+                return out
+
+            # OR de tokens (mais “apanha tudo”)
+            where2 = " OR ".join(["lower(name) LIKE ?"] * len(tokens))
+            rows2 = c.execute(
+                f"""
+                SELECT namespace, name, ref, price, url, url_canonical, brand, variant_key, variant_attrs
+                FROM catalog_items
+                WHERE namespace=? AND ({where2})
+                LIMIT ?
+                """,
+                [ns] + params + [limit]
+            ).fetchall()
+            return [dict(r) for r in rows2] if rows2 else []
+    except Exception:
+        return []
+
+def _hf_group_variants(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Agrupa por URL base (sem âncora), que é o teu critério prático de “mesmo produto”.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows or []:
+        url = (r.get("url_canonical") or r.get("url") or "").strip()
+        if not url:
+            continue
+        base = url.split("#", 1)[0].strip()
+        groups.setdefault(base, []).append(r)
+    return groups
+
+def _hf_render_variants(groups: Dict[str, List[Dict[str, Any]]], title_hint: str) -> str:
+    """
+    Render determinístico: lista TODAS as variantes por grupo.
+    """
+    if not groups:
+        return ""
+
+    # ordena grupos por nº de variantes (desc)
+    ordered_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+
+    lines: List[str] = []
+    # se houver 1 grupo dominante, assume que é o produto pretendido
+    if len(ordered_groups) == 1 or (len(ordered_groups[0][1]) >= max(2, len(ordered_groups[1][1]) + 2)):
+        base_url, variants = ordered_groups[0]
+        # escolhe nome “mais comum”
+        names = [(_hf_norm_name_loose(v.get("name", "")) or v.get("name", "")) for v in variants]
+        product_name = (max(set(names), key=names.count) if names else "") or title_hint or "Produto"
+        product_name = (variants[0].get("name") or product_name or "Produto").strip()
+
+        lines.append(f"{product_name} (múltiplas variantes disponíveis no catálogo interno).")
+        lines.append("")
+        lines.append("Variantes no catálogo:")
+        # ordena por variant_attrs/nome/ref
+        def _key(v: Dict[str, Any]):
+            return (
+                (v.get("variant_attrs") or "").strip().lower(),
+                (v.get("name") or "").strip().lower(),
+                (v.get("ref") or "").strip().lower(),
+            )
+        for v in sorted(variants, key=_key):
+            ref = (v.get("ref") or "").strip()
+            price = v.get("price")
+            try:
+                price_str = f"{float(price):.2f}€" if price is not None else ""
+            except Exception:
+                price_str = f"{price}€" if price else ""
+            var_label = (v.get("variant_attrs") or v.get("variant_key") or "").strip()
+            if not var_label:
+                # tenta derivar algo do nome
+                var_label = "(sem dado)"
+            lines.append(f"- Variante: {var_label} | SKU: {ref} | Preço: {price_str}".rstrip())
+
+        lines.append("")
+        lines.append("Especifique a variante (SKU ou nome) e a quantidade para eu gerar o orçamento.")
+        return "\n".join(lines)
+
+    # caso ambíguo: mostra todos os produtos candidatos (cada um com as suas variantes)
+    lines.append("Encontrei múltiplos produtos possíveis no catálogo. Escolha o grupo correto indicando o SKU de uma variante:")
+    lines.append("")
+    for i, (base_url, variants) in enumerate(ordered_groups, start=1):
+        # nome representativo
+        product_name = (variants[0].get("name") or f"Produto {i}").strip()
+        lines.append(f"[Opção {i}] {product_name} — {len(variants)} variante(s)")
+        def _key(v: Dict[str, Any]):
+            return ((v.get("variant_attrs") or "").strip().lower(), (v.get("ref") or "").strip().lower())
+        for v in sorted(variants, key=_key):
+            ref = (v.get("ref") or "").strip()
+            var_label = (v.get("variant_attrs") or v.get("variant_key") or "(sem dado)").strip()
+            lines.append(f"  - {var_label} | SKU: {ref}")
+        lines.append("")
+    lines.append("Diga-me o SKU de uma variante e a quantidade para avançar com o orçamento.")
+    return "\n".join(lines)
+
+def _hf_wrap_ask_force_variants_listing():
+    try:
+        wrapped = 0
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+            if getattr(ep, "_hf_force_variants_wrapped", False):
+                continue
+
+            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    ans = resp.get("answer") or resp.get("response") or ""
+                    if not ans:
+                        return resp
+
+                    # extrair question/namespace a partir do request model (como noutros hotfix teus)
+                    req_obj = None
+                    if args:
+                        req_obj = args[0]
+                    if req_obj is None:
+                        for v in kwargs.values():
+                            if hasattr(v, "question") and hasattr(v, "user_id"):
+                                req_obj = v
+                                break
+
+                    question = getattr(req_obj, "question", "") if req_obj else ""
+                    namespace = getattr(req_obj, "namespace", None) if req_obj else None
+                    ns = (namespace or DEFAULT_NAMESPACE).strip()
+
+                    # só se:
+                    # - intenção de orçamento
+                    # - NÃO há SKU explícito
+                    # - resposta atual é "sem dados / dá sku"
+                    if (not _hf_quote_intent_loose(question)) or _hf_has_explicit_sku(question):
+                        return resp
+                    if not _hf_answer_looks_like_no_catalog(ans):
+                        return resp
+
+                    name_hint = _hf_extract_product_name_hint(question, ans)
+                    rows = _hf_catalog_fuzzy_find_all(ns, name_hint, limit=1000)
+                    if not rows:
+                        return resp
+
+                    groups = _hf_group_variants(rows)
+                    rendered = _hf_render_variants(groups, title_hint=name_hint)
+                    if not rendered:
+                        return resp
+
+                    if "answer" in resp:
+                        resp["answer"] = rendered
+                    else:
+                        resp["response"] = rendered
+                    return resp
+                except Exception:
+                    return resp
+
+            _wrapped._hf_force_variants_wrapped = True
+            r.endpoint = _wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-force-variants] wrapped /ask routes: {wrapped}")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-force-variants] failed: {e}")
+        except Exception:
+            pass
+        return False
+
+_hf_wrap_ask_force_variants_listing()
+
+# =============================================================================
+# FIM HOTFIX EXTRA — Semântica flexível + listar TODAS as variantes
+# =============================================================================
+
 
 
 # ---------------------------------------------------------------------------------------
