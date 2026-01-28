@@ -6572,6 +6572,275 @@ except Exception:
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — Fallback semântico para ORÇAMENTOS (listar SEMPRE variantes quando
+# o produto não vem totalmente definido)
+# - Só actua quando a resposta cai em "Sem dados" / "Sem variantes" / "Forneça SKU"
+# - Procura candidatos por nome com heurísticas mais flexíveis
+# - Se encontrar um candidato, lista TODAS as variantes (mesmo url_canonical/url)
+# =============================================================================
+
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+_HF_BUDGET_RE = re.compile(r"\borç(?:a|ã)mento\b|\borcamento\b|\bproforma\b", re.I)
+_HF_FAIL_RE = re.compile(
+    r"Sem dados no catálogo interno|Sem variantes no catálogo interno|Forneça o SKU|Forneca o SKU|nome exato|nome exacto",
+    re.I,
+)
+
+# Palavras fracas/ruído típicas em pedidos
+_HF_STOPWORDS = {
+    "faz", "fazer", "orçamento", "orcamento", "do", "da", "de", "para", "um", "uma",
+    "com", "e", "mais", "por", "favor", "pf", "p.f.", "quero", "preciso", "orcar",
+    "sofa", "sofá", "cama", "cadeira", "mesa", "banco", "poltrona", "base"
+}
+
+def _hf_is_budget(text: str) -> bool:
+    return bool(_HF_BUDGET_RE.search(text or ""))
+
+def _hf_tokenize(s: str) -> List[str]:
+    t = re.sub(r"[^\w\s\-\.]", " ", (s or "").lower()).strip()
+    toks = [x for x in re.split(r"\s+", t) if x]
+    # remove stopwords e tokens curtos
+    out = []
+    for x in toks:
+        if x in _HF_STOPWORDS:
+            continue
+        if len(x) < 3:
+            continue
+        out.append(x)
+    return out
+
+def _hf_query_variants_by_url(ns: str, url: str, url_canonical: str, limit: int = 80) -> List[Dict[str, Any]]:
+    """
+    Variantes: todas as linhas com o mesmo url_canonical (preferência), senão mesmo url.
+    """
+    rows: List[Dict[str, Any]] = []
+    try:
+        conn = _catalog_conn()
+        cur = conn.cursor()
+        if url_canonical:
+            cur.execute(
+                """
+                SELECT name, ref, price, url, url_canonical
+                FROM catalog_items
+                WHERE namespace=? AND url_canonical=?
+                ORDER BY name
+                LIMIT ?
+                """,
+                (ns, url_canonical, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT name, ref, price, url, url_canonical
+                FROM catalog_items
+                WHERE namespace=? AND url=?
+                ORDER BY name
+                LIMIT ?
+                """,
+                (ns, url, limit),
+            )
+        for r in cur.fetchall():
+            rows.append(dict(r))
+        conn.close()
+    except Exception:
+        pass
+    return rows
+
+def _hf_pick_best_candidate(ns: str, user_query: str) -> Optional[Dict[str, Any]]:
+    """
+    Tenta encontrar um produto "base" por nome de forma flexível.
+    Estratégia:
+      - usa _catalog_candidates_by_name (se existir) com o termo original
+      - se vazio, tenta combinações dos 2-3 tokens mais fortes (ex.: "dublexo eik")
+      - escolhe o candidato com maior overlap de tokens
+    """
+    uq = (user_query or "").strip()
+    if not uq:
+        return None
+
+    toks = _hf_tokenize(uq)
+    if not toks:
+        return None
+
+    # gera queries candidatas (mais fortes primeiro)
+    qlist = []
+    qlist.append(" ".join(toks))
+    if len(toks) >= 2:
+        qlist.append(" ".join(toks[:2]))
+    if len(toks) >= 3:
+        qlist.append(" ".join(toks[:3]))
+    # tenta também cada token isolado (em último recurso)
+    qlist.extend(toks[:4])
+
+    all_cands: List[Dict[str, Any]] = []
+
+    for q in qlist:
+        try:
+            if " _catalog_candidates_by_name" and callable(globals().get("_catalog_candidates_by_name")):
+                cands = _catalog_candidates_by_name(ns, q, limit=20)  # type: ignore
+            else:
+                cands = _catalog_find_candidates_by_name(ns, q, limit=20, require_all_tokens=False)  # type: ignore
+            if cands:
+                # normaliza para dict
+                for c in cands:
+                    all_cands.append(dict(c))
+        except Exception:
+            continue
+
+        if all_cands:
+            break
+
+    if not all_cands:
+        return None
+
+    uq_set = set(toks)
+
+    def score(c: Dict[str, Any]) -> Tuple[int, int]:
+        name = (c.get("name") or "").lower()
+        ctoks = set(_hf_tokenize(name))
+        overlap = len(uq_set.intersection(ctoks))
+        # bonus: ter url_canonical e ref "forte"
+        bonus = 0
+        if c.get("url_canonical"):
+            bonus += 1
+        if c.get("ref"):
+            bonus += 1
+        return (overlap, bonus)
+
+    all_cands.sort(key=score, reverse=True)
+    return all_cands[0]
+
+def _hf_build_variants_message(ns: str, base_item: Dict[str, Any]) -> Optional[str]:
+    """
+    Constrói bloco legível com TODAS as variantes (com SKU) para escolha.
+    Não inventa URLs; só lista SKUs/nomes/preços.
+    """
+    url = (base_item.get("url") or "").strip()
+    urlc = (base_item.get("url_canonical") or "").strip()
+    if not (url or urlc):
+        return None
+
+    rows = _hf_query_variants_by_url(ns, url, urlc, limit=120)
+    if not rows:
+        return None
+
+    # lista tudo (mesmo tudo), mas evita spam extremo
+    lines = []
+    title = (base_item.get("name") or "Produto").strip()
+    lines.append(f"{title} — variantes disponíveis no catálogo interno:")
+    for r in rows[:80]:
+        n = (r.get("name") or "").strip()
+        ref = (r.get("ref") or "").strip()
+        price = r.get("price")
+        if price is None:
+            lines.append(f"- {n} | SKU: {ref}")
+        else:
+            lines.append(f"- {n} | SKU: {ref} | {price}€")
+    lines.append("")
+    lines.append("Indique o SKU exacto da variante + quantidade para eu gerar o orçamento.")
+    return "\n".join(lines)
+
+def _hotfix_wrap_ask_semantic_budget_fallback():
+    """
+    Envolve /ask: se a resposta falhar por falta de matching semântico em orçamentos,
+    injeta uma lista completa de variantes para escolha.
+    """
+    try:
+        target_routes = []
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) == "/ask":
+                methods = getattr(r, "methods", set()) or set()
+                if "POST" in methods and callable(getattr(r, "endpoint", None)):
+                    target_routes.append(r)
+
+        wrapped = 0
+        for route in target_routes:
+            orig = route.endpoint
+            if getattr(orig, "_hf_sem_budget_wrapped", False):
+                continue
+
+            async def _wrapped(*args: Any, __orig=orig, **kwargs: Any):
+                resp = await __orig(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    # texto do utilizador
+                    uq = ""
+                    try:
+                        body = kwargs.get("payload") or kwargs.get("request") or None
+                    except Exception:
+                        body = None
+                    # fallback genérico: tenta campos comuns
+                    for k in ("question", "query", "message", "text", "prompt"):
+                        if isinstance(resp.get("request"), dict) and resp["request"].get(k):
+                            uq = resp["request"][k]
+                            break
+                    if not uq:
+                        # muitos handlers guardam o user_query no próprio resp
+                        uq = resp.get("user_query") or resp.get("query") or ""
+
+                    ans_key = "answer" if "answer" in resp else ("response" if "response" in resp else None)
+                    if not ans_key:
+                        return resp
+
+                    ans = resp.get(ans_key) or ""
+                    if not ans or not isinstance(ans, str):
+                        return resp
+
+                    # namespace
+                    ns = None
+                    try:
+                        ns = ((resp.get("rag") or {}).get("namespace")) or None
+                    except Exception:
+                        ns = None
+                    ns = (ns or DEFAULT_NAMESPACE)
+
+                    # só actua em orçamentos com falha semântica
+                    if not _hf_is_budget(uq):
+                        return resp
+                    if not _HF_FAIL_RE.search(ans):
+                        return resp
+
+                    base = _hf_pick_best_candidate(ns, uq)
+                    if not base:
+                        return resp
+
+                    msg = _hf_build_variants_message(ns, base)
+                    if not msg:
+                        return resp
+
+                    # Injeta no fim (sem destruir o resto do texto)
+                    fixed = ans.rstrip() + "\n\n" + msg
+                    resp[ans_key] = fixed
+                    return resp
+                except Exception:
+                    return resp
+
+            _wrapped._hf_sem_budget_wrapped = True
+            route.endpoint = _wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-semantic-budget-fallback] wrapped /ask routes: {wrapped}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-semantic-budget-fallback] failed: {e}")
+        except Exception:
+            pass
+
+_hotfix_wrap_ask_semantic_budget_fallback()
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
