@@ -6423,372 +6423,245 @@ _hotfix_v2_wrap_all_ask_routes_budget_cleanup()
 # =============================================================================
 
 # =============================================================================
-# HOTFIX — Fallback semântico para ORÇAMENTOS + listar SEMPRE variantes quando faltam SKUs
-# Objetivo:
-# - Se for "orçamento"/"orcamento" e não houver SKU explícito, garantir:
-#   (a) pesquisa flexível (acentos, ordem, tokens)
-#   (b) se houver múltiplas variantes no catálogo, listar TODAS para escolha
-# - NÃO mexe no hotfix base de links; só melhora o bloco de catálogo (input do LLM)
+# HOTFIX — Fallback semântico FLEXÍVEL para ORÇAMENTOS + listar SEMPRE variantes
+# - Resolve "Sem dados no catálogo" quando a query tem ruído (faz, orçamento, 2, 1, junta…)
+# - Mantém a pesquisa atual como 1ª tentativa; se falhar e for orçamento, usa fallback OR
+# - Quando for orçamento e não houver SKU explícito: lista TODAS as variantes encontradas
 # =============================================================================
 
 import re
-import unicodedata
 from typing import Optional, List, Dict, Tuple
 
-def _hf_strip_accents(s: str) -> str:
-    if not s:
-        return ""
-    return "".join(
-        ch for ch in unicodedata.normalize("NFKD", s)
-        if not unicodedata.combining(ch)
-    )
+# --- stopwords / ruído (PT) + comandos típicos ---
+_HF_STOP = {
+    "faz", "fazer", "cria", "criar", "gera", "gerar", "mostra", "mostrar",
+    "quero", "preciso", "pode", "consegues", "porfavor", "pf", "sff",
+    "um", "uma", "uns", "umas", "o", "a", "os", "as", "de", "do", "da", "dos", "das",
+    "para", "pra", "no", "na", "nos", "nas", "e", "ou", "com", "sem",
+    "isto", "isso", "este", "esta", "estes", "estas",
+    "junta", "adiciona", "acrescenta", "meter", "inclui", "atualiza", "atualizado",
+    "orcamento", "orçamento", "preco", "preço", "cotacao", "cotação", "proforma", "fatura",
+    "qtd", "qtd.", "qt", "qt.", "quantidade", "un", "un.", "uni", "uni.", "unidade", "unidades",
+    "x", "pcs", "pc", "cada",
+}
 
-def _hf_norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = _hf_strip_accents(s)
-    s = re.sub(r"[^a-z0-9\s\.\-_]+", " ", s)   # mantém .-_ para refs
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _hf_is_budget_intent(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(k in ql for k in ("orçamento", "orcamento", "preço", "preco", "proforma", "cotação", "cotacao", "junta", "adiciona", "acrescenta"))
 
-def _hf_is_budget_intent(text: str) -> bool:
-    t = _hf_norm(text)
-    return ("orcamento" in t) or ("orçamento" in (text or "").lower())  # cobre caso com acento no raw
+def _hf_has_explicit_sku(q: str) -> bool:
+    # “SKU:” ou um token muito “sku-like” (números longos / refs com hífen/ponto)
+    if re.search(r"\bsku\s*:", q or "", flags=re.I):
+        return True
+    return bool(re.search(r"\b[A-Z0-9]{5,}(?:[.\-_][A-Z0-9]{1,6})*\b", q or "", flags=re.I))
 
-def _hf_ref_tokens(question: str) -> List[str]:
-    # reutiliza o teu extractor se existir, senão fallback simples
-    try:
-        toks = _extract_ref_tokens(question)  # type: ignore
-        return toks or []
-    except Exception:
-        q = (question or "")
-        return re.findall(r"\b[A-Z0-9]{2,}\.[A-Z0-9\.\-_]{2,}\b|\b[0-9]{5,}(?:-[A-Z0-9]{1,6})?\b", q)
-
-def _hf_terms(question: str) -> List[str]:
-    qn = _hf_norm(question)
-    # remove palavras “operacionais” típicas de pedido
-    qn = re.sub(r"\b(faz|fazer|gera|gerar|cria|criar|um|uma|o|a|de|do|da|dos|das|para|por|com|sem|no|na|nos|nas)\b", " ", qn)
-    qn = re.sub(r"\b(orcamento|orçamento|proforma|cotacao|cotação|preco|preço)\b", " ", qn)
-    qn = re.sub(r"\s+", " ", qn).strip()
-    parts = [p for p in qn.split(" ") if len(p) >= 3]
-    # dedupe mantendo ordem
+def _hf_clean_terms(question: str) -> List[str]:
+    """
+    Extrai termos 'bons' para pesquisa no catálogo:
+    - remove números soltos e tokens ruído
+    - mantém tokens curtos relevantes (>=2)
+    """
+    raw = _sanitize_like(question or "")
+    toks = [t.strip().lower() for t in re.split(r"[\s,;()]+", raw) if t.strip()]
+    out: List[str] = []
+    for t in toks:
+        if t in _HF_STOP:
+            continue
+        if t.isdigit():
+            continue
+        if re.fullmatch(r"\d+x", t):   # "2x"
+            continue
+        if len(t) < 2:
+            continue
+        out.append(t)
+    # reduz explosão
+    # (mantém ordem, remove duplicados)
     seen = set()
-    out = []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out[:10]
+    uniq = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return uniq[:10]
 
-def build_catalog_block(question: str, namespace: Optional[str] = None, limit: int = 30) -> str:
+def _hf_catalog_search_fallback_or(namespace: str, terms: List[str], limit: int = 40) -> List[Dict]:
     """
-    Versão robusta:
-    - Mantém a lógica original (ref exact, AND, OR)
-    - Se ainda não houver resultados e for orçamento → faz fallback extra:
-      OR por tokens normalizados (accent-insensitive via dupla consulta).
+    Pesquisa flexível (OR) — usada só se a pesquisa normal falhar e for orçamento.
     """
+    if not terms:
+        return []
     ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q_raw = (question or "").strip()
 
-    # --- 1) tenta a versão original (copiada do teu build_catalog_block) ---
-    rows: List[Dict] = []
+    # OR por token em (name/summary/ref)
+    where_or = " OR ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
+    like_args: List[str] = []
+    for t in terms:
+        pattern = f"%{t}%"
+        like_args.extend([pattern, pattern, pattern])
+
     try:
         with _catalog_conn() as c:
-            # 1) Match exato por SKU/ref
-            ref_toks = _hf_ref_tokens(q_raw)
-            if ref_toks:
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ref IN ({','.join('?'*len(ref_toks))})
-                     ORDER BY updated_at DESC
-                     LIMIT ?""",
-                    tuple([ns, *ref_toks, limit])
-                )
-                rows = [dict(r) for r in cur.fetchall()]
-
-            q_clean = _sanitize_like(_catalog_query_from_question(q_raw))
-            terms = [t for t in re.split(r"[\s,;]+", _sanitize_like(q_clean)) if len(t) >= 3]
-
-            # 2) AND
-            if len(rows) < 1 and terms:
-                where_and = " AND ".join(["(name LIKE ? OR summary LIKE ? OR ref LIKE ?)"] * len(terms))
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    like_args.extend([p, p, p])
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND {where_and}
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
-
-            # 3) OR
-            if len(rows) < 1 and terms:
-                where_or_parts = []
-                like_args = []
-                for t in terms:
-                    p = f"%{t}%"
-                    where_or_parts.append("(name LIKE ? OR summary LIKE ? OR ref LIKE ?)")
-                    like_args.extend([p, p, p])
-                where_or = " OR ".join(where_or_parts) if where_or_parts else "1=1"
-                cur = c.execute(f"""
-                    SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ({where_or})
-                     ORDER BY (CASE WHEN url LIKE '%#sku=%' THEN 0 ELSE 1 END), updated_at DESC
-                     LIMIT ?""", tuple([ns, *like_args, limit]))
-                rows = [dict(r) for r in cur.fetchall()]
+            cur = c.execute(f"""
+                SELECT name, ref, price, url, brand, variant_attrs, updated_at
+                  FROM catalog_items
+                 WHERE namespace=? AND ({where_or})
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+            """, tuple([ns, *like_args, limit]))
+            return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         try:
-            log.warning(f"[hf-budget-semantic] build_catalog_block base falhou: {e}")
+            log.warning(f"[hf-budget-semantic] fallback OR falhou: {e}")
         except Exception:
             pass
-        rows = []
+        return []
 
-    # --- 2) fallback EXTRA só para orçamentos sem SKU ---
-    if (not rows) and _hf_is_budget_intent(q_raw) and (not _hf_ref_tokens(q_raw)):
+def _hf_group_variants(rows: List[Dict]) -> Dict[str, List[Dict]]:
+    """
+    Agrupa variantes por URL base (strip #...)
+    """
+    groups: Dict[str, List[Dict]] = {}
+    for r in rows or []:
+        u = (r.get("url") or "").strip()
+        base = u.split("#", 1)[0] if u else ""
+        groups.setdefault(base, []).append(r)
+    return groups
+
+# ---- Guardar originais (se existirem) ----
+try:
+    _HF_ORIG_build_catalog_block = build_catalog_block
+except Exception:
+    _HF_ORIG_build_catalog_block = None
+
+try:
+    _HF_ORIG_build_catalog_variants_block = build_catalog_variants_block
+except Exception:
+    _HF_ORIG_build_catalog_variants_block = None
+
+
+def build_catalog_block(question: str, namespace: Optional[str], limit: int = 30) -> str:
+    """
+    1) tenta a função original
+    2) se falhar e for ORÇAMENTO: fallback OR com termos limpos
+    """
+    q = question or ""
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+
+    # 1) original
+    if _HF_ORIG_build_catalog_block:
         try:
-            tokens = _hf_terms(q_raw)
-            if tokens:
-                with _catalog_conn() as c:
-                    # tenta primeiro com tokens "normais"
-                    where_or_parts = []
-                    like_args = []
-                    for t in tokens:
-                        p = f"%{t}%"
-                        where_or_parts.append("(name LIKE ? OR summary LIKE ?)")
-                        like_args.extend([p, p])
-                    where_or = " OR ".join(where_or_parts)
+            out = _HF_ORIG_build_catalog_block(q, ns, limit=limit)
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
 
-                    cur = c.execute(f"""
-                        SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                          FROM catalog_items
-                         WHERE namespace=? AND ({where_or})
-                         ORDER BY updated_at DESC
-                         LIMIT ?""", tuple([ns, *like_args, limit]))
-                    rows = [dict(r) for r in cur.fetchall()]
+    # 2) fallback só para orçamento
+    if not _hf_is_budget_intent(q):
+        return ""
 
-                    # se ainda vazio, tenta com tokens “raw” (com acentos) também
-                    if not rows:
-                        raw_tokens = [t for t in re.split(r"[\s,;]+", (question or "")) if len(t) >= 3]
-                        raw_tokens = raw_tokens[:10]
-                        where_or_parts = []
-                        like_args = []
-                        for t in raw_tokens:
-                            p = f"%{_sanitize_like(t)}%"
-                            where_or_parts.append("(name LIKE ? OR summary LIKE ?)")
-                            like_args.extend([p, p])
-                        where_or = " OR ".join(where_or_parts) if where_or_parts else "1=0"
-                        cur = c.execute(f"""
-                            SELECT namespace, name, ref, price, url, brand, variant_attrs, updated_at
-                              FROM catalog_items
-                             WHERE namespace=? AND ({where_or})
-                             ORDER BY updated_at DESC
-                             LIMIT ?""", tuple([ns, *like_args, limit]))
-                        rows = [dict(r) for r in cur.fetchall()]
-        except Exception as e:
-            try:
-                log.warning(f"[hf-budget-semantic] fallback extra falhou: {e}")
-            except Exception:
-                pass
-
+    terms = _hf_clean_terms(q)
+    rows = _hf_catalog_search_fallback_or(ns, terms, limit=max(40, limit))
     if not rows:
         return ""
 
-    # bloco final igual ao original
-    lines = [f"CATÁLOGO INTERNO — ns={ns} (usar SÓ estes dados para orçamentos/preços; NÃO usar RAG aqui)"]
+    lines = [f"CATÁLOGO INTERNO — ns={ns} (fallback flexível OR; usar SÓ estes dados)"]
     seen = set()
-    for r in rows[:limit]:
-        name = r.get("name") or "(sem nome)"
-        ref  = r.get("ref") or "(sem dado)"
+    for r in rows[:max(40, limit)]:
+        name = (r.get("name") or "(sem nome)").strip()
+        ref  = (r.get("ref") or "").strip()
         price = r.get("price")
-        price_txt = f"{price:.2f}€" if isinstance(price, (int,float)) else "(sem preço)"
-        url = r.get("url") or "(sem URL)"
-        brand = r.get("brand") or ""
-        variant = (r.get("variant_attrs") or "").strip()
+        price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+        url = (r.get("url") or "").strip()
+        url = url.split("#", 1)[0] if url else ""
         key = (ref, url)
         if key in seen:
             continue
         seen.add(key)
+        variant = (r.get("variant_attrs") or "").strip()
         name_show = f"{name} — Variante: {variant}" if variant else name
-        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Marca: {brand} • Link: {url}")
+        lines.append(f"- {name_show} • SKU: {ref} • Preço: {price_txt} • Link: {url}")
     return "\n".join(lines)
+
 
 def build_catalog_variants_block(question: str, namespace: Optional[str]) -> str:
     """
-    NOVA regra:
-    - Se o utilizador pede orçamento e NÃO deu SKU → listar variantes sempre que existirem (>=2).
-    - Mantém também o trigger clássico de "variantes/cores/opções".
+    Regra nova:
+    - Se for ORÇAMENTO e NÃO houver SKU explícito => lista TODAS as variantes possíveis
+      para as correspondências encontradas (via fallback flexível).
+    - Mantém compatibilidade: se a função original já queria listar variantes (palavra 'variantes'),
+      também a deixamos correr primeiro.
     """
     q = question or ""
-    qlow = q.lower()
-    is_budget = _hf_is_budget_intent(q)
-    has_sku = bool(_hf_ref_tokens(q))
-
-    wants_variants = any(k in qlow for k in ("variante", "variantes", "cores", "tamanhos", "opções", "opcoes"))
-    if not wants_variants and not (is_budget and not has_sku):
-        return ""
-
     ns = (namespace or DEFAULT_NAMESPACE).strip()
 
-    # termos flexíveis (accent-insensitive)
-    tokens = _hf_terms(q)
-    if not tokens:
-        tokens = [t for t in re.split(r"[\s,;]+", _sanitize_like(q)) if len(t) >= 3][:10]
-
-    rows: List[Dict] = []
-    try:
-        with _catalog_conn() as c:
-            if tokens:
-                where_or_parts = []
-                like_args = []
-                for t in tokens:
-                    p = f"%{t}%"
-                    where_or_parts.append("(name LIKE ? OR summary LIKE ?)")
-                    like_args.extend([p, p])
-                where_or = " OR ".join(where_or_parts)
-                cur = c.execute(f"""
-                    SELECT name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=? AND ({where_or})
-                     ORDER BY updated_at DESC
-                     LIMIT 300
-                """, tuple([ns, *like_args]))
-            else:
-                cur = c.execute("""
-                    SELECT name, ref, price, url, brand, variant_attrs, updated_at
-                      FROM catalog_items
-                     WHERE namespace=?
-                     ORDER BY updated_at DESC
-                     LIMIT 200
-                """, (ns,))
-            rows = [dict(r) for r in cur.fetchall()]
-    except Exception as e:
+    # 1) deixa o original tentar primeiro (quando o user pede "variantes")
+    if _HF_ORIG_build_catalog_variants_block:
         try:
-            log.warning(f"[hf-budget-semantic] variants query falhou: {e}")
+            out = _HF_ORIG_build_catalog_variants_block(q, ns)
+            if out and out.strip():
+                return out
         except Exception:
             pass
-        rows = []
 
+    # 2) só força listagem automática para ORÇAMENTO sem SKU explícito
+    if (not _hf_is_budget_intent(q)) or _hf_has_explicit_sku(q):
+        return ""
+
+    terms = _hf_clean_terms(q)
+    rows = _hf_catalog_search_fallback_or(ns, terms, limit=120)
     if not rows:
         return ""
 
-    # agrupar por URL-pai (mesma lógica)
-    groups: Dict[str, List[Dict]] = {}
-    for r in rows:
-        u = (r.get("url") or "").strip()
-        parent = u.split("#", 1)[0] if u else ""
-        groups.setdefault(parent, []).append(r)
+    groups = _hf_group_variants(rows)
 
-    # apenas grupos com variantes reais (#sku=) e >=2
-    filtered: Dict[str, List[Dict]] = {}
-    for parent, lst in groups.items():
-        variants = [it for it in lst if "#sku=" in (it.get("url") or "")]
-        if len(variants) >= 2:
-            filtered[parent] = variants
+    # dentro de cada grupo, queremos "todas" as variantes:
+    # - se o catálogo usa variant items como linhas distintas, já vêm aqui
+    # - apresentamos com SKU + preço + variant_attrs (se houver)
+    out_lines = ["CATÁLOGO INTERNO — Variantes disponíveis (escolha 1 SKU):"]
 
-    if not filtered:
-        return ""
+    for base_url, lst in list(groups.items())[:10]:
+        # ordenar e eliminar duplicados de ref
+        seen_ref = set()
+        cleaned: List[Dict] = []
+        for r in sorted(lst, key=lambda x: ((x.get("name") or ""), (x.get("ref") or ""))):
+            ref = (r.get("ref") or "").strip()
+            if not ref or ref in seen_ref:
+                continue
+            seen_ref.add(ref)
+            cleaned.append(r)
 
-    out = ["CATÁLOGO INTERNO — Variantes por produto (Variante | SKU | Preço | Link):"]
-    for parent, lst in filtered.items():
-        lst_sorted = sorted(lst, key=lambda x: ((x.get("variant_attrs") or "").lower(), (x.get("ref") or "").lower()))
-        title = (lst_sorted[0].get("name") or parent or "(produto)")
-        out.append(f"• Produto: {title}")
-        for r in lst_sorted[:80]:  # “todas” na prática: limite alto
-            ref  = r.get("ref") or "(sem ref)"
-            pr   = r.get("price")
-            pr_s = f"{pr:.2f}€" if isinstance(pr, (int, float)) else "(sem preço)"
-            url  = r.get("url") or "(sem url)"
-            va   = (r.get("variant_attrs") or "").strip()
-            label = va or (r.get("name") or "")
-            out.append(f"   - {label} | SKU:{ref} | {pr_s} | {url}")
-    return "\n".join(out)
+        title = (cleaned[0].get("name") or "(produto)").strip() if cleaned else "(produto)"
+        base_link = base_url or ""
 
-# (Opcional mas recomendado) — evitar passar question já “limpo” duas vezes
-try:
-    _hf_original_build_messages = build_messages  # type: ignore
-except Exception:
-    _hf_original_build_messages = None
+        out_lines.append(f"• Produto: {title}")
+        if base_link:
+            out_lines.append(f"  Link: {base_link}")
 
-def build_messages(user_id: str, question: str, namespace: Optional[str]):
-    # igual ao teu build_messages, mas sem "cat_q = _catalog_query_from_question(question)" duplicado
-    new_facts = extract_contextual_facts_pt(question)
-    for k, v in new_facts.items():
-        mem0_set_fact(user_id, k, v)
+        for r in cleaned[:80]:
+            ref = (r.get("ref") or "").strip()
+            price = r.get("price")
+            price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
+            var = (r.get("variant_attrs") or "").strip()
+            if var:
+                out_lines.append(f"  - {var} | SKU: {ref} | {price_txt}")
+            else:
+                out_lines.append(f"  - SKU: {ref} | {price_txt}")
 
-    short_snippets = _mem0_search(question, user_id=user_id, limit=5) or local_search_snippets(user_id, limit=5)
-    memory_block = (
-        "Memórias recentes do utilizador (curto prazo):\n"
-        + "\n".join(f"- {s}" for s in short_snippets[:3])
-        if short_snippets else ""
-    )
+    out_lines.append("")
+    out_lines.append("Indique o SKU escolhido e a quantidade para gerar o orçamento.")
+    return "\n".join(out_lines)
 
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-
-    # catálogo com a pergunta raw (hotfix faz a flexibilidade)
-    catalog_block = build_catalog_block(question, ns)
-    catalog_variants_block = build_catalog_variants_block(question, ns)
-
-    rag_block = ""
-    rag_used = False
-    rag_hits: List[dict] = []
-    if RAG_READY:
-        try:
-            rag_hits = search_chunks(
-                query=question,
-                namespace=namespace or DEFAULT_NAMESPACE,
-                top_k=RAG_TOP_K_DEFAULT
-            ) or []
-            rag_block = build_context_block(rag_hits, token_budget=RAG_CONTEXT_TOKEN_BUDGET) if rag_hits else ""
-            rag_used = bool(rag_block)
-        except Exception as e:
-            log.warning(f"[rag] search falhou: {e}")
-            rag_block, rag_used, rag_hits = "", False, []
-
-    links_pairs = _links_from_matches(rag_hits, max_links=8)
-    links_block = ""
-    if links_pairs:
-        lines = ["Links candidatos (do RAG; NÃO usar para preços/orçamentos):"]
-        for title, url in links_pairs:
-            lines.append(f"- {title or '-'} — {url}")
-        links_block = "\n".join(lines)
-
-    products_block = build_rag_products_block(question)
-
-    messages = [{"role": "system", "content": ALMA_MISSION}]
-    fb = facts_block_for_user(user_id)
-    if fb:
-        messages.append({"role": "system", "content": fb})
-
-    if catalog_block:
-        messages.append({"role": "system", "content": catalog_block})
-    if catalog_variants_block:
-        messages.append({"role": "system", "content": catalog_variants_block})
-
-    if rag_block:
-        messages.append({"role": "system", "content": f"Conhecimento corporativo (RAG — não usar para preços):\n{rag_block}"})
-    if links_block:
-        messages.append({"role": "system", "content": links_block})
-    if products_block:
-        messages.append({"role": "system", "content": products_block})
-    if memory_block:
-        messages.append({"role": "system", "content": memory_block})
-
-    messages.append({"role": "user", "content": question})
-    return messages, new_facts, rag_used, rag_hits
 
 try:
-    log.info("[hf-budget-semantic] ativo: fallback semântico em orçamentos + variantes sempre quando faltar SKU.")
+    log.info("[hotfix] orçamento: fallback semântico flexível + listagem automática de variantes (sem SKU explícito).")
 except Exception:
     pass
 
 # =============================================================================
 # FIM HOTFIX
 # =============================================================================
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
