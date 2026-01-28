@@ -6085,6 +6085,197 @@ def _hotfix_wrap_all_ask_routes_budget_links():
 
 _hotfix_wrap_all_ask_routes_budget_links()
 
+# =============================================================================
+# HOTFIX EXTRA (apenas MULTI-ITENS): impedir "ver produto" no topo + links reais no fim
+# - NÃO mexe no single (deixa o teu hotfix base fazer o trabalho dele)
+# - Só atua quando detectar "orçamento final" E com >1 item/SKU
+# - Só usa URLs reais do catálogo (url_canonical/url). Sem search.php, sem #sku.
+# =============================================================================
+
+import re
+from typing import Any, List, Tuple, Optional
+
+# --- deteção robusta: orçamento "final" (não listagem de variantes) ---
+def _hf_is_final_budget_text(t: str) -> bool:
+    if not t:
+        return False
+    # Tem "orçamento" + "total" + pelo menos 1 valor com €
+    if not re.search(r"\borç(?:a|ã)mento\b|\borcamento\b", t, flags=re.I):
+        return False
+    if not re.search(r"\btotal\b", t, flags=re.I):
+        return False
+    if "€" not in t:
+        return False
+    # Heurística para distinguir de listas de variantes: orçamento final costuma ter tabela/linhas
+    # (ou pelo menos linhas com SKU/preço/qty/subtotal)
+    has_tableish = ("|" in t) or bool(re.search(r"\bsubtotal\b|\bquantidade\b|\bqtd\b", t, flags=re.I))
+    return has_tableish
+
+def _hf_strip_ver_produto_everywhere(answer: str) -> str:
+    if not answer:
+        return answer
+
+    out = answer
+
+    # remove "— ver produto" e "— [ver produto](...)" no topo/linhas
+    out = re.sub(r"\s*—\s*\[?\s*ver\s+produto\s*\]?\s*(\([^)]+\))?", "", out, flags=re.I)
+
+    # remove markdown link [ver produto](...)
+    out = re.sub(r"\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", out, flags=re.I)
+
+    # remove linhas que sejam só "ver produto"
+    out = re.sub(r"(?im)^\s*ver\s+produto\s*$\n?", "", out)
+
+    # limpar excesso de linhas vazias
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+def _hf_extract_refs_multi_from_budget(t: str) -> List[str]:
+    """
+    Extrai refs/SKUs para multi-itens (sem depender de 'SKU:' apenas):
+    - captura 'SKU: XXX'
+    - captura SKUs entre parêntesis '(SKU: XXX)'
+    - captura tokens de ref comuns (ORK.03.01, 740021316-2-AR, 100010, LIN0030, etc.)
+    - tenta também capturar o SKU no fim da primeira coluna de linhas com pipes.
+    """
+    if not t:
+        return []
+    found: List[str] = []
+    seen = set()
+
+    def push(x: str):
+        x = (x or "").strip()
+        if not x:
+            return
+        k = x.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        found.append(x)
+
+    # 1) SKU explícito
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9._\-]{2,})", t, flags=re.I):
+        push(m.group(1))
+
+    # 2) linhas com pipes (tabela): tenta apanhar SKU no fim da 1ª coluna real
+    for line in t.splitlines():
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+        cell = parts[1]  # 1ª coluna real em tabelas do tipo "| ... |"
+        m = re.search(r"([A-Z0-9][A-Z0-9._\-]{2,})\s*$", cell, flags=re.I)
+        if m:
+            push(m.group(1))
+
+    # 3) fallback: tokens plausíveis (números 5+, ou com hífen, ou com ponto tipo ORK.03.01)
+    for m in re.finditer(r"\b([A-Z]{2,}\.[A-Z0-9._\-]{2,}|[0-9]{5,}(?:-[A-Z0-9]{1,8})?)\b", t):
+        push(m.group(1))
+
+    return found
+
+def _hf_build_links_block_from_catalog(namespace: Optional[str], refs: List[str]) -> str:
+    ns = (namespace or DEFAULT_NAMESPACE).strip()
+    links: List[Tuple[str, str]] = []
+    seen = set()
+
+    for ref in refs:
+        cat = None
+        try:
+            cat = _catalog_get_by_ref(ns, ref)
+        except Exception:
+            cat = None
+        if not cat:
+            continue
+
+        url = (cat.get("url_canonical") or cat.get("url") or "").strip()
+        name = (cat.get("name") or "").strip()
+        if not url:
+            continue
+
+        try:
+            url = _canon_ig_url(url) or url
+        except Exception:
+            pass
+
+        label = name or ref
+        if ref and ref not in label:
+            label = f"{label} — {ref}"
+
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
+
+    if not links:
+        return ""
+
+    block_lines = ["", "Links dos produtos:"]
+    for label, url in links[:30]:
+        block_lines.append(f"- {label}")
+        block_lines.append(f"  {url}")
+    return "\n".join(block_lines)
+
+# -----------------------------------------------------------------------------
+# Patch do _postprocess_answer: só MULTI-ITENS (não mexe no resto)
+# -----------------------------------------------------------------------------
+try:
+    _hf_pp_orig = _postprocess_answer  # type: ignore
+except Exception:
+    _hf_pp_orig = None
+
+def _postprocess_answer(answer: str, user_query: str, namespace: Optional[str], decided_top_k: int) -> str:
+    # Se não temos original, não arriscamos
+    if not _hf_pp_orig:
+        return answer
+
+    # Deixa o pipeline original correr primeiro (inclui o teu hotfix base / wrappers / etc.)
+    out = _hf_pp_orig(answer, user_query, namespace, decided_top_k)
+
+    try:
+        # Evitar duplicação do bloco
+        if re.search(r"(?im)^\s*Links\s+dos\s+produtos\s*:\s*$", out or ""):
+            # Mesmo assim, remove "ver produto" se aparecer no topo em multi-itens
+            cleaned = _hf_strip_ver_produto_everywhere(out)
+            return cleaned
+
+        # Só mexe em orçamentos finais
+        if not _hf_is_final_budget_text(out or ""):
+            return out
+
+        # Extrai refs e só atua se for multi (>1)
+        refs = _hf_extract_refs_multi_from_budget(out or "")
+        # remove duplicados vazios e coisas óbvias
+        refs = [r for r in refs if r and r.lower() not in ("total", "subtotal", "qtd", "quantidade")]
+        if len(refs) <= 1:
+            return out  # single fica para o teu hotfix base
+
+        cleaned = _hf_strip_ver_produto_everywhere(out)
+
+        # Ainda: se já houver "ver produto" perdido no header, limpamos.
+        cleaned = _hf_strip_ver_produto_everywhere(cleaned)
+
+        links_block = _hf_build_links_block_from_catalog(namespace, refs)
+        if not links_block:
+            return cleaned
+
+        return cleaned.rstrip() + links_block
+    except Exception:
+        return out
+
+try:
+    log.info("[hotfix-extra-multi] ativo: remove 'ver produto' em multi-itens e anexa links reais do catálogo no fim.")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX EXTRA
+# =============================================================================
+
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
