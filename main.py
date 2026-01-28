@@ -5968,196 +5968,170 @@ def _postprocess_answer(answer: str, user_query: str, namespace: str, decided_to
 # FIM HOTFIX FINAL
 # =============================================================================
 # =============================================================================
-# HOTFIX FINAL DEFINITIVO
-# Multi-links no fim do orçamento (sem inventar URLs)
-# - Remove o "ver produto" (link único) injetado pelo postprocess antigo
-# - Anexa "Links dos produtos" com 1 link por item (quotes.db -> catálogo)
-# - NUNCA inventa links (ex.: "#sku=..."), só usa URLs reais
-# - Funciona com /ask que recebe fastapi.Request (JSON)
+# HOTFIX DEFINITIVO — Links por item (multi + single) SEM "ver produto" no topo
+# - Remove qualquer "ver produto" / links existentes no cabeçalho/miolo do orçamento
+# - Extrai SKUs do texto do orçamento (inclui casos "LIN0030 + LIN0110MA")
+# - Para cada SKU: tenta buscar URL no catálogo (catalog_items.url)
+# - Se URL vier como "#sku=..." (ou vazio), usa search.php?search_query=SKU
+# - Anexa SEMPRE no fim: "Links dos produtos:" com 1 link por item encontrado
+# - Aplica a TODAS as rotas /ask (tens duplicadas no ficheiro)
 # =============================================================================
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
+from typing import Any, List, Tuple, Optional
 
-# --- 1) detetar se a resposta é um orçamento (heurística simples e robusta)
-def _hf_is_budget_answer(text: str) -> bool:
-    t = text or ""
-    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t, flags=re.I))
+def _looks_like_budget_text(t: str) -> bool:
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t or "", flags=re.I))
 
-# --- 2) limpar "ver produto" antigo (não queremos link único nem linhas soltas)
-_VER_PROD_MD_RE = re.compile(r"\s*—\s*\[ver produto\]\([^)]+\)\s*", re.I)
-_VER_PROD_LINE_RE = re.compile(r"^\s*\[?ver produto\]?(?:\([^)]+\))?\s*$", re.I | re.M)
-
-def _hf_strip_single_ver_produto(answer: str) -> str:
+def _strip_ver_produto_noise(answer: str) -> str:
+    """
+    Remove:
+      - '— [ver produto](...)' em headers/linhas
+      - linhas só com 'ver produto'
+      - quaisquer ocorrências 'ver produto' (em markdown link ou texto) que estejam coladas ao orçamento
+    Não mexe nos URLs "a sério" do bloco final (porque este hotfix também evita duplicação pelo header).
+    """
     if not answer:
         return answer
-    out = _VER_PROD_MD_RE.sub("", answer)
-    # remove linhas que sejam só "ver produto" ou "[ver produto](...)"
-    lines = out.splitlines()
-    cleaned = []
-    for ln in lines:
-        if _VER_PROD_LINE_RE.match(ln.strip()):
-            continue
-        cleaned.append(ln)
-    return "\n".join(cleaned).strip()
 
-# --- 3) extrair SKUs do texto do orçamento (fallback quando quotes.db não tem url_snapshot)
-# apanha tokens típicos: ORK.03.01, 740021316-2, LINO030, etc. e também "A + B"
-_HF_SKU_TOKEN_RE = re.compile(r"\b[A-Z0-9][A-Z0-9._\-]{2,}\b", re.I)
+    # remove "— [ver produto](...)" e variantes
+    answer = re.sub(r"\s*—\s*\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", answer, flags=re.I)
 
-def _hf_extract_candidate_refs(answer: str) -> List[str]:
+    # remove markdown link standalone [ver produto](...)
+    answer = re.sub(r"^\s*\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)\s*$", "", answer, flags=re.I | re.M)
+
+    # remove linha só "ver produto"
+    answer = re.sub(r"^\s*ver\s+produto\s*$", "", answer, flags=re.I | re.M)
+
+    # limpa linhas vazias excessivas
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    return answer
+
+def _extract_sku_candidates_from_budget(answer: str) -> List[str]:
     """
-    Extrai refs possíveis do texto final do orçamento.
-    - recolhe tokens
-    - mantém ordem
-    - dedup
-    Nota: se aparecer "LINO030 + LINO110MA" apanha ambos e tenta ambos.
+    Extrai candidatos a SKU do texto do orçamento.
+    - Captura tokens tipo ORK.03.01, 740021316-2-AR, 100010, LIN0030, LIN0110MA
+    - Captura casos "SKU: X" e também colunas após o nome do item
+    - Trata "A + B" (mantém também separados)
     """
-    if not answer:
+    t = answer or ""
+    if not t:
         return []
-    # foco nas linhas da tabela: normalmente têm pipes ou "SKU"
-    lines = answer.splitlines()
-    candidates: List[str] = []
-    for ln in lines:
-        l = ln.strip()
-        if not l:
-            continue
-        if ("|" in l) or ("sku" in l.lower()):
-            for tok in _HF_SKU_TOKEN_RE.findall(l):
-                candidates.append(tok.strip())
 
-    # dedup preservando ordem
+    cands: List[str] = []
     seen = set()
-    out = []
-    for c in candidates:
-        cu = c.strip()
-        if not cu:
-            continue
-        key = cu.upper()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(cu)
-    return out
 
-def _hf_is_real_url(u: str) -> bool:
-    if not u:
-        return False
-    us = u.strip()
-    # recusa “inventos” tipo "#sku=..."
-    if us.startswith("#") or us.lower().startswith("javascript:"):
-        return False
-    return us.startswith("http://") or us.startswith("https://")
+    # 1) "SKU: XXX"
+    for m in re.finditer(r"\bSKU\s*:\s*([A-Z0-9][A-Z0-9.\-_]{2,})", t, flags=re.I):
+        s = (m.group(1) or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower()); cands.append(s)
 
-# --- 4) coletar links seguros (quotes.db primeiro; depois catálogo por ref)
-def _hf_collect_links(user_id: str, namespace: str, answer: str) -> List[Tuple[str, str]]:
+    # 2) padrões comuns de ref/SKU (inclui pontos e hífens, e números 5+)
+    for m in re.finditer(r"\b([A-Z]{2,}\.[A-Z0-9.\-_]{2,}|[0-9]{5,}(?:-[A-Z0-9]{1,6})?)\b", t):
+        s = (m.group(1) or "").strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower()); cands.append(s)
+
+    # 3) linhas da tabela com "Nome ... SKU" (ex.: "Zeal Laser 740021316-2 | 937.00€")
+    for m in re.finditer(r"^\s*\|\s*[^|]+\s+([A-Z0-9][A-Z0-9.\-_]{2,}(?:\s*\+\s*[A-Z0-9][A-Z0-9.\-_]{2,})?)\s*\|",
+                         t, flags=re.I | re.M):
+        s = (m.group(1) or "").strip()
+        if not s:
+            continue
+        if s.lower() not in seen:
+            seen.add(s.lower()); cands.append(s)
+        # se for "A + B", adiciona A e B
+        if "+" in s:
+            for part in re.split(r"\s*\+\s*", s):
+                part = part.strip()
+                if part and part.lower() not in seen:
+                    seen.add(part.lower()); cands.append(part)
+
+    return cands
+
+def _url_from_catalog_or_search(namespace: str, ref: str) -> Optional[Tuple[str, str]]:
+    """
+    Retorna (label, url) se conseguir.
+    Label tenta usar o nome do catálogo; url vem do catálogo, mas:
+      - se url for vazio ou começar por '#sku=' / '#', devolve search.php?search_query=ref
+    """
     ns = (namespace or DEFAULT_NAMESPACE).strip()
-    uid = (user_id or "anon").strip() or "anon"
+    r = (ref or "").strip()
+    if not r:
+        return None
+
+    cat = None
+    try:
+        cat = _catalog_get_by_ref(ns, r)
+    except Exception:
+        cat = None
+
+    name = ""
+    url = ""
+
+    if cat:
+        name = (cat.get("name") or "").strip()
+        url = (cat.get("url") or "").strip()
+
+    # normaliza url do catálogo se existir
+    if url:
+        try:
+            url = _canon_ig_url(url)
+        except Exception:
+            pass
+
+    # se url é só âncora (#sku=...) ou vazio: usa pesquisa
+    if (not url) or url.startswith("#") or ("#sku=" in url.lower()):
+        # usa SEMPRE o teu search.php (evita “inventar” páginas de produto)
+        url = f"https://interiorguider.com/search.php?search_query={quote_plus(r)}"
+
+    label = name or r
+    if r and r not in label:
+        label = f"{label} — {r}"
+    return (label, url)
+
+def _append_links_block(answer: str, namespace: str) -> str:
+    if not answer:
+        return answer
+
+    # evita duplicar
+    if re.search(r"^\s*Links\s+dos\s+produtos\s*:", answer, flags=re.I | re.M):
+        return answer
+
+    if not _looks_like_budget_text(answer):
+        return answer
+
+    refs = _extract_sku_candidates_from_budget(answer)
+    if not refs:
+        return answer
 
     links: List[Tuple[str, str]] = []
     seen = set()
 
-    # 4.1) quotes.db (fonte preferencial)
-    try:
-        qid = None
-        try:
-            qid = _quote_has_open(uid, ns)  # se existir
-        except Exception:
-            qid = None
-        if not qid:
-            try:
-                qid = _quote_get_open(uid, ns)
-            except Exception:
-                qid = None
+    for ref in refs:
+        got = _url_from_catalog_or_search(namespace, ref)
+        if not got:
+            continue
+        label, url = got
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append((label, url))
 
-        if qid:
-            items = _quote_list_items(qid) or []
-            for it in items:
-                ref = (it.get("ref") or "").strip()
-                name = (it.get("name_snapshot") or "").strip()
-                url = (it.get("url_snapshot") or "").strip()
-
-                # se url_snapshot não for URL real, ignorar (não inventar)
-                if url and not _hf_is_real_url(url):
-                    url = ""
-
-                if not url and ref:
-                    # fallback catálogo por ref, mas só se houver URL real
-                    try:
-                        cat = _catalog_get_by_ref(ns, ref)
-                    except Exception:
-                        cat = None
-                    if cat:
-                        cu = (cat.get("url_canonical") or cat.get("url") or "").strip()
-                        if _hf_is_real_url(cu):
-                            url = cu
-                        if not name:
-                            name = (cat.get("name") or "").strip()
-
-                if not url:
-                    continue
-
-                label = name or ref or "Produto"
-                if ref and ref not in label:
-                    label = f"{label} — {ref}"
-
-                key = (label.lower(), url.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                links.append((label, url))
-    except Exception:
-        pass
-
-    # 4.2) fallback: extrair refs do texto e mapear ao catálogo (só URLs reais)
-    try:
-        refs = _hf_extract_candidate_refs(answer)
-        for ref in refs:
-            # já temos este ref via quotes? evita duplicar por URL/label
-            try:
-                cat = _catalog_get_by_ref(ns, ref)
-            except Exception:
-                cat = None
-            if not cat:
-                continue
-            url = (cat.get("url_canonical") or cat.get("url") or "").strip()
-            if not _hf_is_real_url(url):
-                continue
-            name = (cat.get("name") or "").strip()
-            label = name or ref
-            if ref and ref not in label:
-                label = f"{label} — {ref}"
-
-            key = (label.lower(), url.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            links.append((label, url))
-    except Exception:
-        pass
-
-    return links
-
-# --- 5) anexar bloco final (sem markdown "ver produto" e sem repetir urls)
-def _hf_append_links_block(answer: str, links: List[Tuple[str, str]]) -> str:
-    if not answer:
-        return answer
     if not links:
-        return answer
-    # evita duplicação
-    if re.search(r"^\s*Links dos produtos\s*:", answer, flags=re.I | re.M):
         return answer
 
     block = ["", "Links dos produtos:"]
-    for label, url in links[:25]:
-        # formato simples e clicável (raw URL)
+    for label, url in links[:30]:
         block.append(f"- {label}")
         block.append(f"  {url}")
 
     return answer.rstrip() + "\n" + "\n".join(block)
 
-# --- 6) WRAP /ask POST (Request JSON) e pós-processar resposta
-def _hf_wrap_all_ask_routes_multi_links():
+def _hotfix_wrap_all_ask_routes_budget_links():
     try:
         wrapped = 0
         for r in getattr(app, "routes", []):
@@ -6169,83 +6143,57 @@ def _hf_wrap_all_ask_routes_multi_links():
             ep = getattr(r, "endpoint", None)
             if not callable(ep):
                 continue
-            if getattr(ep, "_hf_multi_links_wrapped", False):
+            if getattr(ep, "_hf_budget_links_wrapped_v2", False):
                 continue
 
-            async def _ep_wrapped(*args: Any, __ep=ep, **kwargs: Any):
+            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
                 resp = await __ep(*args, **kwargs)
                 try:
                     if not isinstance(resp, dict):
                         return resp
-
-                    answer = resp.get("answer") or resp.get("response") or ""
-                    if not answer:
+                    ans = resp.get("answer") or resp.get("response") or ""
+                    if not ans:
                         return resp
 
-                    # só mexe em orçamentos
-                    if not _hf_is_budget_answer(answer):
-                        return resp
+                    # tenta namespace da resposta; senão default
+                    ns = None
+                    try:
+                        ns = ((resp.get("rag") or {}).get("namespace")) or None
+                    except Exception:
+                        ns = None
+                    ns = (ns or DEFAULT_NAMESPACE)
 
-                    # obter Request e JSON para user_id/namespace
-                    user_id = "anon"
-                    namespace = None
-                    req = None
-                    for a in args:
-                        # fastapi.Request tem atributo "json" coroutine e "scope"
-                        if hasattr(a, "json") and hasattr(a, "scope"):
-                            req = a
-                            break
-                    if req is None:
-                        for v in kwargs.values():
-                            if hasattr(v, "json") and hasattr(v, "scope"):
-                                req = v
-                                break
-                    if req is not None:
-                        try:
-                            data = await req.json()
-                            if isinstance(data, dict):
-                                user_id = (data.get("user_id") or "").strip() or "anon"
-                                namespace = (data.get("namespace") or "").strip() or None
-                        except Exception:
-                            pass
+                    cleaned = _strip_ver_produto_noise(ans)
+                    fixed = _append_links_block(cleaned, ns)
 
-                    ns = namespace or DEFAULT_NAMESPACE
-
-                    # 1) remover link único "ver produto" antigo
-                    fixed = _hf_strip_single_ver_produto(answer)
-
-                    # 2) anexar bloco final com multi-links seguros (sem inventar)
-                    links = _hf_collect_links(user_id, ns, fixed)
-                    fixed2 = _hf_append_links_block(fixed, links)
-
-                    if fixed2 != answer:
-                        if "answer" in resp:
-                            resp["answer"] = fixed2
-                        else:
-                            resp["response"] = fixed2
-
+                    if "answer" in resp:
+                        resp["answer"] = fixed
+                    elif "response" in resp:
+                        resp["response"] = fixed
                     return resp
                 except Exception:
                     return resp
 
-            _ep_wrapped._hf_multi_links_wrapped = True
-            r.endpoint = _ep_wrapped
+            _wrapped._hf_budget_links_wrapped_v2 = True
+            r.endpoint = _wrapped
             wrapped += 1
 
         try:
-            log.info(f"[hotfix-multi-links] aplicado: /ask routes wrapped={wrapped}")
+            log.info(f"[hotfix-budget-links-v2] wrapped /ask routes: {wrapped}")
         except Exception:
             pass
-
         return True
     except Exception as e:
         try:
-            log.warning(f"[hotfix-multi-links] falhou: {e}")
+            log.warning(f"[hotfix-budget-links-v2] failed: {e}")
         except Exception:
             pass
         return False
 
-_hf_wrap_all_ask_routes_multi_links()
+_hotfix_wrap_all_ask_routes_budget_links()
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
 # =============================================================================
 # FIM HOTFIX FINAL DEFINITIVO
 # =============================================================================
