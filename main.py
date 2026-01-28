@@ -6274,6 +6274,154 @@ except Exception:
 # FIM HOTFIX EXTRA
 # =============================================================================
 
+# =============================================================================
+# HOTFIX EXTRA v2 — manter o HOTFIX BASE como “único gerador” de Links
+# Objetivo:
+# - NÃO inventar links, NÃO criar regras novas de URL
+# - Remover "ver produto" do topo/miolo em respostas de ORÇAMENTO
+# - Remover qualquer bloco "Links dos produtos:" já existente (para o HOTFIX BASE reconstruir bem)
+# - Reaplicar o gerador do HOTFIX BASE (funções já existentes no ficheiro)
+# Colar NO FIM do main.py (DEPOIS do hotfix base).
+# =============================================================================
+
+import re
+from typing import Any
+
+def _hf_v2_is_budget(t: str) -> bool:
+    return bool(re.search(r"\bOrçamento\b|\bOrcamento\b", t or "", flags=re.I))
+
+def _hf_v2_strip_inline_ver_produto(answer: str) -> str:
+    """
+    Remove “— ver produto” e links markdown [ver produto](...) e linhas isoladas “ver produto”.
+    (Sem tocar em URLs normais.)
+    """
+    if not answer:
+        return answer
+
+    # remove "— [ver produto](...)"
+    answer = re.sub(r"\s*—\s*\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", answer, flags=re.I)
+
+    # remove "[ver produto](...)" standalone
+    answer = re.sub(r"\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", answer, flags=re.I)
+
+    # remove linhas isoladas "ver produto"
+    answer = re.sub(r"(?im)^\s*ver\s+produto\s*$\n?", "", answer)
+
+    # normaliza espaços/linhas
+    answer = re.sub(r"[ \t]{2,}", " ", answer)
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    return answer
+
+def _hf_v2_remove_links_block(answer: str) -> str:
+    """
+    Remove qualquer bloco 'Links dos produtos:' do texto (para evitar o guard-rail do hotfix base
+    que impede reconstrução se já existir esse cabeçalho).
+    """
+    if not answer:
+        return answer
+
+    m = re.search(r"(?im)^\s*Links\s+dos\s+produtos\s*:\s*$", answer)
+    if not m:
+        return answer
+
+    # corta do cabeçalho até ao fim
+    return answer[:m.start()].rstrip()
+
+def _hf_v2_apply_base_builder(clean_text: str, namespace: str) -> str:
+    """
+    Reusa EXATAMENTE o gerador do HOTFIX BASE, se existir no runtime.
+    (Não cria links aqui.)
+    """
+    # tenta chamar o builder do hotfix base (nomes conforme o snippet “stable” que me mostraste)
+    try:
+        if callable(globals().get("_append_links_block")):
+            return globals()["_append_links_block"](clean_text, namespace)
+    except Exception:
+        pass
+    return clean_text
+
+def _hotfix_v2_wrap_all_ask_routes_budget_cleanup():
+    """
+    Envolve TODAS as rotas /ask (POST):
+    - se for orçamento:
+      1) remove "ver produto" (miolo/topo)
+      2) remove bloco "Links dos produtos:" pré-existente
+      3) reaplica o gerador do HOTFIX BASE para reconstruir os links corretamente
+    """
+    try:
+        wrapped = 0
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+            if getattr(ep, "_hf_budget_cleanup_v2_wrapped", False):
+                continue
+
+            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    key = "answer" if "answer" in resp else ("response" if "response" in resp else None)
+                    if not key:
+                        return resp
+
+                    ans = resp.get(key) or ""
+                    if not ans or not _hf_v2_is_budget(ans):
+                        return resp
+
+                    # namespace (mantém a lógica existente)
+                    ns = None
+                    try:
+                        ns = ((resp.get("rag") or {}).get("namespace")) or None
+                    except Exception:
+                        ns = None
+                    ns = (ns or DEFAULT_NAMESPACE)
+
+                    # 1) limpa “ver produto”
+                    cleaned = _hf_v2_strip_inline_ver_produto(ans)
+
+                    # 2) remove qualquer bloco Links... já existente (para não bloquear o hotfix base)
+                    cleaned = _hf_v2_remove_links_block(cleaned)
+
+                    # 3) se existir o teu hotfix base (stable), deixa-o reconstruir os links
+                    rebuilt = _hf_v2_apply_base_builder(cleaned, ns)
+
+                    resp[key] = rebuilt
+                    return resp
+                except Exception:
+                    return resp
+
+            _wrapped._hf_budget_cleanup_v2_wrapped = True
+            r.endpoint = _wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-budget-cleanup-v2] wrapped /ask routes: {wrapped}")
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-budget-cleanup-v2] failed: {e}")
+        except Exception:
+            pass
+        return False
+
+_hotfix_v2_wrap_all_ask_routes_budget_cleanup()
+
+# =============================================================================
+# FIM HOTFIX EXTRA v2
+# =============================================================================
+
 
 
 # ---------------------------------------------------------------------------------------
