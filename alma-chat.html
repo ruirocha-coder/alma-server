@@ -930,6 +930,289 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
   try{ if (typeof window.renderMsgs === "function") window.renderMsgs(); }catch(e){}
 })();
 </script>
+
+  <style id="alma-quote-clean-v1-css">
+  /* Garantir que o texto mantém parágrafos e quebras */
+  .msg .bubble{
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* Estilo para blocos “quase-título” dentro do orçamento */
+  .alma-quote-title{
+    font-weight: 800;
+    font-size: 1.05rem;
+    margin: 0 0 8px 0;
+  }
+
+  .alma-quote-section{
+    margin: 10px 0 0 0;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,0.10);
+  }
+
+  .alma-quote-kv{
+    margin: 4px 0;
+    color: var(--fg);
+  }
+
+  .alma-quote-kv span{
+    color: var(--fg-dim);
+  }
+
+  .alma-quote-list{
+    margin: 6px 0 0 18px;
+  }
+
+  /* Links */
+  .bubble a{
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+</style>
+
+<script id="alma-quote-clean-v1-js">
+(function(){
+  if (window.__alma_quote_clean_v1) return;
+  window.__alma_quote_clean_v1 = true;
+
+  function trimUrl(u){
+    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
+  }
+
+  // Linkifica URLs dentro de um elemento, mas sem mexer em A/Code/Pre etc.
+  function linkify(root){
+    const skip = new Set(["A","CODE","PRE","SCRIPT","STYLE","TEXTAREA","INPUT","BUTTON"]);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node){
+        const p = node.parentNode;
+        if(!p) return NodeFilter.FILTER_REJECT;
+        if(skip.has(p.nodeName)) return NodeFilter.FILTER_REJECT;
+        if(p.classList && p.classList.contains("copy-btn")) return NodeFilter.FILTER_REJECT;
+        if(!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    const nodes=[];
+    while(walker.nextNode()) nodes.push(walker.currentNode);
+
+    nodes.forEach(n=>{
+      const text = n.nodeValue;
+      if(!/https?:\/\//.test(text)) return;
+
+      const frag = document.createDocumentFragment();
+      const re = /(https?:\/\/[^\s<]+)/g;
+      let last = 0, m;
+
+      while((m = re.exec(text)) !== null){
+        if(m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+
+        const raw = m[1];
+        const url = trimUrl(raw);
+        const tail = raw.slice(url.length);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = url;
+        frag.appendChild(a);
+
+        if(tail) frag.appendChild(document.createTextNode(tail));
+        last = re.lastIndex;
+      }
+
+      if(last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      n.parentNode.replaceChild(frag, n);
+    });
+  }
+
+  function stripHeaderVerProdutoLines(lines){
+    // remove linhas iniciais “ver produto” isoladas (link errado no cabeçalho)
+    while(lines.length){
+      const first = (lines[0]||"").trim().toLowerCase();
+      if(first === "ver produto" || first === "- ver produto" || first === "— ver produto" || first === "– ver produto"){
+        lines.shift();
+        if(lines[0] && !lines[0].trim()) lines.shift();
+        continue;
+      }
+      break;
+    }
+    return lines;
+  }
+
+  function looksLikeBudget(text){
+    const t = (text||"").toLowerCase();
+    // heurística simples (sem risco)
+    return t.includes("orçamento") || t.includes("cotação") || t.includes("total:");
+  }
+
+  function formatBudgetText(raw){
+    // NÃO cria tabelas. Apenas organiza.
+    let t = (raw||"").replace(/\r\n/g,"\n").trimEnd();
+    let lines = t.split("\n");
+    lines = stripHeaderVerProdutoLines(lines);
+
+    // Se já estiver “bem escrito”, não inventar: só limpar separadores feios e pipes.
+    // Remove linhas de separador tipo |----|----| e excesso de pipes isolados.
+    lines = lines.filter(l => {
+      const s = (l||"").trim();
+      if(!s) return true;
+      if(/^\|?\s*:?-{3,}/.test(s) && s.includes("|")) return false;
+      return true;
+    }).map(l=>{
+      // Se a linha parece uma linha de “tabela ASCII” cheia de pipes, trocar por uma versão legível
+      // Ex: "Item | Preço | Quantidade | Subtotal" -> "• Item — Preço — Quantidade — Subtotal"
+      const s = l.trim();
+      const pipeCount = (s.match(/\|/g)||[]).length;
+      if(pipeCount >= 2){
+        const parts = s.split("|").map(x=>x.trim()).filter(Boolean);
+        if(parts.length >= 2){
+          return "• " + parts.join(" — ");
+        }
+      }
+      return l;
+    });
+
+    // Agora tenta estruturar: título + secções + bullets
+    const out = [];
+    let titleDone = false;
+
+    for(const l of lines){
+      const s = (l||"").trim();
+      if(!s){
+        out.push(""); // manter parágrafo
+        continue;
+      }
+
+      // Primeira linha com "Orçamento:" vira título
+      if(!titleDone && /^orçamento\s*:/i.test(s)){
+        out.push("## " + s.replace(/^orçamento\s*:\s*/i,"Orçamento: "));
+        titleDone = true;
+        continue;
+      }
+
+      // Linhas "Total:" destacadas
+      if(/^total\s*:/i.test(s)){
+        out.push("");
+        out.push("TOTAL: " + s.replace(/^total\s*:\s*/i,"").trim());
+        continue;
+      }
+
+      // Linhas "Preço com IVA..." etc como nota
+      if(/iva/i.test(s) && /portes?/i.test(s)){
+        out.push("Nota: " + s);
+        continue;
+      }
+
+      out.push(s);
+    }
+
+    return out.join("\n").trim();
+  }
+
+  function applyToBubble(bubble){
+    if(!bubble || bubble.dataset.quoteCleaned === "1") return;
+
+    const raw = (bubble.innerText || "").replace(/\u00a0/g," ").trimEnd();
+    if(!raw) { bubble.dataset.quoteCleaned="1"; return; }
+
+    // Só atuar em mensagens da Alma e só se parecer orçamento
+    const row = bubble.closest(".msg");
+    if(!row || !row.classList.contains("alma")) { bubble.dataset.quoteCleaned="1"; return; }
+    if(!looksLikeBudget(raw)) { 
+      // ainda assim, linkify para ficar bem
+      linkify(bubble);
+      bubble.dataset.quoteCleaned="1";
+      return;
+    }
+
+    // Guardar o botão copiar, porque vamos reescrever HTML
+    const copyBtn = bubble.querySelector(".copy-btn");
+    if(copyBtn) copyBtn.remove();
+
+    const cleaned = formatBudgetText(raw);
+
+    // Render mínimo em HTML (sem markdown): converte "## " em título visual e preserva \n com <br>
+    // Também cria secções simples se houver "Links dos produtos:" etc.
+    const htmlLines = cleaned.split("\n").map(line=>{
+      if(line.startsWith("## ")){
+        const t = line.slice(3).trim();
+        return '<div class="alma-quote-title">'+escapeHtml(t)+'</div>';
+      }
+      if(/^links?/i.test(line.trim())){
+        return '<div class="alma-quote-section"><div class="alma-quote-kv"><span>'+escapeHtml(line.trim())+'</span></div>';
+      }
+      if(line.trim() === "TOTAL:" || line.trim().startsWith("TOTAL:")){
+        return '<div class="alma-quote-section"><div class="alma-quote-kv"><b>'+escapeHtml(line.trim())+'</b></div></div>';
+      }
+      return escapeHtml(line).replace(/^•\s+/,"&bull; ");
+    });
+
+    // Fechar secção aberta (simplificação: sempre fecha no fim)
+    let html = htmlLines.join("<br>");
+    // Se abrimos uma secção com <div class="alma-quote-section"> sem fechar, fecha aqui:
+    const openSections = (html.match(/<div class="alma-quote-section">/g)||[]).length;
+    const closeSections = (html.match(/<\/div>/g)||[]).length; // bruto, mas ok aqui
+    // Não vamos tentar balancear tags à força; em vez disso, evitamos deixar tags abertas:
+    html = html.replace(/<div class="alma-quote-section"><div class="alma-quote-kv"><span>(.*?)<\/span><\/div>/g,
+                        '<div class="alma-quote-section"><div class="alma-quote-kv"><span>$1</span></div>');
+
+    bubble.innerHTML = html;
+
+    // linkify depois de reescrever
+    linkify(bubble);
+
+    // repor copy
+    if(row.classList.contains("alma")){
+      const copy = document.createElement("span");
+      copy.className = "copy-btn";
+      copy.textContent = "copiar";
+      copy.onclick = ()=>navigator.clipboard.writeText(cleaned);
+      bubble.appendChild(copy);
+    }
+
+    bubble.dataset.quoteCleaned="1";
+  }
+
+  function escapeHtml(s){
+    return (s||"")
+      .replace(/&/g,"&amp;")
+      .replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;")
+      .replace(/'/g,"&#39;");
+  }
+
+  function runOnce(){
+    document.querySelectorAll(".msg .bubble").forEach(applyToBubble);
+  }
+
+  // Corre já
+  runOnce();
+
+  // Observa novas mensagens (leve, só bubbles novas)
+  const messages = document.getElementById("messages");
+  if(messages){
+    const obs = new MutationObserver(muts=>{
+      for(const mut of muts){
+        for(const n of mut.addedNodes){
+          if(!(n instanceof HTMLElement)) continue;
+          if(n.classList && n.classList.contains("msg")){
+            const b = n.querySelector(".bubble");
+            if(b) applyToBubble(b);
+          }else{
+            n.querySelectorAll && n.querySelectorAll(".msg .bubble").forEach(applyToBubble);
+          }
+        }
+      }
+    });
+    obs.observe(messages, {childList:true, subtree:true});
+  }
+})();
+</script>
   
 </body>
 </html>
