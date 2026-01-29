@@ -511,7 +511,216 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
   obs.observe(messages, { childList: true, subtree: true });
 })();
 </script>
-  
+
+<style id="alma-markdown-css">
+/* --- Hotfix Markdown (tabelas, código, listas) --- */
+.msg .bubble{
+  white-space: normal !important;   /* crucial: permitir HTML/Markdown renderizado */
+}
+
+/* Links (mantém o teu accent) */
+.msg .bubble a{
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Tabelas bonitas */
+.msg .bubble table{
+  width:100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: .95rem;
+}
+.msg .bubble th, .msg .bubble td{
+  border: 1px solid rgba(255,255,255,0.10);
+  padding: 8px 10px;
+  vertical-align: top;
+}
+.msg .bubble th{
+  color: var(--fg);
+  background: rgba(255,255,255,0.04);
+  font-weight: 700;
+}
+.msg .bubble tr:nth-child(even) td{
+  background: rgba(255,255,255,0.02);
+}
+
+/* Blocos de código */
+.msg .bubble pre,
+.msg .bubble code{
+  background: rgba(0,0,0,0.25);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+}
+.msg .bubble pre{
+  padding: 10px 12px;
+  overflow:auto;
+}
+.msg .bubble code{
+  padding: 2px 6px;
+}
+
+/* Listas mais legíveis */
+.msg .bubble ul,
+.msg .bubble ol{
+  margin: 8px 0 8px 22px;
+}
+.msg .bubble li{
+  margin: 4px 0;
+}
+
+/* Headers Markdown (se o modelo usar #) */
+.msg .bubble h1, .msg .bubble h2, .msg .bubble h3,
+.msg .bubble h4, .msg .bubble h5, .msg .bubble h6{
+  margin: 10px 0 6px;
+  font-size: 1.05rem;
+}
+
+/* Separadores */
+.msg .bubble hr{
+  border: none;
+  border-top: 1px solid rgba(255,255,255,0.10);
+  margin: 12px 0;
+}
+</style>
+
+<script>
+/* =========================================================
+   Alma Markdown Renderer Hotfix (GFM tables)
+   - Carrega marked + DOMPurify
+   - Renderiza markdown em .bubble
+   - Evita duplicação com linkify antigo
+   ========================================================= */
+(function(){
+  if (window.__alma_markdown_hotfix_v1) return;
+  window.__alma_markdown_hotfix_v1 = true;
+
+  // 1) Desligar o linkify antigo (para não mexer em HTML já renderizado)
+  //    (se o teu linkify já correu, não conseguimos "des-correr", mas evitamos corridas futuras)
+  window.__alma_linkify_v3 = true; // força o teu guard a achar que já correu
+
+  function loadScript(src){
+    return new Promise((resolve, reject)=>{
+      var s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.onload = ()=>resolve(true);
+      s.onerror = ()=>reject(new Error("Falha a carregar: "+src));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function ensureLibs(){
+    // marked
+    if (!window.marked){
+      await loadScript("https://cdn.jsdelivr.net/npm/marked/marked.min.js");
+    }
+    // DOMPurify
+    if (!window.DOMPurify){
+      await loadScript("https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js");
+    }
+    return (window.marked && window.DOMPurify);
+  }
+
+  function shouldSkipBubble(bubble){
+    // Não tocar em bubbles sem conteúdo
+    if (!bubble) return true;
+
+    // Se já foi renderizado por este hotfix
+    if (bubble.dataset && bubble.dataset.mdRendered === "1") return true;
+
+    // Evitar tocar no botão copiar (é child, não bubble), ok.
+    return false;
+  }
+
+  function getRawTextFromBubble(bubble){
+    // O teu renderMsgs mete HTML (b, u, etc.) com base no texto original.
+    // Para não “dobrar” tags, aqui vamos ao texto visível.
+    // Nota: isto pode perder alguns sublinhados/bolds anteriores,
+    // mas a ideia é que o backend mande markdown correcto.
+    return (bubble.innerText || "").trimEnd();
+  }
+
+  function renderBubbleMarkdown(bubble){
+    if (shouldSkipBubble(bubble)) return;
+
+    const raw = getRawTextFromBubble(bubble);
+    if (!raw) { bubble.dataset.mdRendered = "1"; return; }
+
+    // manter referência ao copy-btn (se existir)
+    const copyBtn = bubble.querySelector(".copy-btn");
+    if (copyBtn) copyBtn.remove();
+
+    // configurar marked (GFM + tabelas + quebras)
+    window.marked.setOptions({
+      gfm: true,
+      breaks: true,
+      headerIds: false,
+      mangle: false
+    });
+
+    const html = window.marked.parse(raw);
+    const safe = window.DOMPurify.sanitize(html);
+
+    bubble.innerHTML = safe;
+
+    // repor copy-btn no fim (só nas mensagens da Alma)
+    const row = bubble.closest(".msg");
+    if (row && row.classList.contains("alma")){
+      const copy = document.createElement("span");
+      copy.className = "copy-btn";
+      copy.textContent = "copiar";
+      copy.onclick = ()=>navigator.clipboard.writeText(raw);
+      bubble.appendChild(copy);
+    }
+
+    bubble.dataset.mdRendered = "1";
+  }
+
+  function renderAll(){
+    document.querySelectorAll(".msg .bubble").forEach(renderBubbleMarkdown);
+  }
+
+  async function boot(){
+    try{
+      const ok = await ensureLibs();
+      if (!ok) return;
+
+      // 2) Renderizar o histórico já existente
+      renderAll();
+
+      // 3) Observar novas mensagens e renderizar automaticamente
+      const messages = document.getElementById("messages");
+      if (!messages) return;
+
+      const obs = new MutationObserver((muts)=>{
+        for (const mut of muts){
+          for (const n of mut.addedNodes){
+            if (!(n instanceof HTMLElement)) continue;
+
+            // Se for uma msg inteira
+            if (n.classList && n.classList.contains("msg")){
+              const b = n.querySelector(".bubble");
+              if (b) renderBubbleMarkdown(b);
+              continue;
+            }
+
+            // Caso contrário, procurar bubbles dentro do nó
+            n.querySelectorAll && n.querySelectorAll(".msg .bubble").forEach(renderBubbleMarkdown);
+          }
+        }
+      });
+      obs.observe(messages, { childList:true, subtree:true });
+    }catch(e){
+      // Se falhar, não bloqueia o chat
+      console.warn("Alma Markdown hotfix falhou:", e);
+    }
+  }
+
+  boot();
+})();
+</script>  
 
 
   
