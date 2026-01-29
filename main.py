@@ -7051,6 +7051,299 @@ try:
     app.add_middleware(_AskAnswerCleanerMiddleware)
 except Exception:
     pass
+
+# ============================================================
+# HOTFIX ÚNICO — Orçamentos sem “tabelas ASCII”, bonito e legível
+# Colar NO FIM do main.py
+# - Não altera o teu ask()
+# - Interceta /ask e reescreve apenas o campo "answer"
+# ============================================================
+
+import re
+import json
+from typing import List, Dict, Tuple, Optional
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ---------- Helpers de texto ----------
+
+_URL_RE = re.compile(r"https?://[^\s<>()\]]+", re.IGNORECASE)
+
+def _norm_newlines(s: str) -> str:
+    return (s or "").replace("\r\n", "\n").replace("\r", "\n")
+
+def _strip_ascii_separators_line(line: str) -> bool:
+    # linhas só de separadores (---, |---|, etc.)
+    s = (line or "").strip()
+    return bool(re.fullmatch(r"[-|–—\s]{4,}", s))
+
+def _remove_ver_produto_markdown(text: str) -> str:
+    # remove "ver produto" enquanto link markdown no meio do texto
+    # ex: [ver produto](https://...)  -> remove (o link será listado mais abaixo)
+    text = re.sub(r"\[\s*ver\s+produto\s*\]\(\s*https?://[^\s)]+\s*\)", "", text, flags=re.I)
+    # remove "— ver produto" / "ver produto" solto
+    text = re.sub(r"(\s*[—-]\s*)?\bver\s+produto\b", "", text, flags=re.I)
+    return text
+
+def _extract_urls(text: str) -> List[str]:
+    seen = set()
+    urls = []
+    for m in _URL_RE.finditer(text or ""):
+        u = m.group(0).rstrip(").,;:!?]}")
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+def _collapse_blank_lines(text: str) -> str:
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def _looks_like_budget(text: str) -> bool:
+    t = (text or "").lower()
+    keys = ["orçamento", "orcamento", "cotação", "cotacao", "preço", "preco", "proforma", "pro forma"]
+    return any(k in t for k in keys)
+
+# ---------- Parser de “tabela ASCII” de orçamento ----------
+
+def _parse_ascii_table_lines(lines: List[str]) -> Tuple[List[Dict], Optional[str], List[str], List[str]]:
+    """
+    Devolve:
+      items: [{name, sku, unit_price, qty, subtotal}]
+      total: "1739.00€" (string como aparecer)
+      notes: linhas fora da tabela (IVA/portes etc.)
+      links: urls
+    """
+    items: List[Dict] = []
+    notes: List[str] = []
+    links: List[str] = []
+
+    in_table = False
+    total = None
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        s = line.strip()
+
+        if not s:
+            continue
+
+        links.extend(_extract_urls(s))
+
+        if _strip_ascii_separators_line(s):
+            continue
+
+        low = s.lower()
+
+        # detectar header de tabela
+        if ("|" in s) and any(k in low for k in ("item", "preço", "preco", "quantidade", "subtotal", "sku")):
+            in_table = True
+            continue
+
+        # detectar total
+        if low.startswith("total"):
+            # tenta capturar valor
+            m = re.search(r"total\s*[:\-]?\s*(.*)$", s, flags=re.I)
+            if m:
+                total = m.group(1).strip()
+            else:
+                total = s
+            continue
+
+        if in_table and s.count("|") >= 2:
+            cols = [c.strip() for c in s.split("|") if c.strip()]
+            # heurística: [Item+SKU, Preço unit, Quantidade, Subtotal]
+            # às vezes o item já traz SKU no texto
+            if len(cols) >= 4:
+                item_col = cols[0]
+                unit = cols[1]
+                qty = cols[2]
+                sub = cols[3]
+
+                sku = None
+                msku = re.search(r"\bSKU[:\s]*([A-Za-z0-9\-_.]+)", item_col, flags=re.I)
+                if msku:
+                    sku = msku.group(1).strip()
+
+                # nome: remove "SKU=..." ou "SKU: ..."
+                name = re.sub(r"\bSKU\s*[:=]\s*[A-Za-z0-9\-_.]+\b", "", item_col, flags=re.I).strip(" -—")
+
+                items.append({
+                    "name": name or item_col,
+                    "sku": sku,
+                    "unit_price": unit,
+                    "qty": qty,
+                    "subtotal": sub
+                })
+                continue
+
+        # se estamos fora ou não apanhámos linha de tabela: tratar como nota
+        notes.append(s)
+
+    # dedup links
+    dedup = []
+    seen = set()
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+
+    return items, total, notes, dedup
+
+def _clean_and_format_budget(text: str) -> str:
+    """
+    - remove tabela ASCII / traços
+    - formata orçamento em bullets
+    - empurra links para bloco final
+    """
+    text = _norm_newlines(text)
+    text = _remove_ver_produto_markdown(text)
+
+    lines = text.split("\n")
+    items, total, notes, links = _parse_ascii_table_lines(lines)
+
+    # remover das notas frases muito “tabela”
+    clean_notes = []
+    for n in notes:
+        if _strip_ascii_separators_line(n):
+            continue
+        # reduzir excesso de pipes se houver
+        if n.count("|") >= 2:
+            n = re.sub(r"\s*\|\s*", " — ", n).strip()
+        clean_notes.append(n)
+
+    # separar notas úteis (IVA/portes/confirmar)
+    iva_notes = []
+    other_notes = []
+    for n in clean_notes:
+        low = n.lower()
+        if any(k in low for k in ("iva", "portes", "não inclu", "nao inclu", "incluído", "incluido")):
+            iva_notes.append(n)
+        else:
+            other_notes.append(n)
+
+    out: List[str] = []
+    out.append("**Orçamento**")
+
+    # itens
+    if items:
+        for it in items:
+            sku_txt = f" (SKU: {it['sku']})" if it.get("sku") else ""
+            out.append(
+                f"• {it.get('name','').strip()}{sku_txt} — "
+                f"Qtd: {it.get('qty','').strip()} — "
+                f"Unit: {it.get('unit_price','').strip()} — "
+                f"Subtotal: {it.get('subtotal','').strip()}"
+            )
+    else:
+        # fallback: se não conseguiu parsear itens, pelo menos limpa os traços e mantém texto
+        # (mas sem compactar tudo numa linha)
+        cleaned = []
+        for raw in lines:
+            s = raw.rstrip()
+            if not s.strip():
+                cleaned.append("")
+                continue
+            if _strip_ascii_separators_line(s):
+                continue
+            if s.count("|") >= 2:
+                s = re.sub(r"\s*\|\s*", " — ", s).strip()
+            cleaned.append(s)
+        core = _collapse_blank_lines("\n".join(cleaned))
+        # evita duplicar título se já veio
+        if core:
+            out.append(core)
+
+    # total
+    if total:
+        out.append("")
+        out.append(f"**Total:** {total}")
+
+    # notas (IVA/portes)
+    if iva_notes:
+        out.append("")
+        # junta em 1-2 linhas para ficar limpo
+        out.append("_" + " ".join(iva_notes).strip() + "_")
+
+    # outras notas úteis (sem ruído)
+    # (opcional: manter só 1-2 linhas)
+    trimmed_other = [n for n in other_notes if n and len(n) <= 180]
+    if trimmed_other:
+        out.append("")
+        # evita repetir coisas tipo "Links dos produtos:" sem links
+        for n in trimmed_other[:3]:
+            if re.search(r"\blinks?\b", n.lower()) and not links:
+                continue
+            out.append(n)
+
+    # links (sempre no fim)
+    if links:
+        out.append("")
+        out.append("**Links**")
+        for u in links:
+            out.append(f"- {u}")
+
+    return _collapse_blank_lines("\n".join(out))
+
+
+def _postprocess_answer(answer: str) -> str:
+    if not answer:
+        return answer
+
+    # Só mexer forte quando for orçamento/cotação/preço
+    if _looks_like_budget(answer):
+        return _clean_and_format_budget(answer)
+
+    # caso geral: pelo menos remove separadores “ASCII”
+    s = _norm_newlines(answer)
+    s = _remove_ver_produto_markdown(s)
+    s = "\n".join([ln for ln in s.split("\n") if not _strip_ascii_separators_line(ln)])
+    return _collapse_blank_lines(s)
+
+
+# ---------- Middleware (interceta /ask sem mexer no ask()) ----------
+
+class _AskBeautifierMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+
+        # só /ask
+        if request.url.path != "/ask":
+            return response
+
+        # só JSON
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            return response
+
+        # ler body (response pode ser streaming)
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            # devolve como veio, mas recompõe body
+            return JSONResponse(content={"answer": body.decode("utf-8", "ignore")}, status_code=response.status_code)
+
+        if isinstance(payload, dict) and "answer" in payload:
+            payload["answer"] = _postprocess_answer(payload.get("answer") or "")
+            # preservar status code
+            return JSONResponse(content=payload, status_code=response.status_code)
+
+        # se não for o formato esperado, devolve intacto
+        return JSONResponse(content=payload, status_code=response.status_code)
+
+
+# Regista o middleware no fim (não quebra se já existir)
+try:
+    app.add_middleware(_AskBeautifierMiddleware)
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
