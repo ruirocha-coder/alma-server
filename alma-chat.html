@@ -273,58 +273,56 @@ function escapeHtml(s){
 function trimUrl(u){
   return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
 }
+
 function renderRichText(raw){
-  // 1) normalizar newlines
   let t = (raw || "").replace(/\r\n/g,"\n");
 
-  // 2) HOTFIX: corrigir URLs partidos por espaços (o teu caso real)
-  // ".../ sku=XXXX"  -> ".../?sku=XXXX"
+  // 1) Corrigir URL partido por espaços (o teu caso real)
   t = t.replace(/\/\s*(sku=)/gi, "/?$1");
-
-  // também remove espaços “a colar” em query strings: "? a=b" -> "?a=b"
   t = t.replace(/\?\s+/g, "?").replace(/&\s+/g, "&").replace(/#\s+/g, "#");
 
-  // 3) HOTFIX: limpar markdown lixo (pares soltos de **)
-  // (mantém **texto**; só remove ** isolado)
-  t = t.replace(/(^|[\s•\-])\*\*(?=($|[\s•\-]))/g, "$1");
+  // 2) Quebras mínimas antes de secções (ajuda MUITO a leitura)
+  t = t.replace(/\s*(Links dos produtos\s*:)/gi, "\n\n$1");
+  t = t.replace(/\s*(Total\s*:)/gi, "\n\n$1");
 
-  // 4) escapar tudo (seguro)
+  // 3) Limpar "**" lixo colado a preços / pontuação (sem estragar bold normal)
+  // Ex.: "1739.00€**" -> "1739.00€"
+  t = t.replace(/(€)\*\*/g, "$1");
+  // e também casos "**." "**," "** " no fim de frase
+  t = t.replace(/\*\*(?=[\s.,;:!?]|$)/g, "");
+
+  // 4) Normalizar bullets feios "·" e listas "- "
+  t = t.replace(/(^|\n)\s*[·•]\s+/g, "$1• ");
+  t = t.replace(/(^|\n)\s*-\s+/g, "$1• ");
+
+  // 5) Escapar HTML (seguro)
   t = escapeHtml(t);
 
-  // 5) headings (# Título)
-  t = t.replace(/^\s*#{1,6}\s+(.+)$/gm, '<div class="alma-h">$1</div>');
-
-  // 6) markdown inline simples
+  // 6) Markdown inline simples
   t = t
     .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/__(.+?)__/g, "<u>$1</u>");
 
-  // 7) listas simples: linhas "- xxx" -> "• xxx"
-  // (não inventa <ul>, só torna legível e consistente)
-  t = t.replace(/(^|\n)\s*-\s+/g, "$1• ");
-
-  // 8) linkify: [texto](url), (url), url solta
+  // 7) Linkify [texto](url), (url), url solta
   t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, txt, url){
     url = trimUrl(url);
     return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(txt)+'</a>';
   });
-
   t = t.replace(/\((https?:\/\/[^\s)]+)\)/g, function(_, url){
     url = trimUrl(url);
     return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
   });
-
   t = t.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, rawUrl){
     const url = trimUrl(rawUrl);
     const tail = rawUrl.slice(url.length);
     return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
   });
 
-  // 9) quebras de linha
+  // 8) Quebras
   t = t.replace(/\n/g, "<br>");
-
   return t;
 }
+  
 /* ================================
    Sessões
 ================================ */
