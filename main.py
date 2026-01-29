@@ -6686,6 +6686,291 @@ except Exception:
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — Orçamentos: (1) remover links no cabeçalho (ver produto) quando NÃO há SKU fechado
+#                     (2) padronizar blocos de orçamento e “embelezar” tabelas (Markdown)
+#
+# Colar NO FIM do main.py
+# Objetivo:
+# - Nunca mostrar “— ver produto” no TÍTULO/cabeçalho de um bloco de orçamento quando:
+#     • há variantes / pedido não está totalmente definido / não há SKU explícito no pedido
+# - Transformar as tabelas “CSV/ASCII com | e ----” em Markdown table limpa
+# - Normalizar secções: Título → Tabela → Total → Nota IVA/portes → Links (no fim)
+#
+# Nota: não mexe na tua lógica de catálogo/LLM; só faz pós-processamento do texto final.
+# =============================================================================
+
+import re
+from typing import Any, Optional, Tuple, List
+
+# -------------------------------
+# Helpers: detetar orçamentos
+# -------------------------------
+
+def _hf_is_budget_context(answer: str, user_query: str = "") -> bool:
+    t = (answer or "") + "\n" + (user_query or "")
+    return bool(re.search(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao|preço|preco)\b", t, flags=re.I))
+
+def _hf_answer_has_variants(answer: str) -> bool:
+    """
+    Heurística: se o bloco listar variantes/opções, tratamos como 'não fechado'.
+    """
+    a = answer or ""
+    if re.search(r"\bvariantes?\b|\bescolha\s+o\s+SKU\b|\bindique\s+a\s+variante\b|\bSKU\s+ou\s+nome\b", a, flags=re.I):
+        return True
+
+    # linhas de lista típicas: "- Variante: X | SKU: Y"
+    variant_lines = re.findall(r"(?im)^\s*-\s*variante\s*:.*SKU\s*:\s*[A-Z0-9]", a)
+    if len(variant_lines) >= 1:
+        return True
+
+    # também cobre listas sem "Variante:" mas com várias opções SKU
+    sku_lines = re.findall(r"(?im)^\s*-\s*.*\bSKU\s*:\s*[A-Z0-9]", a)
+    if len(sku_lines) >= 2:
+        return True
+
+    return False
+
+def _hf_user_query_has_explicit_sku(user_query: str) -> bool:
+    """
+    Se o utilizador deu um SKU (ex.: 741050527-TW, ORK.03.01, 100010, 740021316-2)
+    consideramos “fechado” para permitir link no cabeçalho (se existir).
+    """
+    q = user_query or ""
+    if re.search(r"\bSKU\s*:\s*[A-Z0-9][A-Z0-9.\-_]{2,}\b", q, flags=re.I):
+        return True
+    # tokens com padrão de SKU/ref
+    if re.search(r"\b([A-Z]{2,}[A-Z0-9.\-_]{2,}|[0-9]{5,}(?:-[A-Z0-9]{1,6})?)\b", q):
+        return True
+    return False
+
+# -------------------------------
+# 1) Remover “ver produto” no cabeçalho
+# -------------------------------
+
+def _hf_strip_header_ver_produto(answer: str) -> str:
+    """
+    Remove apenas o “— ver produto” colado ao cabeçalho/título.
+    Mantém os links no bloco “Links dos produtos:” (que é onde queremos).
+    """
+    a = answer or ""
+    if not a:
+        return a
+
+    # Remove "— ver produto" no mesmo parágrafo do título/primeira linha
+    # Exemplos:
+    # "Dublexo ... — ver produto"
+    # "Orçamento ... — ver produto"
+    a = re.sub(r"(?im)^(\s*(?:orç(?:a|ã)mento|orcamento).*)\s+—\s*ver\s+produto\s*$", r"\1", a)
+    a = re.sub(r"(?im)^(\s*.+?)\s+—\s*ver\s+produto\s*$", r"\1", a, count=1)
+
+    # Remove link markdown “[ver produto](...)” no cabeçalho (primeiras ~3 linhas)
+    lines = a.splitlines()
+    for i in range(min(3, len(lines))):
+        lines[i] = re.sub(r"\s*—\s*\[?\s*ver\s+produto\s*\]?\s*(\([^)]+\))?", "", lines[i], flags=re.I).rstrip()
+        lines[i] = re.sub(r"\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", lines[i], flags=re.I).rstrip()
+    a = "\n".join(lines)
+
+    # Limpa excesso de linhas vazias
+    a = re.sub(r"\n{3,}", "\n\n", a).strip()
+    return a
+
+# -------------------------------
+# 2) Embelezar tabelas para Markdown
+# -------------------------------
+
+def _hf_parse_ascii_table(block: str) -> Optional[str]:
+    """
+    Converte tabelas ASCII do tipo:
+      | Item + SKU | Preço | Quantidade | Subtotal |
+      |-----|-----|-----|-----|
+      | X | 10€ | 1 | 10€ |
+    para Markdown table.
+    """
+    if not block or "|" not in block:
+        return None
+
+    lines = [l.rstrip() for l in block.splitlines()]
+    table_lines = [l for l in lines if "|" in l]
+    if len(table_lines) < 3:
+        return None
+
+    # tenta encontrar header e separador
+    header_idx = None
+    sep_idx = None
+    for i, l in enumerate(lines):
+        if "|" in l and re.search(r"item|preço|quantidade|subtotal|sku", l, flags=re.I):
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    for j in range(header_idx + 1, min(header_idx + 4, len(lines))):
+        if re.search(r"^\s*\|?\s*-{2,}", lines[j]) and "|" in lines[j]:
+            sep_idx = j
+            break
+
+    if sep_idx is None:
+        # alguns outputs não têm a linha de ---- mas têm várias linhas com pipes
+        # aceitamos assim mesmo
+        sep_idx = header_idx + 1
+
+    def split_row(r: str) -> List[str]:
+        # remove pipes extremos e divide
+        r2 = r.strip()
+        if r2.startswith("|"):
+            r2 = r2[1:]
+        if r2.endswith("|"):
+            r2 = r2[:-1]
+        return [c.strip() for c in r2.split("|")]
+
+    header = split_row(lines[header_idx])
+    # recolhe rows até acabar a tabela (linhas com pipes e pelo menos 2 colunas)
+    rows: List[List[str]] = []
+    for k in range(sep_idx + 1, len(lines)):
+        if "|" not in lines[k]:
+            # para quando sai da tabela
+            break
+        r = split_row(lines[k])
+        if len(r) >= 2 and any(x for x in r):
+            rows.append(r)
+
+    if not rows:
+        return None
+
+    # normaliza número de colunas (pad)
+    ncols = max(len(header), max(len(r) for r in rows))
+    header = (header + [""] * ncols)[:ncols]
+    rows = [(r + [""] * ncols)[:ncols] for r in rows]
+
+    md = []
+    md.append("| " + " | ".join(header) + " |")
+    md.append("| " + " | ".join(["---"] * ncols) + " |")
+    for r in rows:
+        md.append("| " + " | ".join(r) + " |")
+
+    return "\n".join(md)
+
+def _hf_beautify_budget_tables(answer: str) -> str:
+    """
+    Procura a primeira tabela ASCII típica de orçamento e converte para Markdown.
+    """
+    a = answer or ""
+    if not a:
+        return a
+
+    # encontra blocos que comecem em linha com pipes e tenham "Item" + "Subtotal"
+    m = re.search(r"(?s)(\n?\|.*\n\|.*\n(?:\|.*\n)+)", a)
+    if not m:
+        return a
+
+    table_block = m.group(1)
+    md_table = _hf_parse_ascii_table(table_block)
+    if not md_table:
+        return a
+
+    return a.replace(table_block, "\n" + md_table + "\n")
+
+# -------------------------------
+# 3) Padronizar secções de orçamento (leve, sem reescrever conteúdo)
+# -------------------------------
+
+def _hf_standardize_budget_block(answer: str) -> str:
+    """
+    Ajustes leves:
+    - Garante espaçamento consistente
+    - Evita duplicações de “Links úteis (do RAG)” (opcional: remove)
+    """
+    a = (answer or "").strip()
+    if not a:
+        return a
+
+    # Remove bloco "Links úteis (do RAG):" (normalmente confunde)
+    a = re.sub(r"(?is)\n\s*Links\s+úteis\s*\(do\s+RAG\)\s*:\s*\n(?:\s*-\s*.*\n?)+", "\n", a)
+
+    # Compacta espaços
+    a = re.sub(r"\n{3,}", "\n\n", a).strip()
+    return a
+
+# -------------------------------
+# Wrapper universal das rotas /ask (sem tocar no core)
+# -------------------------------
+
+def _hf_wrap_all_ask_routes_budget_formatting():
+    try:
+        wrapped = 0
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+            if getattr(ep, "_hf_budget_formatting_v1", False):
+                continue
+
+            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    # lê answer/response
+                    ans_key = "answer" if "answer" in resp else ("response" if "response" in resp else None)
+                    if not ans_key:
+                        return resp
+                    ans = resp.get(ans_key) or ""
+                    if not ans:
+                        return resp
+
+                    # tenta obter user_query (se existir no payload)
+                    user_q = ""
+                    try:
+                        user_q = (resp.get("user_query") or resp.get("query") or "")  # depende da tua estrutura
+                    except Exception:
+                        user_q = ""
+
+                    if _hf_is_budget_context(ans, user_q):
+                        has_variants = _hf_answer_has_variants(ans)
+                        explicit_sku = _hf_user_query_has_explicit_sku(user_q)
+
+                        # Se NÃO está fechado (variantes) e NÃO há SKU explícito: remove link no cabeçalho
+                        if has_variants and not explicit_sku:
+                            ans = _hf_strip_header_ver_produto(ans)
+
+                        # Embelezar tabelas e padronizar
+                        ans = _hf_beautify_budget_tables(ans)
+                        ans = _hf_standardize_budget_block(ans)
+
+                        resp[ans_key] = ans
+                    return resp
+                except Exception:
+                    return resp
+
+            _wrapped._hf_budget_formatting_v1 = True
+            r.endpoint = _wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix-budget-formatting-v1] wrapped /ask routes: {wrapped}")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix-budget-formatting-v1] failed: {e}")
+        except Exception:
+            pass
+        return False
+
+_hf_wrap_all_ask_routes_budget_formatting()
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
 
 # ---------------------------------------------------------------------------------------
 # Local run
