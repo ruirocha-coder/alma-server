@@ -2,7 +2,7 @@
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
-  <title>Alma - chat</title>
+  <title>Alma - chat (raw)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
@@ -25,6 +25,7 @@
       display:flex; overflow:hidden;
     }
 
+    /* Sidebar */
     .sidebar{
       width:310px; min-width:260px; max-width:360px;
       background:linear-gradient(180deg,var(--panel),var(--panel-2));
@@ -86,12 +87,14 @@
     }
     .session .del:hover{ color:#ff6363; }
 
+    /* Main */
     .main{
       flex:1;
       display:flex;
       flex-direction:column;
       min-height:0;
     }
+
     .messages{
       flex:1;
       overflow:auto;
@@ -106,8 +109,10 @@
       padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
       font-size:1rem; line-height:1.55;
       border:1px solid rgba(255,255,255,0.06);
-      word-break:break-word;
-      white-space:pre-wrap; /* <- default: respeitar \n */
+
+      /* CRÍTICO: mostrar exactamente o texto que vem do backend */
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .msg.user{ justify-content:flex-start; }
     .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
@@ -126,16 +131,7 @@
     }
     .copy-btn:hover{ color:var(--accent); }
 
-    .bubble b{ font-weight:700; }
-    .bubble u{ text-underline-offset: 3px; }
-
-    .bubble a{
-      color: var(--accent);
-      text-decoration: underline;
-      text-underline-offset: 3px;
-      cursor: pointer;
-    }
-
+    /* Input */
     .input-bar{
       position:sticky; bottom:0; z-index:5;
       padding:12px;
@@ -158,11 +154,15 @@
       display:flex; align-items:center; justify-content:center; cursor:pointer;
       padding:0 22px;
     }
+    .send-btn:hover{ filter:brightness(1.05); }
+    .send-btn:active{ transform:translateY(1px); }
 
+    /* Scrollbars discretos */
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
 
+    /* Responsivo */
     @media (max-width: 1024px){
       .sidebar{ width:280px; }
       .side-header img{ width:64px; height:64px; }
@@ -223,65 +223,12 @@
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
 
+/* ---------- Util ---------- */
 function saveSessions(){ localStorage.setItem("alma_sessions", JSON.stringify(sessions)); }
 function byId(id){ return document.getElementById(id); }
 function snippetFrom(text, n=48){
   const s=(text||"").replace(/\s+/g," ").trim();
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
-}
-
-/* ---------- Render seguro (conservador) ---------- */
-function escapeHtml(s){
-  return (s||"")
-    .replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;")
-    .replace(/'/g,"&#39;");
-}
-
-function trimUrl(u){
-  return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
-}
-
-/**
- * Render da Alma:
- * - NÃO tenta markdown completo
- * - NÃO mexe em URLs (zero "correções")
- * - Só:
- *   1) remove lixo "[ver produto](" e "— ver produto" quando aparece colado
- *   2) converte **bold** e __underline__
- *   3) linkify apenas URLs soltas http(s)://...
- */
-function renderAlma(raw){
-  let t = (raw || "").replace(/\r\n/g,"\n");
-
-  // 1) limpar lixo típico vindo do backend (sem inventar)
-  // remove "[ver produto](" ou "ver produto](" perdido
-  t = t.replace(/\[\s*ver\s+produto\s*\]\s*\(/gi, "");
-  t = t.replace(/\bver\s+produto\s*\]\s*\(/gi, "");
-  // remove "— ver produto" / "– ver produto" isolado
-  t = t.replace(/(^|\n)\s*[—–-]\s*ver\s+produto\s*($|\n)/gi, "$1");
-
-  // 2) melhorar leitura mínima: garantir linha vazia antes de "Links dos produtos:"
-  t = t.replace(/\s*(\n?Links dos produtos\s*:)/gi, "\n\n$1");
-
-  // 3) escape
-  let html = escapeHtml(t);
-
-  // 4) markdown inline simples
-  html = html
-    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-    .replace(/__(.+?)__/g, "<u>$1</u>");
-
-  // 5) linkify só URLs soltas (não faz [texto](url), não faz (url))
-  html = html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, rawUrl){
-    const url = trimUrl(rawUrl);
-    const tail = rawUrl.slice(url.length);
-    return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
-  });
-
-  return html; // mantém \n; bubble está em pre-wrap
 }
 
 /* ---------- Sessões ---------- */
@@ -318,6 +265,7 @@ function renderSessions(){
   sessions.forEach(s=>{
     const match = !q || (s.title||"").toLowerCase().includes(q);
     if(!match) return;
+
     const div = document.createElement("div");
     div.className = "session"+(s.id===activeId?" active":"");
     div.onclick = ()=>{ activeId=s.id; renderSessions(); renderMsgs(); };
@@ -350,7 +298,7 @@ function renderSessions(){
   });
 }
 
-/* ---------- Mensagens ---------- */
+/* ---------- Mensagens (RAW: sem markdown, sem linkify, sem replace) ---------- */
 function renderMsgs(){
   const s = sessions.find(x=>x.id===activeId);
   const box = byId("messages");
@@ -364,17 +312,15 @@ function renderMsgs(){
     const bubble=document.createElement("div");
     bubble.className="bubble";
 
-    if(m.role === "alma"){
-      // render conservador e estável
-      bubble.innerHTML = renderAlma(m.content||"");
+    // CRÍTICO: texto puro
+    bubble.textContent = (m.content||"");
+
+    if(m.role==="alma"){
       const copy=document.createElement("span");
       copy.className="copy-btn";
       copy.textContent="copiar";
       copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
-      bubble.appendChild(copy);
-    }else{
-      // user: sem render HTML (só texto)
-      bubble.textContent = m.content || "";
+      row.appendChild(copy);
     }
 
     row.appendChild(bubble);
@@ -401,6 +347,7 @@ async function sendMsg(){
 
   s.msgs.push({role:"user", content:txt});
   if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
+
   saveSessions();
   renderSessions();
   renderMsgs();
@@ -411,11 +358,14 @@ async function sendMsg(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
+
+    // se o backend devolver algo não-JSON, isto vai rebentar e cai no catch
     const j = await res.json();
-    const ans = j.answer || JSON.stringify(j);
-    s.msgs.push({role:"alma", content: ans});
+    const ans = (j && (j.answer ?? j.response)) ?? JSON.stringify(j);
+
+    s.msgs.push({role:"alma", content: String(ans)});
   }catch(err){
-    s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
+    s.msgs.push({role:"alma", content: "ERRO no frontend (raw): "+ String(err)});
   }finally{
     saveSessions();
     renderMsgs();
