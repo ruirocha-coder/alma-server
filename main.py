@@ -6970,90 +6970,87 @@ _hf_wrap_all_ask_routes_budget_formatting()
 # =============================================================================
 # FIM HOTFIX
 # =============================================================================
-
 # ============================================================
-# HOTFIX ÚNICO — remover “tabelas ASCII” e traços do output
-# Colar NO FIM do main.py (depois de app = FastAPI(...) e rotas)
-# Não mexe no teu /ask original.
+# HOTFIX ÚNICO — limpar “tabelas ASCII”/traços no output do /ask
+# Colar NO FIM do main.py
 # ============================================================
 
 import re
-from fastapi.responses import JSONResponse
-from fastapi.routing import APIRoute
+import json
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 def _clean_ascii_tables(text: str) -> str:
     if not text:
         return text
 
-    # normalizar newlines
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    out_lines = []
+    out = []
     for raw in text.split("\n"):
-        line = raw.rstrip()
-        s = line.strip()
+        s = raw.rstrip()
+        st = s.strip()
 
-        # 1) remover linhas só de separadores (----, |----|, etc.)
-        if re.fullmatch(r"[-|–—\s]{4,}", s or ""):
+        # linhas só de separadores (-----, |---|, etc.)
+        if re.fullmatch(r"[-|–—\s]{4,}", st or ""):
             continue
 
-        # 2) remover cabeçalhos típicos de tabelas ASCII
-        low = s.lower()
-        if ("|" in s) and any(k in low for k in ("item", "preço", "quantidade", "subtotal", "sku")):
-            # não remover se for link markdown
-            if not re.search(r"\[[^\]]+\]\(https?://", s):
+        # cabeçalhos de tabela ASCII (com pipes) — remove
+        low = st.lower()
+        if ("|" in st) and any(k in low for k in ("item", "preço", "quantidade", "subtotal", "sku")):
+            # não remover se for markdown link
+            if not re.search(r"\[[^\]]+\]\(https?://", st):
                 continue
 
-        # 3) linhas com múltiplas colunas ASCII
-        if s.count("|") >= 2:
-            s = s.replace("|", " — ")
-            s = re.sub(r"\s{2,}", " ", s).strip()
+        # linhas “colunares” com muitos pipes -> troca por separador legível
+        if st.count("|") >= 2:
+            st = st.replace("|", " — ")
+            st = re.sub(r"\s{2,}", " ", st).strip()
 
-        out_lines.append(s if s else "")
+        out.append(st if st else "")
 
-    cleaned = "\n".join(out_lines)
-
-    # 4) reduzir linhas vazias excessivas
+    cleaned = "\n".join(out)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
     return cleaned
 
 
-def _wrap_ask_endpoint(app):
-    """
-    Envolve a rota /ask e limpa apenas o campo 'answer'
-    sem tocar no código original do endpoint.
-    """
-    target = None
-    for route in app.routes:
-        if isinstance(route, APIRoute) and route.path == "/ask":
-            target = route
-            break
+class _AskAnswerCleanerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
 
-    if not target:
-        return
+        # Só atuar no /ask
+        if request.url.path != "/ask":
+            return response
 
-    original = target.endpoint
+        # Só atuar em respostas JSON
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            return response
 
-    async def wrapped(request):
-        result = await original(request)
+        # Ler corpo (stream) e reconstruir JSON
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
 
-        if isinstance(result, dict) and "answer" in result:
-            result["answer"] = _clean_ascii_tables(result.get("answer") or "")
-            return JSONResponse(result)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            # se não for JSON válido, devolve como veio
+            return JSONResponse(content={"answer": body.decode("utf-8", errors="ignore")}, status_code=response.status_code)
 
-        return result
+        # Limpar só o campo answer
+        if isinstance(payload, dict) and "answer" in payload and isinstance(payload["answer"], str):
+            payload["answer"] = _clean_ascii_tables(payload["answer"])
 
-    target.endpoint = wrapped
+        # Preservar status_code
+        return JSONResponse(content=payload, status_code=response.status_code)
 
 
-# executar hotfix ao arrancar
+# Registar middleware (no fim, para não mexer no /ask)
 try:
-    _wrap_ask_endpoint(app)
+    app.add_middleware(_AskAnswerCleanerMiddleware)
 except Exception:
     pass
-
-
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
