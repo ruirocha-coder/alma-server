@@ -6971,104 +6971,87 @@ _hf_wrap_all_ask_routes_budget_formatting()
 # FIM HOTFIX
 # =============================================================================
 
-# =============================================================================
-# HOTFIX FINAL — Limpeza de tabelas Markdown no output do /ask
-# - Remove pipes |, traços ---- e tabelas feias
-# - Não altera lógica, apenas apresentação
-# - Não toca no RAG nem no LLM
-# - Seguro para Railway
-# =============================================================================
+# ============================================================
+# HOTFIX ÚNICO — remover “tabelas ASCII” e traços do output
+# Colar NO FIM do main.py (depois de app = FastAPI(...) e rotas)
+# Não mexe no teu /ask original.
+# ============================================================
 
 import re
-from typing import Any
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
-
-def _alma_sanitize_orcamento_text(text: str) -> str:
+def _clean_ascii_tables(text: str) -> str:
     if not text:
         return text
 
-    t = text
+    # normalizar newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # remove linhas tipo tabela markdown
-    t = re.sub(r"^\s*\|.*\|\s*$", "", t, flags=re.M)
+    out_lines = []
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        s = line.strip()
 
-    # remove separadores tipo ----|----
-    t = re.sub(r"^\s*[-]{3,}\s*$", "", t, flags=re.M)
+        # 1) remover linhas só de separadores (----, |----|, etc.)
+        if re.fullmatch(r"[-|–—\s]{4,}", s or ""):
+            continue
 
-    # remove pipes soltos
-    t = t.replace("|", " ")
-
-    # normaliza espaços
-    t = re.sub(r"[ \t]{2,}", " ", t)
-
-    # normaliza linhas vazias
-    t = re.sub(r"\n{3,}", "\n\n", t)
-
-    return t.strip()
-
-
-def _hotfix_wrap_ask_remove_tables():
-    try:
-        wrapped = 0
-
-        for r in getattr(app, "routes", []):
-            if getattr(r, "path", None) != "/ask":
+        # 2) remover cabeçalhos típicos de tabelas ASCII
+        low = s.lower()
+        if ("|" in s) and any(k in low for k in ("item", "preço", "quantidade", "subtotal", "sku")):
+            # não remover se for link markdown
+            if not re.search(r"\[[^\]]+\]\(https?://", s):
                 continue
 
-            methods = getattr(r, "methods", set()) or set()
-            if "POST" not in methods:
-                continue
+        # 3) linhas com múltiplas colunas ASCII
+        if s.count("|") >= 2:
+            s = s.replace("|", " — ")
+            s = re.sub(r"\s{2,}", " ", s).strip()
 
-            ep = getattr(r, "endpoint", None)
-            if not callable(ep):
-                continue
+        out_lines.append(s if s else "")
 
-            if getattr(ep, "_alma_table_clean_wrapped", False):
-                continue
+    cleaned = "\n".join(out_lines)
 
-            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
-                resp = await __ep(*args, **kwargs)
+    # 4) reduzir linhas vazias excessivas
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
-                try:
-                    if not isinstance(resp, dict):
-                        return resp
-
-                    answer = resp.get("answer") or resp.get("response")
-                    if not answer:
-                        return resp
-
-                    clean = _alma_sanitize_orcamento_text(answer)
-
-                    if "answer" in resp:
-                        resp["answer"] = clean
-                    else:
-                        resp["response"] = clean
-
-                    return resp
-
-                except Exception:
-                    return resp
-
-            _wrapped._alma_table_clean_wrapped = True
-            r.endpoint = _wrapped
-            wrapped += 1
-
-        try:
-            log.info(f"[hotfix] limpeza de tabelas aplicada em {wrapped} rota(s) /ask")
-        except Exception:
-            pass
-
-    except Exception as e:
-        try:
-            log.warning(f"[hotfix] falha limpeza tabelas: {e}")
-        except Exception:
-            pass
+    return cleaned
 
 
-_hotfix_wrap_ask_remove_tables()
-# =============================================================================
-# FIM HOTFIX
-# =============================================================================
+def _wrap_ask_endpoint(app):
+    """
+    Envolve a rota /ask e limpa apenas o campo 'answer'
+    sem tocar no código original do endpoint.
+    """
+    target = None
+    for route in app.routes:
+        if isinstance(route, APIRoute) and route.path == "/ask":
+            target = route
+            break
+
+    if not target:
+        return
+
+    original = target.endpoint
+
+    async def wrapped(request):
+        result = await original(request)
+
+        if isinstance(result, dict) and "answer" in result:
+            result["answer"] = _clean_ascii_tables(result.get("answer") or "")
+            return JSONResponse(result)
+
+        return result
+
+    target.endpoint = wrapped
+
+
+# executar hotfix ao arrancar
+try:
+    _wrap_ask_endpoint(app)
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------------------
