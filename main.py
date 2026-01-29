@@ -6591,6 +6591,102 @@ except Exception:
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — Orçamento: follow-ups (junta/acrescenta/soma...) também ativam fallback semântico
+# - Se houver quote aberto em quotes.db e o user usar verbos de adicionar/editar,
+#   tratamos como intenção de orçamento mesmo sem dizer "orçamento".
+# - NÃO mexe nos links nem no comportamento base; só melhora o gatilho.
+# =============================================================================
+
+import re
+from typing import Optional
+
+def _hf_is_quote_followup_intent(text: str) -> bool:
+    """
+    Deteta linguagem de continuação de orçamento, sem dizer 'orçamento'.
+    Exemplos:
+      'acrescenta um orikomi'
+      'junta mais 2 cadeiras'
+      'soma isto ao orçamento'
+      'inclui também o dublexo'
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # verbos/expressões mais comuns em PT-PT (mantém curto e eficaz)
+    return bool(re.search(
+        r"\b(junta|acrescenta|adiciona|soma|inclui|mete|põe|poe|coloca|adita)\b"
+        r"|\b(mais\s+\d+|mais\s+um|mais\s+uma|tamb[eé]m|e\s+ainda|al[eé]m\s+disso)\b",
+        t,
+        flags=re.I
+    ))
+
+def _hf_has_open_quote(user_id: str, namespace: str) -> bool:
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        uid = (user_id or "anon").strip() or "anon"
+        qid = _quote_has_open(uid, ns) or None
+        if not qid:
+            # alguns setups usam só _quote_get_open (que cria); aqui NÃO queremos criar.
+            # portanto só consideramos aberto se _quote_has_open existir e devolver.
+            return False
+        return True
+    except Exception:
+        return False
+
+# --- patch do build_messages atual (encapsula sem destruir o que já tens) ---
+try:
+    _hf_prev_build_messages__followup = build_messages
+except Exception:
+    _hf_prev_build_messages__followup = None
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    if not _hf_prev_build_messages__followup:
+        raise RuntimeError("build_messages original não encontrado (followup hotfix).")
+
+    messages, new_facts, rag_used, rag_hits = _hf_prev_build_messages__followup(user_id, question, namespace)
+
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        q  = (question or "").strip()
+        uid = (user_id or "anon").strip() or "anon"
+
+        # gatilho “clássico” ou “follow-up com quote aberto”
+        semantic_trigger = _hf_budget_intent(q) or (_hf_has_open_quote(uid, ns) and _hf_is_quote_followup_intent(q))
+        if not semantic_trigger:
+            return messages, new_facts, rag_used, rag_hits
+
+        # se já tem SKU explícito, não forçar variantes
+        if _hf_has_explicit_sku(q):
+            return messages, new_facts, rag_used, rag_hits
+
+        vb = _hf_variants_block(ns, q)
+        if not vb:
+            return messages, new_facts, rag_used, rag_hits
+
+        insert_at = max(0, len(messages) - 1)
+        messages.insert(insert_at, {"role": "system", "content": vb})
+        messages.insert(insert_at + 1, {"role": "system", "content": (
+            "REGRA (ORÇAMENTO): Se o utilizador não deu SKU, NÃO fixes itens. "
+            "Lista TODAS as variantes disponíveis (do bloco acima) e pede confirmação de SKUs e quantidades."
+        )})
+
+    except Exception:
+        pass
+
+    return messages, new_facts, rag_used, rag_hits
+
+try:
+    log.info("[hotfix-semantic-budget-followup] ativo: follow-ups (junta/acrescenta/soma...) com quote aberto ativam fallback semântico.")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
