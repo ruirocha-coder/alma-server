@@ -25,7 +25,7 @@
       display:flex; overflow:hidden;
     }
 
-    /* Sidebar / Topbar */
+    /* Sidebar */
     .sidebar{
       width:310px; min-width:260px; max-width:360px;
       background:linear-gradient(180deg,var(--panel),var(--panel-2));
@@ -92,7 +92,7 @@
       flex:1;
       display:flex;
       flex-direction:column;
-      min-height:0; /* importante para flex + overflow */
+      min-height:0;
     }
 
     .messages{
@@ -101,25 +101,33 @@
       padding:18px 20px 24px;
       background: radial-gradient(1200px 600px at 80% -10%, rgba(212,160,23,.05), transparent 60%);
       scroll-behavior:smooth;
-      min-height:0; /* permite overflow correto */
+      min-height:0;
       padding-bottom: 110px; /* espaço para não ficar atrás do composer */
     }
 
     .msg{ position:relative; max-width:980px; margin:0 auto 12px auto; display:flex; }
     .msg .bubble{
-      padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
-      font-size:1rem; line-height:1.55; white-space:pre-wrap; word-break:break-word;
+      padding:12px 16px;
+      border-radius:14px;
+      box-shadow: var(--shadow);
+      font-size:1rem;
+      line-height:1.55;
       border:1px solid rgba(255,255,255,0.06);
+
+      /* IMPORTANT: o texto é HTML nosso (escapado), com <br> */
+      white-space: normal;
+      word-break: break-word;
     }
+
     .msg.user{ justify-content:flex-start; }
     .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
 
     .msg.alma{ justify-content:flex-end; }
     .msg.alma .bubble{
       background:var(--bubble-alma);
-      margin-left:auto;           /* encosta à direita */
+      margin-left:auto;
       max-width:min(90%, 720px);
-      text-align:left;            /* texto normal, balão à direita */
+      text-align:left;
     }
 
     .copy-btn{
@@ -128,10 +136,27 @@
     }
     .copy-btn:hover{ color:var(--accent); }
 
+    /* Links */
+    .bubble a{
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      cursor: pointer;
+    }
+
+    /* “Markdown” inline */
     .bubble b{ font-weight:700; }
     .bubble u{ text-underline-offset: 3px; }
 
-    /* Input (composer flutuante) */
+    /* Headings */
+    .alma-h{
+      font-weight:800;
+      margin:10px 0 6px;
+      font-size:1.05rem;
+      line-height:1.25;
+    }
+
+    /* Input */
     .input-bar{
       position:sticky; bottom:0; z-index:5;
       padding:12px;
@@ -149,7 +174,7 @@
       padding:14px 14px; font-size:1rem; border:none; outline:none;
     }
     .send-btn{
-      min-width:64px; /* altura visual compatível com a barra */
+      min-width:64px;
       background:var(--accent); color:#000; border:none; font-size:1.2rem;
       display:flex; align-items:center; justify-content:center; cursor:pointer;
       padding:0 22px;
@@ -157,18 +182,18 @@
     .send-btn:hover{ filter:brightness(1.05); }
     .send-btn:active{ transform:translateY(1px); }
 
-    /* Scrollbars discretos */
+    /* Scrollbars */
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
 
-    /* --- Responsivo (mobile / iPad) --- */
+    /* Responsivo */
     @media (max-width: 1024px){
       .sidebar{ width:280px; }
       .side-header img{ width:64px; height:64px; }
       .messages{ padding:14px 14px 20px; padding-bottom:120px; }
     }
-    @media (max-width: 820px){ /* iPad portrait / tablets pequenos */
+    @media (max-width: 820px){
       body{ flex-direction:column; }
       .sidebar{
         width:100%; max-width:none; border-right:none; border-bottom:1px solid var(--border);
@@ -178,7 +203,7 @@
       .input-bar{ padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
       .input-wrap{ margin:0 6px; }
     }
-    @media (max-width: 480px){ /* telemóvel */
+    @media (max-width: 480px){
       .side-header img{ width:54px; height:54px; }
       .session-search{ padding:8px; }
       .side-actions{ padding:8px; }
@@ -190,7 +215,7 @@
   </style>
 </head>
 <body>
-  <!-- Sidebar / Topbar -->
+
   <aside class="sidebar">
     <div class="side-header">
       <img src="/static/alma.png" alt="Alma">
@@ -208,7 +233,6 @@
     <div id="sessions" class="sessions"></div>
   </aside>
 
-  <!-- Main -->
   <main class="main">
     <div id="messages" class="messages"></div>
 
@@ -221,11 +245,12 @@
   </main>
 
 <script>
-/* ---------- Estado local ---------- */
+/* ================================
+   Estado local
+================================ */
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
 
-/* ---------- Util ---------- */
 function saveSessions(){ localStorage.setItem("alma_sessions", JSON.stringify(sessions)); }
 function byId(id){ return document.getElementById(id); }
 function snippetFrom(text, n=48){
@@ -233,7 +258,66 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* ---------- Sessões ---------- */
+/* ================================
+   Render seguro + “markdown” leve
+================================ */
+function escapeHtml(s){
+  return (s||"")
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#39;");
+}
+
+function trimUrl(u){
+  return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
+}
+
+function renderRichText(raw){
+  // 1) normalizar newlines
+  let t = (raw || "").replace(/\r\n/g,"\n");
+
+  // 2) escapar tudo (seguro)
+  t = escapeHtml(t);
+
+  // 3) headings (# Título) -> bloco destacado
+  t = t.replace(/^\s*#{1,6}\s+(.+)$/gm, '<div class="alma-h">$1</div>');
+
+  // 4) markdown inline simples
+  t = t
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/__(.+?)__/g, "<u>$1</u>");
+
+  // 5) linkify: [texto](url), (url), url solta
+  // [texto](url)
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, txt, url){
+    url = trimUrl(url);
+    return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(txt)+'</a>';
+  });
+
+  // (url)
+  t = t.replace(/\((https?:\/\/[^\s)]+)\)/g, function(_, url){
+    url = trimUrl(url);
+    return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
+  });
+
+  // url solta (evitar apanhar já dentro de href="...")
+  t = t.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, rawUrl){
+    const url = trimUrl(rawUrl);
+    const tail = rawUrl.slice(url.length);
+    return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
+  });
+
+  // 6) quebras de linha
+  t = t.replace(/\n/g, "<br>");
+
+  return t;
+}
+
+/* ================================
+   Sessões
+================================ */
 function newSession(){
   const id = "s"+Date.now();
   const sess = { id, title:"Nova sessão", msgs:[], createdAt: Date.now() };
@@ -264,9 +348,11 @@ function clearLocal(){
 function renderSessions(){
   const box = byId("sessions"); box.innerHTML="";
   const q = (byId("search").value||"").toLowerCase();
+
   sessions.forEach(s=>{
     const match = !q || (s.title||"").toLowerCase().includes(q);
     if(!match) return;
+
     const div = document.createElement("div");
     div.className = "session"+(s.id===activeId?" active":"");
     div.onclick = ()=>{ activeId=s.id; renderSessions(); renderMsgs(); };
@@ -299,7 +385,14 @@ function renderSessions(){
   });
 }
 
-/* ---------- Mensagens ---------- */
+/* ================================
+   Mensagens
+================================ */
+function updateSessionTitleFromFirstUserMsg(sess){
+  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
+  if(firstUser) sess.title = snippetFrom(firstUser.content, 50);
+}
+
 function renderMsgs(){
   const s = sessions.find(x=>x.id===activeId);
   const box = byId("messages");
@@ -312,17 +405,17 @@ function renderMsgs(){
 
     const bubble=document.createElement("div");
     bubble.className="bubble";
-    bubble.innerHTML = (m.content||"")
-      .replace(/\*\*(.*?)\*\*/g,"<b>$1</b>")
-      .replace(/__(.*?)__/g,"<u>$1</u>")
-      .replace(/^\s*#{1,6}\s+(.+)$/gm, "<b>$1</b>");  /* <--- ÚNICA LINHA NOVA */
+
+    // Render seguro e consistente
+    bubble.innerHTML = renderRichText(m.content||"");
 
     if(m.role==="alma"){
       const copy=document.createElement("span");
       copy.className="copy-btn";
       copy.textContent="copiar";
-      copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
-      bubble.appendChild(copy);
+      const raw = (m.content||"");
+      copy.onclick=()=>navigator.clipboard.writeText(raw);
+      row.appendChild(copy);
     }
 
     row.appendChild(bubble);
@@ -332,14 +425,9 @@ function renderMsgs(){
   box.scrollTop = box.scrollHeight;
 }
 
-function updateSessionTitleFromFirstUserMsg(sess){
-  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
-  if(firstUser){
-    sess.title = snippetFrom(firstUser.content, 50);
-  }
-}
-
-/* ---------- Enviar ---------- */
+/* ================================
+   Enviar
+================================ */
 async function sendMsg(){
   const inp = byId("prompt");
   const txt = (inp.value||"").trim();
@@ -349,22 +437,21 @@ async function sendMsg(){
   let s = sessions.find(x=>x.id===activeId);
   if(!s){ newSession(); s = sessions.find(x=>x.id===activeId); }
 
-  // push user msg
   s.msgs.push({role:"user", content:txt});
   if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
   saveSessions();
   renderSessions();
   renderMsgs();
 
-  // chamada ao servidor
   try{
     const res = await fetch("/ask", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
+
     const j = await res.json();
-    const ans = j.answer || JSON.stringify(j);
+    const ans = (j && typeof j === "object" && j.answer) ? j.answer : JSON.stringify(j);
     s.msgs.push({role:"alma", content: ans});
   }catch(err){
     s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
@@ -374,845 +461,12 @@ async function sendMsg(){
   }
 }
 
-/* ---------- Evitar “saltos” no foco do input ---------- */
-document.getElementById('prompt').addEventListener('focus', () => {
-  /* não forçar scroll; deixar o browser gerir */
-}, { passive: true });
-
-/* ---------- Boot ---------- */
-if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
+/* ================================
+   Boot
+================================ */
+if(!activeId){ newSession(); }
+else { renderSessions(); renderMsgs(); }
 </script>
 
-
-<style>
-  /* Links clicáveis e consistentes */
-  .bubble a{
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-    cursor: pointer;
-  }
-</style>
-
-<script>
-(function () {
-  if (window.__alma_linkify_v3) return;
-  window.__alma_linkify_v3 = true;
-
-  function trimUrl(u){
-    // remove pontuação final que o Safari “agarra” (inclui ')')
-    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
-  }
-
-  function linkifyTextNode(textNode){
-    const text = textNode.nodeValue || "";
-    if (!/https?:\/\/|\]\(https?:\/\/|\(https?:\/\//.test(text)) return;
-
-    const frag = document.createDocumentFragment();
-    const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<]+)/g;
-
-    let last = 0, m;
-    while ((m = re.exec(text)) !== null) {
-      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-
-      // [texto](url)
-      if (m[1] && m[2]) {
-        const a = document.createElement("a");
-        a.href = trimUrl(m[2]);
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.textContent = m[1];
-        frag.appendChild(a);
-        last = re.lastIndex;
-        continue;
-      }
-
-      // (url) -> sem parêntesis
-      if (m[3]) {
-        const url = trimUrl(m[3]);
-        const a = document.createElement("a");
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.textContent = url;
-        frag.appendChild(a);
-        last = re.lastIndex;
-        continue;
-      }
-
-      // url solta (pode vir com "…/)" no fim)
-      if (m[4]) {
-        const raw = m[4];
-        const url = trimUrl(raw);
-        const tail = raw.slice(url.length); // devolve o que foi cortado (ex.: ')')
-        const a = document.createElement("a");
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.textContent = url;
-        frag.appendChild(a);
-        if (tail) frag.appendChild(document.createTextNode(tail));
-        last = re.lastIndex;
-        continue;
-      }
-
-      last = re.lastIndex;
-    }
-
-    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-    textNode.parentNode.replaceChild(frag, textNode);
-  }
-
-  function walkAndLinkify(root){
-    if (!root) return;
-
-    const skip = new Set(["A","CODE","PRE","SCRIPT","STYLE","TEXTAREA","INPUT","BUTTON"]);
-    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node){
-        const p = node.parentNode;
-        if (!p) return NodeFilter.FILTER_REJECT;
-        if (skip.has(p.nodeName)) return NodeFilter.FILTER_REJECT;
-        if (p.classList && p.classList.contains("copy-btn")) return NodeFilter.FILTER_REJECT;
-        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
-    const nodes = [];
-    while (w.nextNode()) nodes.push(w.currentNode);
-    nodes.forEach(n => { try { linkifyTextNode(n); } catch(e) {} });
-  }
-
-  function run(){
-    document.querySelectorAll(".msg .bubble").forEach(b => walkAndLinkify(b));
-  }
-
-  // aplica já ao histórico existente
-  run();
-
-  // aplica a novas mensagens
-  const messages = document.getElementById("messages");
-  if (!messages) return;
-
-  const obs = new MutationObserver(muts => {
-    for (const mut of muts) {
-      for (const n of mut.addedNodes) {
-        if (!(n instanceof HTMLElement)) continue;
-        if (n.classList && n.classList.contains("msg")) {
-          const b = n.querySelector(".bubble");
-          if (b) walkAndLinkify(b);
-        } else {
-          walkAndLinkify(n);
-        }
-      }
-    }
-  });
-
-  obs.observe(messages, { childList: true, subtree: true });
-})();
-</script>
-
-<style id="alma-markdown-css">
-/* --- Hotfix Markdown (tabelas, código, listas) --- */
-.msg .bubble{
-  white-space: normal !important;   /* crucial: permitir HTML/Markdown renderizado */
-}
-
-/* Links (mantém o teu accent) */
-.msg .bubble a{
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-/* Tabelas bonitas */
-.msg .bubble table{
-  width:100%;
-  border-collapse: collapse;
-  margin: 10px 0;
-  font-size: .95rem;
-}
-.msg .bubble th, .msg .bubble td{
-  border: 1px solid rgba(255,255,255,0.10);
-  padding: 8px 10px;
-  vertical-align: top;
-}
-.msg .bubble th{
-  color: var(--fg);
-  background: rgba(255,255,255,0.04);
-  font-weight: 700;
-}
-.msg .bubble tr:nth-child(even) td{
-  background: rgba(255,255,255,0.02);
-}
-
-/* Blocos de código */
-.msg .bubble pre,
-.msg .bubble code{
-  background: rgba(0,0,0,0.25);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-}
-.msg .bubble pre{
-  padding: 10px 12px;
-  overflow:auto;
-}
-.msg .bubble code{
-  padding: 2px 6px;
-}
-
-/* Listas mais legíveis */
-.msg .bubble ul,
-.msg .bubble ol{
-  margin: 8px 0 8px 22px;
-}
-.msg .bubble li{
-  margin: 4px 0;
-}
-
-/* Headers Markdown (se o modelo usar #) */
-.msg .bubble h1, .msg .bubble h2, .msg .bubble h3,
-.msg .bubble h4, .msg .bubble h5, .msg .bubble h6{
-  margin: 10px 0 6px;
-  font-size: 1.05rem;
-}
-
-/* Separadores */
-.msg .bubble hr{
-  border: none;
-  border-top: 1px solid rgba(255,255,255,0.10);
-  margin: 12px 0;
-}
-</style>
-<style id="alma-quote-ui-hotfix">
-/* ===== Orçamentos: tabela bonita + layout ===== */
-
-/* Mantém o comportamento geral */
-.msg .bubble{ white-space: pre-wrap; }
-
-/* Para mensagens Alma: vamos renderizar HTML (com <br> e <table>) */
-.msg.alma .bubble{
-  white-space: normal;           /* permite HTML renderizado */
-}
-
-/* Wrapper de orçamento */
-.msg.alma .bubble .quote-block{
-  margin: 10px 0 6px;
-  padding: 12px 12px;
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 12px;
-  background: rgba(0,0,0,0.18);
-}
-
-/* Título do orçamento */
-.msg.alma .bubble .quote-title{
-  font-weight: 800;
-  margin: 0 0 10px 0;
-  line-height: 1.25;
-}
-
-/* Tabela */
-.msg.alma .bubble table.quote-table{
-  width: 100%;
-  border-collapse: collapse;
-  margin: 8px 0 10px 0;
-  font-size: .95rem;
-}
-
-.msg.alma .bubble table.quote-table th,
-.msg.alma .bubble table.quote-table td{
-  border: 1px solid rgba(255,255,255,0.10);
-  padding: 8px 10px;
-  vertical-align: top;
-}
-
-.msg.alma .bubble table.quote-table th{
-  background: rgba(255,255,255,0.05);
-  font-weight: 800;
-}
-
-.msg.alma .bubble table.quote-table tr:nth-child(even) td{
-  background: rgba(255,255,255,0.025);
-}
-
-/* Totais / notas */
-.msg.alma .bubble .quote-total{
-  font-weight: 800;
-  margin-top: 8px;
-}
-.msg.alma .bubble .quote-note{
-  color: rgba(243,243,243,0.85);
-  font-style: italic;
-  margin-top: 4px;
-}
-
-/* Links */
-.msg .bubble a{
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  cursor: pointer;
-}
-</style>
-
-<script>
-  <!-- =========================================================
-     ALMA HOTFIX v1 (TUDO-EM-UM)
-     Objetivo:
-     - Renderizar tabelas ASCII/pipe ("| a | b |") como <table> bonita
-     - Preservar quebras de linha (sem “compactar”)
-     - Remover o “ver produto” no cabeçalho (linhas isoladas no topo)
-     - Linkificar URLs e [texto](url) (sem depender do linkify antigo)
-     - Não usar CDNs, não usar libs externas
-     Como aplicar:
-     1) Cola ESTE BLOCO no FINAL do ficheiro (antes de </body>)
-     2) Se tiveres hotfixes antigos (marked/DOMPurify ou linkify_v3), podes deixá-los:
-        este hotfix desativa-os e impõe o renderer.
-     ========================================================= -->
-
-<style id="alma-hotfix-v1-css">
-  /* Garantir que o texto mantém quebras */
-  .msg .bubble{
-    white-space: pre-wrap !important;
-    word-break: break-word;
-  }
-
-  /* Parágrafos/headers gerados pelo renderer */
-  .alma-p{ margin: 6px 0; }
-  .alma-h{
-    font-weight: 800;
-    margin: 10px 0 6px;
-  }
-
-  /* Tabelas bonitas */
-  .alma-table-wrap{
-    overflow-x: auto;
-    margin: 10px 0;
-  }
-  .alma-table{
-    width: 100%;
-    border-collapse: collapse;
-    font-size: .95rem;
-  }
-  .alma-table th,
-  .alma-table td{
-    border: 1px solid rgba(255,255,255,0.12);
-    padding: 8px 10px;
-    vertical-align: top;
-  }
-  .alma-table th{
-    background: rgba(255,255,255,0.05);
-    font-weight: 800;
-  }
-  .alma-table tr:nth-child(even) td{
-    background: rgba(255,255,255,0.03);
-  }
-
-  /* Links coerentes */
-  .msg .bubble a{
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-    cursor: pointer;
-  }
-</style>
-
-<script id="alma-hotfix-v1-js">
-(function(){
-  if (window.__alma_hotfix_v1) return;
-  window.__alma_hotfix_v1 = true;
-
-  // Desativar hotfixes antigos que “estragam” (se existirem)
-  window.__alma_markdown_hotfix_v1 = true; // impede o teu marked/DOMPurify de correr
-  window.__alma_linkify_v3 = true;         // impede o linkify antigo de correr
-
-  /* ---------- Helpers ---------- */
-  function escapeHtml(s){
-    return (s||"")
-      .replace(/&/g,"&amp;")
-      .replace(/</g,"&lt;")
-      .replace(/>/g,"&gt;")
-      .replace(/"/g,"&quot;")
-      .replace(/'/g,"&#39;");
-  }
-
-  function trimUrl(u){
-    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
-  }
-
-  function linkifyHtml(html){
-    // Converte [texto](url), (url) e url solta em <a>
-    // Nota: assume que html já está escapado (ou é HTML nosso controlado)
-    // Vamos atuar só em texto (não dentro de tags) usando regex simples:
-    // Para robustez, fazemos isto ANTES de inserir <br>, e após escapes.
-
-    // 1) [texto](url)
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, txt, url){
-      url = trimUrl(url);
-      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(txt)+'</a>';
-    });
-
-    // 2) (url)
-    html = html.replace(/\((https?:\/\/[^\s)]+)\)/g, function(_, url){
-      url = trimUrl(url);
-      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
-    });
-
-    // 3) url solta (evitar apanhar já dentro de href="...")
-    html = html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, raw){
-      const url = trimUrl(raw);
-      const tail = raw.slice(url.length);
-      return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
-    });
-
-    return html;
-  }
-
-  // Deteta bloco tipo tabela pipe com linha separadora (|---|---|)
-  function isPipeTableBlock(lines){
-    if (lines.length < 2) return false;
-    const hasPipes = /\|/.test(lines[0]);
-
-    const sepLike = (lines[1]||"").replace(/\s/g,"");
-    const isSep = /^(\|?-{3,}\|)+-?\|?$/.test(sepLike) || /^-+\|?-+/.test(sepLike);
-
-    return hasPipes && isSep;
-  }
-
-  function splitTableRow(line){
-    let t = (line||"").trim();
-    if (t.startsWith("|")) t = t.slice(1);
-    if (t.endsWith("|")) t = t.slice(0,-1);
-    return t.split("|").map(c => c.trim());
-  }
-
-  function renderPipeTable(lines){
-    const headerCells = splitTableRow(lines[0]);
-    const bodyLines = lines.slice(2);
-
-    let html = '<div class="alma-table-wrap"><table class="alma-table">';
-    html += '<thead><tr>' + headerCells.map(c=>'<th>'+escapeHtml(c)+'</th>').join("") + '</tr></thead>';
-    html += '<tbody>';
-
-    for(const ln of bodyLines){
-      if(!ln || !ln.trim()) continue;
-      const cells = splitTableRow(ln);
-      while (cells.length < headerCells.length) cells.push("");
-      html += '<tr>' + cells.slice(0, headerCells.length).map(c=>'<td>'+escapeHtml(c)+'</td>').join("") + '</tr>';
-    }
-
-    html += '</tbody></table></div>';
-    return html;
-  }
-
-  // Remove o “ver produto” isolado no cabeçalho (link random)
-  // Heurística: se o conteúdo começa por "ver produto" / "- ver produto" numa linha sozinha -> remove essa linha
-  function stripHeaderVerProduto(text){
-    const t = (text||"").replace(/\r\n/g,"\n");
-    const lines = t.split("\n");
-    while(lines.length){
-      const first = (lines[0]||"").trim().toLowerCase();
-      if (first === "ver produto" || first === "- ver produto" || first === "— ver produto" || first === "– ver produto"){
-        lines.shift();
-        // também limpa uma linha vazia a seguir
-        if (lines[0] && !lines[0].trim()) lines.shift();
-        continue;
-      }
-      break;
-    }
-    return lines.join("\n");
-  }
-
-  function renderAlmaContent(raw){
-    // 1) limpar cabeçalho indevido
-    const cleaned = stripHeaderVerProduto(raw);
-
-    // 2) normalizar quebras
-    const text = (cleaned||"").replace(/\r\n/g,"\n");
-
-    // 3) blocos por parágrafos (linhas vazias)
-    const blocks = text.split(/\n{2,}/);
-
-    const out = [];
-    for(const block of blocks){
-      const lines = block.split("\n");
-
-      // tabela?
-      if (isPipeTableBlock(lines)){
-        out.push(renderPipeTable(lines));
-        continue;
-      }
-
-      // normal: escapar, markdown simples, linkify, headings, <br>
-      let html = escapeHtml(block);
-
-      // markdown simples
-      html = html
-        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-        .replace(/__(.+?)__/g, "<u>$1</u>");
-
-      // headings (# Título)
-      html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<div class=\"alma-h\">$1</div>");
-
-      // linkify
-      html = linkifyHtml(html);
-
-      // quebras
-      html = html.replace(/\n/g, "<br>");
-
-      out.push('<div class="alma-p">'+html+'</div>');
-    }
-
-    return out.join("");
-  }
-
-  /* ---------- Patch ao renderMsgs existente ---------- */
-  function patchRenderMsgs(){
-    if (typeof window.renderMsgs !== "function") return false;
-    if (window.__alma_renderMsgs_patched) return true;
-    window.__alma_renderMsgs_patched = true;
-
-    const original = window.renderMsgs;
-
-    window.renderMsgs = function(){
-      // corre o original para construir DOM e manter lógica da app
-      original();
-
-      // depois re-renderiza só os bubbles da Alma (sem mexer no user)
-      document.querySelectorAll(".msg.alma .bubble").forEach(bubble=>{
-        // já processado?
-        if (bubble.dataset && bubble.dataset.almaRendered === "1") return;
-
-        // obter raw do modelo a partir do texto (antes estava em innerHTML por replace)
-        // Melhor: usar o texto visível e reconstituir com \n (pre-wrap)
-        const raw = (bubble.innerText || "").replace(/\u00a0/g," ").trimEnd();
-
-        // remover copy-btn se tiver sido inserido no original
-        const copyBtn = bubble.querySelector(".copy-btn");
-        if (copyBtn) copyBtn.remove();
-
-        // renderizar bonito
-        bubble.innerHTML = renderAlmaContent(raw);
-
-        // repor copy
-        const copy = document.createElement("span");
-        copy.className = "copy-btn";
-        copy.textContent = "copiar";
-        copy.onclick = ()=>navigator.clipboard.writeText(raw);
-        bubble.appendChild(copy);
-
-        bubble.dataset.almaRendered = "1";
-      });
-    };
-
-    return true;
-  }
-
-  /* ---------- Observa novas mensagens e reaplica ---------- */
-  function observeNewMessages(){
-    const messages = document.getElementById("messages");
-    if (!messages) return;
-
-    const obs = new MutationObserver(()=>{
-      // Sempre que algo muda, garante patch e re-render
-      patchRenderMsgs();
-      if (typeof window.renderMsgs === "function") window.renderMsgs();
-    });
-
-    obs.observe(messages, { childList:true, subtree:true });
-  }
-
-  // Boot
-  patchRenderMsgs();
-  observeNewMessages();
-
-  // aplica já (histórico existente)
-  try{ if (typeof window.renderMsgs === "function") window.renderMsgs(); }catch(e){}
-})();
-</script>
-
-  <style id="alma-quote-clean-v1-css">
-  /* Garantir que o texto mantém parágrafos e quebras */
-  .msg .bubble{
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  /* Estilo para blocos “quase-título” dentro do orçamento */
-  .alma-quote-title{
-    font-weight: 800;
-    font-size: 1.05rem;
-    margin: 0 0 8px 0;
-  }
-
-  .alma-quote-section{
-    margin: 10px 0 0 0;
-    padding-top: 8px;
-    border-top: 1px solid rgba(255,255,255,0.10);
-  }
-
-  .alma-quote-kv{
-    margin: 4px 0;
-    color: var(--fg);
-  }
-
-  .alma-quote-kv span{
-    color: var(--fg-dim);
-  }
-
-  .alma-quote-list{
-    margin: 6px 0 0 18px;
-  }
-
-  /* Links */
-  .bubble a{
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 3px;
-  }
-</style>
-
-<script id="alma-quote-clean-v1-js">
-(function(){
-  if (window.__alma_quote_clean_v1) return;
-  window.__alma_quote_clean_v1 = true;
-
-  function trimUrl(u){
-    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
-  }
-
-  // Linkifica URLs dentro de um elemento, mas sem mexer em A/Code/Pre etc.
-  function linkify(root){
-    const skip = new Set(["A","CODE","PRE","SCRIPT","STYLE","TEXTAREA","INPUT","BUTTON"]);
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node){
-        const p = node.parentNode;
-        if(!p) return NodeFilter.FILTER_REJECT;
-        if(skip.has(p.nodeName)) return NodeFilter.FILTER_REJECT;
-        if(p.classList && p.classList.contains("copy-btn")) return NodeFilter.FILTER_REJECT;
-        if(!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
-    const nodes=[];
-    while(walker.nextNode()) nodes.push(walker.currentNode);
-
-    nodes.forEach(n=>{
-      const text = n.nodeValue;
-      if(!/https?:\/\//.test(text)) return;
-
-      const frag = document.createDocumentFragment();
-      const re = /(https?:\/\/[^\s<]+)/g;
-      let last = 0, m;
-
-      while((m = re.exec(text)) !== null){
-        if(m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-
-        const raw = m[1];
-        const url = trimUrl(raw);
-        const tail = raw.slice(url.length);
-
-        const a = document.createElement("a");
-        a.href = url;
-        a.target = "_blank";
-        a.rel = "noopener noreferrer";
-        a.textContent = url;
-        frag.appendChild(a);
-
-        if(tail) frag.appendChild(document.createTextNode(tail));
-        last = re.lastIndex;
-      }
-
-      if(last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-      n.parentNode.replaceChild(frag, n);
-    });
-  }
-
-  function stripHeaderVerProdutoLines(lines){
-    // remove linhas iniciais “ver produto” isoladas (link errado no cabeçalho)
-    while(lines.length){
-      const first = (lines[0]||"").trim().toLowerCase();
-      if(first === "ver produto" || first === "- ver produto" || first === "— ver produto" || first === "– ver produto"){
-        lines.shift();
-        if(lines[0] && !lines[0].trim()) lines.shift();
-        continue;
-      }
-      break;
-    }
-    return lines;
-  }
-
-  function looksLikeBudget(text){
-    const t = (text||"").toLowerCase();
-    // heurística simples (sem risco)
-    return t.includes("orçamento") || t.includes("cotação") || t.includes("total:");
-  }
-
-  function formatBudgetText(raw){
-    // NÃO cria tabelas. Apenas organiza.
-    let t = (raw||"").replace(/\r\n/g,"\n").trimEnd();
-    let lines = t.split("\n");
-    lines = stripHeaderVerProdutoLines(lines);
-
-    // Se já estiver “bem escrito”, não inventar: só limpar separadores feios e pipes.
-    // Remove linhas de separador tipo |----|----| e excesso de pipes isolados.
-    lines = lines.filter(l => {
-      const s = (l||"").trim();
-      if(!s) return true;
-      if(/^\|?\s*:?-{3,}/.test(s) && s.includes("|")) return false;
-      return true;
-    }).map(l=>{
-      // Se a linha parece uma linha de “tabela ASCII” cheia de pipes, trocar por uma versão legível
-      // Ex: "Item | Preço | Quantidade | Subtotal" -> "• Item — Preço — Quantidade — Subtotal"
-      const s = l.trim();
-      const pipeCount = (s.match(/\|/g)||[]).length;
-      if(pipeCount >= 2){
-        const parts = s.split("|").map(x=>x.trim()).filter(Boolean);
-        if(parts.length >= 2){
-          return "• " + parts.join(" — ");
-        }
-      }
-      return l;
-    });
-
-    // Agora tenta estruturar: título + secções + bullets
-    const out = [];
-    let titleDone = false;
-
-    for(const l of lines){
-      const s = (l||"").trim();
-      if(!s){
-        out.push(""); // manter parágrafo
-        continue;
-      }
-
-      // Primeira linha com "Orçamento:" vira título
-      if(!titleDone && /^orçamento\s*:/i.test(s)){
-        out.push("## " + s.replace(/^orçamento\s*:\s*/i,"Orçamento: "));
-        titleDone = true;
-        continue;
-      }
-
-      // Linhas "Total:" destacadas
-      if(/^total\s*:/i.test(s)){
-        out.push("");
-        out.push("TOTAL: " + s.replace(/^total\s*:\s*/i,"").trim());
-        continue;
-      }
-
-      // Linhas "Preço com IVA..." etc como nota
-      if(/iva/i.test(s) && /portes?/i.test(s)){
-        out.push("Nota: " + s);
-        continue;
-      }
-
-      out.push(s);
-    }
-
-    return out.join("\n").trim();
-  }
-
-  function applyToBubble(bubble){
-    if(!bubble || bubble.dataset.quoteCleaned === "1") return;
-
-    const raw = (bubble.innerText || "").replace(/\u00a0/g," ").trimEnd();
-    if(!raw) { bubble.dataset.quoteCleaned="1"; return; }
-
-    // Só atuar em mensagens da Alma e só se parecer orçamento
-    const row = bubble.closest(".msg");
-    if(!row || !row.classList.contains("alma")) { bubble.dataset.quoteCleaned="1"; return; }
-    if(!looksLikeBudget(raw)) { 
-      // ainda assim, linkify para ficar bem
-      linkify(bubble);
-      bubble.dataset.quoteCleaned="1";
-      return;
-    }
-
-    // Guardar o botão copiar, porque vamos reescrever HTML
-    const copyBtn = bubble.querySelector(".copy-btn");
-    if(copyBtn) copyBtn.remove();
-
-    const cleaned = formatBudgetText(raw);
-
-    // Render mínimo em HTML (sem markdown): converte "## " em título visual e preserva \n com <br>
-    // Também cria secções simples se houver "Links dos produtos:" etc.
-    const htmlLines = cleaned.split("\n").map(line=>{
-      if(line.startsWith("## ")){
-        const t = line.slice(3).trim();
-        return '<div class="alma-quote-title">'+escapeHtml(t)+'</div>';
-      }
-      if(/^links?/i.test(line.trim())){
-        return '<div class="alma-quote-section"><div class="alma-quote-kv"><span>'+escapeHtml(line.trim())+'</span></div>';
-      }
-      if(line.trim() === "TOTAL:" || line.trim().startsWith("TOTAL:")){
-        return '<div class="alma-quote-section"><div class="alma-quote-kv"><b>'+escapeHtml(line.trim())+'</b></div></div>';
-      }
-      return escapeHtml(line).replace(/^•\s+/,"&bull; ");
-    });
-
-    // Fechar secção aberta (simplificação: sempre fecha no fim)
-    let html = htmlLines.join("<br>");
-    // Se abrimos uma secção com <div class="alma-quote-section"> sem fechar, fecha aqui:
-    const openSections = (html.match(/<div class="alma-quote-section">/g)||[]).length;
-    const closeSections = (html.match(/<\/div>/g)||[]).length; // bruto, mas ok aqui
-    // Não vamos tentar balancear tags à força; em vez disso, evitamos deixar tags abertas:
-    html = html.replace(/<div class="alma-quote-section"><div class="alma-quote-kv"><span>(.*?)<\/span><\/div>/g,
-                        '<div class="alma-quote-section"><div class="alma-quote-kv"><span>$1</span></div>');
-
-    bubble.innerHTML = html;
-
-    // linkify depois de reescrever
-    linkify(bubble);
-
-    // repor copy
-    if(row.classList.contains("alma")){
-      const copy = document.createElement("span");
-      copy.className = "copy-btn";
-      copy.textContent = "copiar";
-      copy.onclick = ()=>navigator.clipboard.writeText(cleaned);
-      bubble.appendChild(copy);
-    }
-
-    bubble.dataset.quoteCleaned="1";
-  }
-
-  function escapeHtml(s){
-    return (s||"")
-      .replace(/&/g,"&amp;")
-      .replace(/</g,"&lt;")
-      .replace(/>/g,"&gt;")
-      .replace(/"/g,"&quot;")
-      .replace(/'/g,"&#39;");
-  }
-
-  function runOnce(){
-    document.querySelectorAll(".msg .bubble").forEach(applyToBubble);
-  }
-
-  // Corre já
-  runOnce();
-
-  // Observa novas mensagens (leve, só bubbles novas)
-  const messages = document.getElementById("messages");
-  if(messages){
-    const obs = new MutationObserver(muts=>{
-      for(const mut of muts){
-        for(const n of mut.addedNodes){
-          if(!(n instanceof HTMLElement)) continue;
-          if(n.classList && n.classList.contains("msg")){
-            const b = n.querySelector(".bubble");
-            if(b) applyToBubble(b);
-          }else{
-            n.querySelectorAll && n.querySelectorAll(".msg .bubble").forEach(applyToBubble);
-          }
-        }
-      }
-    });
-    obs.observe(messages, {childList:true, subtree:true});
-  }
-})();
-</script>
-  
 </body>
 </html>
