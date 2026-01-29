@@ -12,7 +12,7 @@
       --fg:#f3f3f3;
       --fg-dim:#cfcfd3;
       --border:#26262b;
-      --accent:#d4a017; /* amarelo torrado */
+      --accent:#d4a017;
       --bubble-user:#1b1b21;
       --bubble-alma:#23232a;
       --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25);
@@ -25,7 +25,6 @@
       display:flex; overflow:hidden;
     }
 
-    /* Sidebar */
     .sidebar{
       width:310px; min-width:260px; max-width:360px;
       background:linear-gradient(180deg,var(--panel),var(--panel-2));
@@ -87,38 +86,29 @@
     }
     .session .del:hover{ color:#ff6363; }
 
-    /* Main */
     .main{
       flex:1;
       display:flex;
       flex-direction:column;
       min-height:0;
     }
-
     .messages{
       flex:1;
       overflow:auto;
       padding:18px 20px 24px;
       background: radial-gradient(1200px 600px at 80% -10%, rgba(212,160,23,.05), transparent 60%);
-      scroll-behavior:smooth;
       min-height:0;
-      padding-bottom: 110px; /* espaço para não ficar atrás do composer */
+      padding-bottom: 110px;
     }
 
     .msg{ position:relative; max-width:980px; margin:0 auto 12px auto; display:flex; }
     .msg .bubble{
-      padding:12px 16px;
-      border-radius:14px;
-      box-shadow: var(--shadow);
-      font-size:1rem;
-      line-height:1.55;
+      padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
+      font-size:1rem; line-height:1.55;
       border:1px solid rgba(255,255,255,0.06);
-
-      /* IMPORTANT: o texto é HTML nosso (escapado), com <br> */
-      white-space: normal;
-      word-break: break-word;
+      word-break:break-word;
+      white-space:pre-wrap; /* <- default: respeitar \n */
     }
-
     .msg.user{ justify-content:flex-start; }
     .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
 
@@ -136,7 +126,9 @@
     }
     .copy-btn:hover{ color:var(--accent); }
 
-    /* Links */
+    .bubble b{ font-weight:700; }
+    .bubble u{ text-underline-offset: 3px; }
+
     .bubble a{
       color: var(--accent);
       text-decoration: underline;
@@ -144,19 +136,6 @@
       cursor: pointer;
     }
 
-    /* “Markdown” inline */
-    .bubble b{ font-weight:700; }
-    .bubble u{ text-underline-offset: 3px; }
-
-    /* Headings */
-    .alma-h{
-      font-weight:800;
-      margin:10px 0 6px;
-      font-size:1.05rem;
-      line-height:1.25;
-    }
-
-    /* Input */
     .input-bar{
       position:sticky; bottom:0; z-index:5;
       padding:12px;
@@ -179,15 +158,11 @@
       display:flex; align-items:center; justify-content:center; cursor:pointer;
       padding:0 22px;
     }
-    .send-btn:hover{ filter:brightness(1.05); }
-    .send-btn:active{ transform:translateY(1px); }
 
-    /* Scrollbars */
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
 
-    /* Responsivo */
     @media (max-width: 1024px){
       .sidebar{ width:280px; }
       .side-header img{ width:64px; height:64px; }
@@ -215,7 +190,6 @@
   </style>
 </head>
 <body>
-
   <aside class="sidebar">
     <div class="side-header">
       <img src="/static/alma.png" alt="Alma">
@@ -245,9 +219,7 @@
   </main>
 
 <script>
-/* ================================
-   Estado local
-================================ */
+/* ---------- Estado local ---------- */
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
 
@@ -258,9 +230,7 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* ================================
-   Render seguro + “markdown” leve
-================================ */
+/* ---------- Render seguro (conservador) ---------- */
 function escapeHtml(s){
   return (s||"")
     .replace(/&/g,"&amp;")
@@ -274,58 +244,47 @@ function trimUrl(u){
   return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
 }
 
-function renderRichText(raw){
+/**
+ * Render da Alma:
+ * - NÃO tenta markdown completo
+ * - NÃO mexe em URLs (zero "correções")
+ * - Só:
+ *   1) remove lixo "[ver produto](" e "— ver produto" quando aparece colado
+ *   2) converte **bold** e __underline__
+ *   3) linkify apenas URLs soltas http(s)://...
+ */
+function renderAlma(raw){
   let t = (raw || "").replace(/\r\n/g,"\n");
 
-  // 1) Corrigir URL partido por espaços (o teu caso real)
-  t = t.replace(/\/\s*(sku=)/gi, "/?$1");
-  t = t.replace(/\?\s+/g, "?").replace(/&\s+/g, "&").replace(/#\s+/g, "#");
+  // 1) limpar lixo típico vindo do backend (sem inventar)
+  // remove "[ver produto](" ou "ver produto](" perdido
+  t = t.replace(/\[\s*ver\s+produto\s*\]\s*\(/gi, "");
+  t = t.replace(/\bver\s+produto\s*\]\s*\(/gi, "");
+  // remove "— ver produto" / "– ver produto" isolado
+  t = t.replace(/(^|\n)\s*[—–-]\s*ver\s+produto\s*($|\n)/gi, "$1");
 
-  // 2) Quebras mínimas antes de secções (ajuda MUITO a leitura)
-  t = t.replace(/\s*(Links dos produtos\s*:)/gi, "\n\n$1");
-  t = t.replace(/\s*(Total\s*:)/gi, "\n\n$1");
+  // 2) melhorar leitura mínima: garantir linha vazia antes de "Links dos produtos:"
+  t = t.replace(/\s*(\n?Links dos produtos\s*:)/gi, "\n\n$1");
 
-  // 3) Limpar "**" lixo colado a preços / pontuação (sem estragar bold normal)
-  // Ex.: "1739.00€**" -> "1739.00€"
-  t = t.replace(/(€)\*\*/g, "$1");
-  // e também casos "**." "**," "** " no fim de frase
-  t = t.replace(/\*\*(?=[\s.,;:!?]|$)/g, "");
+  // 3) escape
+  let html = escapeHtml(t);
 
-  // 4) Normalizar bullets feios "·" e listas "- "
-  t = t.replace(/(^|\n)\s*[·•]\s+/g, "$1• ");
-  t = t.replace(/(^|\n)\s*-\s+/g, "$1• ");
-
-  // 5) Escapar HTML (seguro)
-  t = escapeHtml(t);
-
-  // 6) Markdown inline simples
-  t = t
+  // 4) markdown inline simples
+  html = html
     .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
     .replace(/__(.+?)__/g, "<u>$1</u>");
 
-  // 7) Linkify [texto](url), (url), url solta
-  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, txt, url){
-    url = trimUrl(url);
-    return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(txt)+'</a>';
-  });
-  t = t.replace(/\((https?:\/\/[^\s)]+)\)/g, function(_, url){
-    url = trimUrl(url);
-    return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
-  });
-  t = t.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, rawUrl){
+  // 5) linkify só URLs soltas (não faz [texto](url), não faz (url))
+  html = html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, rawUrl){
     const url = trimUrl(rawUrl);
     const tail = rawUrl.slice(url.length);
     return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
   });
 
-  // 8) Quebras
-  t = t.replace(/\n/g, "<br>");
-  return t;
+  return html; // mantém \n; bubble está em pre-wrap
 }
-  
-/* ================================
-   Sessões
-================================ */
+
+/* ---------- Sessões ---------- */
 function newSession(){
   const id = "s"+Date.now();
   const sess = { id, title:"Nova sessão", msgs:[], createdAt: Date.now() };
@@ -356,11 +315,9 @@ function clearLocal(){
 function renderSessions(){
   const box = byId("sessions"); box.innerHTML="";
   const q = (byId("search").value||"").toLowerCase();
-
   sessions.forEach(s=>{
     const match = !q || (s.title||"").toLowerCase().includes(q);
     if(!match) return;
-
     const div = document.createElement("div");
     div.className = "session"+(s.id===activeId?" active":"");
     div.onclick = ()=>{ activeId=s.id; renderSessions(); renderMsgs(); };
@@ -393,14 +350,7 @@ function renderSessions(){
   });
 }
 
-/* ================================
-   Mensagens
-================================ */
-function updateSessionTitleFromFirstUserMsg(sess){
-  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
-  if(firstUser) sess.title = snippetFrom(firstUser.content, 50);
-}
-
+/* ---------- Mensagens ---------- */
 function renderMsgs(){
   const s = sessions.find(x=>x.id===activeId);
   const box = byId("messages");
@@ -414,16 +364,17 @@ function renderMsgs(){
     const bubble=document.createElement("div");
     bubble.className="bubble";
 
-    // Render seguro e consistente
-    bubble.innerHTML = renderRichText(m.content||"");
-
-    if(m.role==="alma"){
+    if(m.role === "alma"){
+      // render conservador e estável
+      bubble.innerHTML = renderAlma(m.content||"");
       const copy=document.createElement("span");
       copy.className="copy-btn";
       copy.textContent="copiar";
-      const raw = (m.content||"");
-      copy.onclick=()=>navigator.clipboard.writeText(raw);
-      row.appendChild(copy);
+      copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
+      bubble.appendChild(copy);
+    }else{
+      // user: sem render HTML (só texto)
+      bubble.textContent = m.content || "";
     }
 
     row.appendChild(bubble);
@@ -433,9 +384,12 @@ function renderMsgs(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ================================
-   Enviar
-================================ */
+function updateSessionTitleFromFirstUserMsg(sess){
+  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
+  if(firstUser) sess.title = snippetFrom(firstUser.content, 50);
+}
+
+/* ---------- Enviar ---------- */
 async function sendMsg(){
   const inp = byId("prompt");
   const txt = (inp.value||"").trim();
@@ -457,9 +411,8 @@ async function sendMsg(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
-
     const j = await res.json();
-    const ans = (j && typeof j === "object" && j.answer) ? j.answer : JSON.stringify(j);
+    const ans = j.answer || JSON.stringify(j);
     s.msgs.push({role:"alma", content: ans});
   }catch(err){
     s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
@@ -469,12 +422,8 @@ async function sendMsg(){
   }
 }
 
-/* ================================
-   Boot
-================================ */
-if(!activeId){ newSession(); }
-else { renderSessions(); renderMsgs(); }
+/* ---------- Boot ---------- */
+if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
-
 </body>
 </html>
