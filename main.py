@@ -6687,224 +6687,122 @@ except Exception:
 # =============================================================================
 
 # =============================================================================
-# HOTFIX ÚNICO — limpar orçamento (sem tabelas) + remover links no cabeçalho
-# Colar NO FIM do main.py (apenas este hotfix; remove todos os anteriores)
+# HOTFIX ÚNICO — normalizar texto de orçamento (sem tabelas, com quebras)
+# Colar NO FIM do main.py. Remove hotfixes anteriores para não haver conflito.
 # =============================================================================
 
-import re
-import json
+import re, json
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
-_BUDGET_RE = re.compile(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao)\b", re.I)
+_BUDGET_HINT = re.compile(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao)\b", re.I)
 
-def _is_budget_text(t: str) -> bool:
-    return bool(t and _BUDGET_RE.search(t))
-
-def _strip_ascii_table_gunk(text: str) -> str:
-    """Remove traços, cabeçalhos de tabela e 'pipes' típicos."""
-    if not text:
-        return text
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    out = []
-    for raw in text.split("\n"):
-        s = raw.rstrip()
-        st = s.strip()
-
-        # linhas só de separadores
-        if re.fullmatch(r"[-|–—\s]{4,}", st or ""):
-            continue
-
-        # cabeçalhos típicos de tabela ASCII
-        low = st.lower()
-        if ("|" in st) and any(k in low for k in ("item", "preço", "preco", "quantidade", "subtotal", "sku")):
-            continue
-
-        # linhas muito "colunares": trocar | por separador
-        if st.count("|") >= 2:
-            st = st.replace("|", " · ")
-            st = re.sub(r"\s{2,}", " ", st).strip()
-
-        out.append(st)
-
-    cleaned = "\n".join(out)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned
-
-def _extract_urls(text: str):
-    return re.findall(r"https?://[^\s\]]+", text or "")
-
-def _remove_urls(text: str) -> str:
-    return re.sub(r"https?://[^\s\]]+", "", text or "")
-
-def _remove_ver_produto(text: str) -> str:
-    # remove "— ver produto" ou "[ver produto](...)" em qualquer lado
-    t = text or ""
-    t = re.sub(r"\s*—\s*ver\s+produto\b", "", t, flags=re.I)
-    t = re.sub(r"\[\s*ver\s+produto\s*\]\([^)]+\)", "", t, flags=re.I)
-    return t
-
-def _normalize_spacing(text: str) -> str:
-    t = text or ""
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
-
-def _beautify_budget_plain(text: str) -> str:
-    """
-    Produz um bloco legível (sem tabelas), com:
-    - Título
-    - Itens (se conseguir detetar)
-    - Total
-    - Nota IVA/portes
-    - Links (sempre no fim)
-    """
-    if not text:
-        return text
-
-    t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not _is_budget_text(t):
+def _normalize_budget_text(t: str) -> str:
+    if not t:
         return t
 
-    # 1) limpar lixo de tabela
-    t = _strip_ascii_table_gunk(t)
-    t = _remove_ver_produto(t)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 2) separar "Links dos produtos" se existir
-    parts = re.split(r"\bLinks\s+dos\s+produtos\s*:\s*", t, flags=re.I)
-    head = parts[0].strip()
-    tail = parts[1].strip() if len(parts) > 1 else ""
+    # Se não parecer orçamento, só limpar um pouco e devolver
+    if not _BUDGET_HINT.search(t):
+        t = re.sub(r"\n{3,}", "\n\n", t).strip()
+        return t
 
-    # 3) URLs: tirar do cabeçalho SEMPRE, e pôr numa secção final
-    urls = []
-    urls += _extract_urls(head)
-    urls += _extract_urls(tail)
+    # 1) remover headings markdown "###"
+    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)      # no início de linha
+    t = re.sub(r"\s*#{1,6}\s*", " ", t)          # no meio (caso venha "Itens: - ### Orçamento")
 
-    head = _remove_urls(head)
-    tail = _remove_urls(tail)
+    # 2) remover lixo de "tabela ASCII" e traços
+    lines = []
+    for raw in t.split("\n"):
+        s = raw.strip()
 
-    # de-dup + limpar pontuação final
-    seen = set()
-    clean_urls = []
-    for u in urls:
-        u = u.rstrip(").,;:!?\u2014\u2013")
-        if u and u not in seen:
-            seen.add(u)
-            clean_urls.append(u)
+        # linhas só de separadores
+        if re.fullmatch(r"[-|–—\s]{4,}", s or ""):
+            continue
 
-    # 4) tentar extrair campos chave
-    base = re.sub(r"\n+", " ", head)
-    base = _normalize_spacing(base)
+        # cabeçalhos típicos de tabela
+        low = s.lower()
+        if ("|" in s) and any(k in low for k in ("item", "preço", "preco", "quantidade", "subtotal", "sku")):
+            continue
 
-    # total
-    total = None
-    m_total = re.search(r"\bTotal\s*:\s*([0-9][0-9\.,]*\s*€)", base, flags=re.I)
-    if m_total:
-        total = m_total.group(1).replace(" ", "")
+        # pipes em excesso -> trocar por " · "
+        if s.count("|") >= 2:
+            s = s.replace("|", " · ")
+            s = re.sub(r"\s{2,}", " ", s).strip()
 
-    # sku
-    sku = None
-    m_sku = re.search(r"\bSKU\s*:\s*([A-Za-z0-9][A-Za-z0-9\-_]+)\b", base, flags=re.I)
-    if m_sku:
-        sku = m_sku.group(1)
+        lines.append(s)
 
-    # nome do item (muito heurístico, mas suficiente)
-    # apanha algo tipo "Dublexo ... (SKU: ...)" ou antes de "Preço unitário"
-    name = None
-    m_name = re.search(r"^(?:Nota:\s*)?(?:Orçamento\s*:?\s*)?(.*?)(?:\s*\(SKU|\s*SKU\s*:|\s*Preço\s+unitário|\s*Preço\s+unitario)", base, flags=re.I)
-    if m_name:
-        name = m_name.group(1).strip(" -—:·")
+    t = " ".join([x for x in lines if x])  # muitos modelos mandam tudo “colado”
+    t = re.sub(r"\s{2,}", " ", t).strip()
 
-    # preço unitário
-    unit = None
-    m_unit = re.search(r"Preço\s+unit[aá]rio(?:\s*\(IVA\s+inclu[ií]do\))?\s*:\s*([0-9][0-9\.,]*\s*€)", base, flags=re.I)
-    if m_unit:
-        unit = m_unit.group(1).replace(" ", "")
+    # 3) pequenas correções de estrutura
+    # "Itens: -" -> "Itens:\n-"
+    t = re.sub(r"\bItens\s*:\s*-\s*", "Itens:\n- ", t, flags=re.I)
 
-    # quantidade
-    qty = None
-    m_qty = re.search(r"\bQuantidade\s*:\s*(\d+)\b", base, flags=re.I)
-    if m_qty:
-        qty = m_qty.group(1)
+    # Forçar quebras antes de secções
+    for k in ["Orçamento", "Total:", "Links dos produtos:", "Próxima ação:", "Próxima ação", "Indique se deseja"]:
+        t = re.sub(rf"\s*({re.escape(k)})\s*", r"\n\1 ", t, flags=re.I)
 
-    # subtotal
-    sub = None
-    m_sub = re.search(r"\bSubtotal\s*:\s*([0-9][0-9\.,]*\s*€)", base, flags=re.I)
-    if m_sub:
-        sub = m_sub.group(1).replace(" ", "")
+    # 4) URLs: pôr 1 por linha (e limpar pontuação final)
+    def _url_linebreak(m):
+        u = m.group(0).rstrip(").,;:!?\u2014\u2013")
+        return "\n- " + u
 
-    # 5) construir output final (texto simples, bonito)
-    out = []
-    out.append("Orçamento")
-    out.append("")
+    # garantir que "Links dos produtos:" existe se houver urls
+    urls = re.findall(r"https?://[^\s]+", t)
+    if urls and not re.search(r"\bLinks dos produtos\s*:", t, flags=re.I):
+        t += "\nLinks dos produtos:"
 
-    if name or sku or unit or qty or sub:
-        out.append("Itens:")
-        line = "- "
-        if name:
-            line += name
-        if sku:
-            line += f" (SKU: {sku})"
-        extras = []
-        if unit: extras.append(f"Preço unit.: {unit}")
-        if qty:  extras.append(f"Qtd.: {qty}")
-        if sub:  extras.append(f"Subtotal: {sub}")
-        if extras:
-            line += " — " + " · ".join(extras)
-        out.append(line)
-        out.append("")
+    # depois de "Links dos produtos:" transformar urls em lista
+    # primeiro: garantir newline a seguir ao título
+    t = re.sub(r"(?i)\bLinks dos produtos\s*:\s*", "Links dos produtos:\n", t)
+    t = re.sub(r"https?://[^\s]+", _url_linebreak, t)
 
-    if total:
-        out.append(f"Total: {total}")
-        out.append("")
+    # 5) limpar duplicações e espaços
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
 
-    out.append("Preço com IVA incluído; portes não incluídos.")
-    out.append("")
+    # 6) toque final: se não houver quebras nenhumas, cria um mínimo
+    if "\n" not in t:
+        t = re.sub(r"\s+(Total:)", r"\n\1", t, flags=re.I)
+        t = re.sub(r"\s+(Links dos produtos:)", r"\n\1\n", t, flags=re.I)
+        t = re.sub(r"\s+(Próxima ação:)", r"\n\1\n", t, flags=re.I)
 
-    if clean_urls:
-        out.append("Links dos produtos:")
-        for u in clean_urls:
-            out.append(f"- {u}")
-        out.append("")
+    return t
 
-    out.append("Próxima ação:")
-    out.append("- Indique se deseja alterar quantidades, adicionar itens (com SKU) ou finalizar o pedido.")
 
-    return _normalize_spacing("\n".join(out))
-
-class _AskBudgetBeautifyMiddleware(BaseHTTPMiddleware):
+class _AskBudgetNormalizeMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        response = await call_next(request)
+        resp = await call_next(request)
 
         if request.url.path != "/ask":
-            return response
+            return resp
 
-        ctype = (response.headers.get("content-type") or "").lower()
+        ctype = (resp.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
-            return response
+            return resp
 
         body = b""
-        async for chunk in response.body_iterator:
+        async for chunk in resp.body_iterator:
             body += chunk
 
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:
-            # devolve como vinha
-            return JSONResponse(content={"answer": body.decode("utf-8", errors="ignore")}, status_code=response.status_code)
+            # se vier estranho, devolve como texto
+            return JSONResponse({"answer": body.decode("utf-8", errors="ignore")}, status_code=resp.status_code)
 
         if isinstance(payload, dict) and isinstance(payload.get("answer"), str):
-            payload["answer"] = _beautify_budget_plain(payload["answer"])
+            payload["answer"] = _normalize_budget_text(payload["answer"])
 
-        return JSONResponse(content=payload, status_code=response.status_code)
+        return JSONResponse(payload, status_code=resp.status_code)
+
 
 try:
-    app.add_middleware(_AskBudgetBeautifyMiddleware)
+    # IMPORTANTE: este add_middleware deve ser o ÚLTIMO do ficheiro.
+    app.add_middleware(_AskBudgetNormalizeMiddleware)
 except Exception:
     pass
-
 
 # ---------------------------------------------------------------------------------------
 # Local run
