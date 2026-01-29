@@ -6971,154 +6971,104 @@ _hf_wrap_all_ask_routes_budget_formatting()
 # FIM HOTFIX
 # =============================================================================
 
+# =============================================================================
+# HOTFIX FINAL — Limpeza de tabelas Markdown no output do /ask
+# - Remove pipes |, traços ---- e tabelas feias
+# - Não altera lógica, apenas apresentação
+# - Não toca no RAG nem no LLM
+# - Seguro para Railway
+# =============================================================================
+
 import re
+from typing import Any
 
-# -------- HOTFIX: limpar tabelas ASCII / pipes / traços --------
 
-_ORCAMENTO_TRIGGER_RE = re.compile(
-    r"\b(orç|orc)amento(s)?\b|\bcota(ç|c)ão\b|\bpre(ç|c)o(s)?\b|\bvalor(es)?\b",
-    re.IGNORECASE
-)
-
-_ASCII_TABLE_HINT_RE = re.compile(
-    r"(^\s*\|.*\|\s*$)|(^\s*[-+]{3,}\s*$)|(^\s*[:\-| ]{8,}\s*$)",
-    re.MULTILINE
-)
-
-def _strip_bad_header_link(text: str) -> str:
-    # remove "ver produto" isolado no topo (e variações)
-    lines = (text or "").replace("\r\n", "\n").split("\n")
-    while lines:
-        first = (lines[0] or "").strip().lower()
-        if first in ("ver produto", "- ver produto", "— ver produto", "– ver produto"):
-            lines.pop(0)
-            # remove linha vazia imediata
-            if lines and not lines[0].strip():
-                lines.pop(0)
-            continue
-        break
-    return "\n".join(lines)
-
-def _looks_like_ascii_table(text: str) -> bool:
-    if not text:
-        return False
-    if _ASCII_TABLE_HINT_RE.search(text):
-        return True
-    # muitos pipes numa zona curta costuma ser tabela
-    pipe_count = text.count("|")
-    return pipe_count >= 8
-
-def _normalize_spaces(s: str) -> str:
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
-
-def _clean_table_lines_to_bullets(lines):
-    """
-    Converte blocos tipo:
-      | Item | Preço | Qtd | Subtotal |
-      | ---- | ----- | --- | -------- |
-      | X    | 10€   | 2   | 20€      |
-    em bullets simples (sem frontend especial).
-    """
-    out = []
-    header = None
-
-    for ln in lines:
-        raw = ln.rstrip("\n")
-
-        # ignora separadores
-        if re.match(r"^\s*[-+]{3,}\s*$", raw):
-            continue
-        if re.match(r"^\s*\|?\s*[:\-| ]{8,}\s*\|?\s*$", raw):
-            continue
-
-        # linha com pipes -> tenta partir em colunas
-        if "|" in raw:
-            parts = [p.strip() for p in raw.strip().strip("|").split("|")]
-            parts = [p for p in parts if p != ""]
-            if not parts:
-                continue
-
-            # Heurística: primeira linha “parece” header se contiver palavras típicas
-            joined = " ".join(parts).lower()
-            is_header = any(k in joined for k in ["item", "preço", "preco", "quant", "qtd", "subtotal", "sku"])
-            if header is None and is_header:
-                header = parts
-                continue
-
-            # Se houver header, tenta mapear
-            if header and len(parts) >= 2:
-                row = dict(zip(header, parts))
-                # tenta compor frase curta
-                item = row.get("Item") or row.get("item") or parts[0]
-                preco = row.get("Preço") or row.get("preço") or row.get("Preco") or row.get("preco")
-                qtd = row.get("Quantidade") or row.get("quantidade") or row.get("Qtd") or row.get("qtd")
-                sub = row.get("Subtotal") or row.get("subtotal")
-
-                bits = [_normalize_spaces(item)]
-                if preco: bits.append(f"{preco}")
-                if qtd: bits.append(f"qtd: {qtd}")
-                if sub: bits.append(f"subtotal: {sub}")
-                out.append("• " + " — ".join(bits))
-                continue
-
-            # sem header -> bullet com colunas
-            out.append("• " + " — ".join(parts))
-            continue
-
-        # linha sem pipes: mantém se tiver conteúdo útil
-        raw2 = raw.strip()
-        if raw2:
-            out.append(raw2)
-
-    return out
-
-def sanitize_orcamento(text: str) -> str:
-    """
-    Remove tabelas ascii e blocos de traços.
-    Mantém o texto todo legível em linhas/bullets.
-    """
+def _alma_sanitize_orcamento_text(text: str) -> str:
     if not text:
         return text
 
-    text = _strip_bad_header_link(text)
-    t = text.replace("\r\n", "\n")
+    t = text
 
-    # se não parece orçamento nem tabela, não mexe
-    if (not _ORCAMENTO_TRIGGER_RE.search(t)) and (not _looks_like_ascii_table(t)):
-        return text
+    # remove linhas tipo tabela markdown
+    t = re.sub(r"^\s*\|.*\|\s*$", "", t, flags=re.M)
 
-    lines = t.split("\n")
+    # remove separadores tipo ----|----
+    t = re.sub(r"^\s*[-]{3,}\s*$", "", t, flags=re.M)
 
-    cleaned = []
-    buffer_tbl = []
+    # remove pipes soltos
+    t = t.replace("|", " ")
 
-    def flush_tbl():
-        nonlocal buffer_tbl, cleaned
-        if not buffer_tbl:
-            return
-        cleaned.extend(_clean_table_lines_to_bullets(buffer_tbl))
-        buffer_tbl = []
+    # normaliza espaços
+    t = re.sub(r"[ \t]{2,}", " ", t)
 
-    for ln in lines:
-        # se a linha parece parte de tabela ascii, acumula
-        if ("|" in ln) or re.match(r"^\s*[-+]{3,}\s*$", ln) or re.match(r"^\s*[:\-| ]{8,}\s*$", ln):
-            buffer_tbl.append(ln)
-        else:
-            # se saímos do bloco de tabela, processa
-            flush_tbl()
-            cleaned.append(ln)
+    # normaliza linhas vazias
+    t = re.sub(r"\n{3,}", "\n\n", t)
 
-    flush_tbl()
+    return t.strip()
 
-    # limpeza final: remover excesso de linhas vazias
-    out = "\n".join(cleaned)
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    return out
 
-# ------------------ APLICAR NO RETURN ------------------
-# No ponto em que tens "answer = ..." e vais devolver:
-# answer = sanitize_orcamento(answer)
+def _hotfix_wrap_ask_remove_tables():
+    try:
+        wrapped = 0
+
+        for r in getattr(app, "routes", []):
+            if getattr(r, "path", None) != "/ask":
+                continue
+
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+
+            if getattr(ep, "_alma_table_clean_wrapped", False):
+                continue
+
+            async def _wrapped(*args: Any, __ep=ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    answer = resp.get("answer") or resp.get("response")
+                    if not answer:
+                        return resp
+
+                    clean = _alma_sanitize_orcamento_text(answer)
+
+                    if "answer" in resp:
+                        resp["answer"] = clean
+                    else:
+                        resp["response"] = clean
+
+                    return resp
+
+                except Exception:
+                    return resp
+
+            _wrapped._alma_table_clean_wrapped = True
+            r.endpoint = _wrapped
+            wrapped += 1
+
+        try:
+            log.info(f"[hotfix] limpeza de tabelas aplicada em {wrapped} rota(s) /ask")
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            log.warning(f"[hotfix] falha limpeza tabelas: {e}")
+        except Exception:
+            pass
+
+
+_hotfix_wrap_ask_remove_tables()
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
 
 
 # ---------------------------------------------------------------------------------------
