@@ -584,144 +584,283 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
   margin: 12px 0;
 }
 </style>
+<style id="alma-quote-ui-hotfix">
+/* ===== Orçamentos: tabela bonita + layout ===== */
+
+/* Mantém o comportamento geral */
+.msg .bubble{ white-space: pre-wrap; }
+
+/* Para mensagens Alma: vamos renderizar HTML (com <br> e <table>) */
+.msg.alma .bubble{
+  white-space: normal;           /* permite HTML renderizado */
+}
+
+/* Wrapper de orçamento */
+.msg.alma .bubble .quote-block{
+  margin: 10px 0 6px;
+  padding: 12px 12px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  background: rgba(0,0,0,0.18);
+}
+
+/* Título do orçamento */
+.msg.alma .bubble .quote-title{
+  font-weight: 800;
+  margin: 0 0 10px 0;
+  line-height: 1.25;
+}
+
+/* Tabela */
+.msg.alma .bubble table.quote-table{
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 10px 0;
+  font-size: .95rem;
+}
+
+.msg.alma .bubble table.quote-table th,
+.msg.alma .bubble table.quote-table td{
+  border: 1px solid rgba(255,255,255,0.10);
+  padding: 8px 10px;
+  vertical-align: top;
+}
+
+.msg.alma .bubble table.quote-table th{
+  background: rgba(255,255,255,0.05);
+  font-weight: 800;
+}
+
+.msg.alma .bubble table.quote-table tr:nth-child(even) td{
+  background: rgba(255,255,255,0.025);
+}
+
+/* Totais / notas */
+.msg.alma .bubble .quote-total{
+  font-weight: 800;
+  margin-top: 8px;
+}
+.msg.alma .bubble .quote-note{
+  color: rgba(243,243,243,0.85);
+  font-style: italic;
+  margin-top: 4px;
+}
+
+/* Links */
+.msg .bubble a{
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+</style>
 
 <script>
 /* =========================================================
-   Alma Markdown Renderer Hotfix (GFM tables)
-   - Carrega marked + DOMPurify
-   - Renderiza markdown em .bubble
-   - Evita duplicação com linkify antigo
+   Alma Quote UI Hotfix (sem libs externas)
+   - Usa o conteúdo original de sessions[].msgs[].content
+   - Converte tabelas com pipes em <table>
+   - Converte \n em <br> no resto
+   - Remove "ver produto" do cabeçalho (1ª linha) se existir
    ========================================================= */
 (function(){
-  if (window.__alma_markdown_hotfix_v1) return;
-  window.__alma_markdown_hotfix_v1 = true;
+  if (window.__alma_quote_ui_hotfix_v1) return;
+  window.__alma_quote_ui_hotfix_v1 = true;
 
-  // 1) Desligar o linkify antigo (para não mexer em HTML já renderizado)
-  //    (se o teu linkify já correu, não conseguimos "des-correr", mas evitamos corridas futuras)
-  window.__alma_linkify_v3 = true; // força o teu guard a achar que já correu
+  function escapeHtml(s){
+    return (s||"")
+      .replace(/&/g,"&amp;")
+      .replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;")
+      .replace(/'/g,"&#039;");
+  }
 
-  function loadScript(src){
-    return new Promise((resolve, reject)=>{
-      var s = document.createElement("script");
-      s.src = src;
-      s.async = true;
-      s.onload = ()=>resolve(true);
-      s.onerror = ()=>reject(new Error("Falha a carregar: "+src));
-      document.head.appendChild(s);
+  function trimUrl(u){
+    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
+  }
+
+  function linkifyPlain(text){
+    // suporta [texto](url) e URL solta
+    const t = text || "";
+    // 1) [texto](url)
+    const withMdLinks = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, label, url)=>{
+      url = trimUrl(url);
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+    });
+    // 2) URLs soltas
+    return withMdLinks.replace(/(https?:\/\/[^\s<]+)/g, (m)=>{
+      const url = trimUrl(m);
+      const tail = m.slice(url.length);
+      return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>${escapeHtml(tail)}`;
     });
   }
 
-  async function ensureLibs(){
-    // marked
-    if (!window.marked){
-      await loadScript("https://cdn.jsdelivr.net/npm/marked/marked.min.js");
+  function splitPipes(line){
+    // remove pipes externos e divide
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    return s.split("|").map(c => c.trim());
+  }
+
+  function isSeparatorLine(line){
+    // linha tipo |-----|----:|---|
+    const s = line.trim();
+    if (!s.includes("|")) return false;
+    const parts = splitPipes(s);
+    return parts.length >= 2 && parts.every(p => /^:?-{3,}:?$/.test(p.replace(/\s+/g,"")));
+  }
+
+  function parsePipeTable(lines, startIdx){
+    // Espera: header line com pipes + separator line + rows
+    const header = lines[startIdx];
+    const sep = lines[startIdx+1];
+    if (!header || !sep) return null;
+    if (!header.includes("|")) return null;
+    if (!isSeparatorLine(sep)) return null;
+
+    const headers = splitPipes(header);
+    const rows = [];
+    let i = startIdx + 2;
+    while (i < lines.length){
+      const ln = lines[i];
+      if (!ln.trim()) break;
+      if (!ln.includes("|")) break;
+      // se aparecer outro separador “solto”, termina
+      if (isSeparatorLine(ln)) { i++; continue; }
+      rows.push(splitPipes(ln));
+      i++;
     }
-    // DOMPurify
-    if (!window.DOMPurify){
-      await loadScript("https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js");
+    return { headers, rows, nextIdx: i };
+  }
+
+  function removeHeaderVerProduto(raw){
+    // Remove "— ver produto" (ou variações) na 1ª linha apenas
+    const lines = (raw || "").split("\n");
+    if (!lines.length) return raw;
+    lines[0] = lines[0].replace(/\s*[—-]\s*ver produto\s*$/i, "");
+    // também remove [ver produto](url) na 1ª linha
+    lines[0] = lines[0].replace(/\s*[—-]\s*\[ver produto\]\([^)]+\)\s*$/i, "");
+    return lines.join("\n");
+  }
+
+  function renderQuoteLike(raw){
+    // Heurística: se tiver pipes e uma linha separadora, converte table(s)
+    const cleaned = removeHeaderVerProduto(raw);
+    const lines = cleaned.split("\n");
+
+    let html = "";
+    let i = 0;
+
+    // Se o bloco começa com "Orçamento:" ou "Orçamento " vamos embrulhar num quote-block
+    const startsAsQuote = /^(\s*)orçamento\b/i.test(lines[0] || "");
+
+    if (startsAsQuote) html += `<div class="quote-block">`;
+
+    while (i < lines.length){
+      // tenta tabela
+      const t = parsePipeTable(lines, i);
+      if (t){
+        // título antes da tabela (linhas anteriores já renderizadas como texto)
+        html += `<table class="quote-table"><thead><tr>${
+          t.headers.map(h=>`<th>${linkifyPlain(escapeHtml(h))}</th>`).join("")
+        }</tr></thead><tbody>`;
+        t.rows.forEach(r=>{
+          html += "<tr>" + t.headers.map((_, idx)=>{
+            const cell = (r[idx] ?? "");
+            return `<td>${linkifyPlain(escapeHtml(cell))}</td>`;
+          }).join("") + "</tr>";
+        });
+        html += `</tbody></table>`;
+        i = t.nextIdx;
+        continue;
+      }
+
+      const ln = lines[i];
+
+      // “Total:” em destaque (opcional)
+      if (/^\s*total\s*:/i.test(ln)){
+        html += `<div class="quote-total">${linkifyPlain(escapeHtml(ln))}</div>`;
+      } else if (/^\s*\*?preço com iva/i.test(ln) || /^\s*\*?preço/i.test(ln) && /portes/i.test(ln)){
+        html += `<div class="quote-note">${linkifyPlain(escapeHtml(ln))}</div>`;
+      } else if (/^\s*orçamento\b/i.test(ln)){
+        html += `<div class="quote-title">${linkifyPlain(escapeHtml(ln))}</div>`;
+      } else {
+        // texto normal
+        html += `${linkifyPlain(escapeHtml(ln))}`;
+      }
+
+      // quebras de linha
+      if (i < lines.length - 1) html += "<br>";
+      i++;
     }
-    return (window.marked && window.DOMPurify);
+
+    if (startsAsQuote) html += `</div>`;
+    return html;
   }
 
-  function shouldSkipBubble(bubble){
-    // Não tocar em bubbles sem conteúdo
-    if (!bubble) return true;
-
-    // Se já foi renderizado por este hotfix
-    if (bubble.dataset && bubble.dataset.mdRendered === "1") return true;
-
-    // Evitar tocar no botão copiar (é child, não bubble), ok.
-    return false;
-  }
-
-  function getRawTextFromBubble(bubble){
-    // O teu renderMsgs mete HTML (b, u, etc.) com base no texto original.
-    // Para não “dobrar” tags, aqui vamos ao texto visível.
-    // Nota: isto pode perder alguns sublinhados/bolds anteriores,
-    // mas a ideia é que o backend mande markdown correcto.
-    return (bubble.innerText || "").trimEnd();
-  }
-
-  function renderBubbleMarkdown(bubble){
-    if (shouldSkipBubble(bubble)) return;
-
-    const raw = getRawTextFromBubble(bubble);
-    if (!raw) { bubble.dataset.mdRendered = "1"; return; }
-
-    // manter referência ao copy-btn (se existir)
-    const copyBtn = bubble.querySelector(".copy-btn");
-    if (copyBtn) copyBtn.remove();
-
-    // configurar marked (GFM + tabelas + quebras)
-    window.marked.setOptions({
-      gfm: true,
-      breaks: true,
-      headerIds: false,
-      mangle: false
-    });
-
-    const html = window.marked.parse(raw);
-    const safe = window.DOMPurify.sanitize(html);
-
-    bubble.innerHTML = safe;
-
-    // repor copy-btn no fim (só nas mensagens da Alma)
-    const row = bubble.closest(".msg");
-    if (row && row.classList.contains("alma")){
-      const copy = document.createElement("span");
-      copy.className = "copy-btn";
-      copy.textContent = "copiar";
-      copy.onclick = ()=>navigator.clipboard.writeText(raw);
-      bubble.appendChild(copy);
-    }
-
-    bubble.dataset.mdRendered = "1";
-  }
-
-  function renderAll(){
-    document.querySelectorAll(".msg .bubble").forEach(renderBubbleMarkdown);
-  }
-
-  async function boot(){
+  function postProcessActiveSession(){
     try{
-      const ok = await ensureLibs();
-      if (!ok) return;
+      if (!window.sessions || !window.activeId) return;
 
-      // 2) Renderizar o histórico já existente
-      renderAll();
+      const s = window.sessions.find(x=>x.id===window.activeId);
+      if (!s) return;
 
-      // 3) Observar novas mensagens e renderizar automaticamente
-      const messages = document.getElementById("messages");
-      if (!messages) return;
+      const rows = document.querySelectorAll("#messages .msg");
+      if (!rows.length) return;
 
-      const obs = new MutationObserver((muts)=>{
-        for (const mut of muts){
-          for (const n of mut.addedNodes){
-            if (!(n instanceof HTMLElement)) continue;
+      // Para cada msg, re-render Alma bubble com base no texto ORIGINAL (não no innerText)
+      let domIndex = 0;
+      s.msgs.forEach((m)=>{
+        const row = rows[domIndex++];
+        if (!row) return;
+        const bubble = row.querySelector(".bubble");
+        if (!bubble) return;
 
-            // Se for uma msg inteira
-            if (n.classList && n.classList.contains("msg")){
-              const b = n.querySelector(".bubble");
-              if (b) renderBubbleMarkdown(b);
-              continue;
-            }
+        // não tocar em user
+        if (m.role !== "alma") return;
 
-            // Caso contrário, procurar bubbles dentro do nó
-            n.querySelectorAll && n.querySelectorAll(".msg .bubble").forEach(renderBubbleMarkdown);
-          }
-        }
+        // preservar o botão copiar
+        const copyBtn = bubble.querySelector(".copy-btn");
+        if (copyBtn) copyBtn.remove();
+
+        const raw = (m.content || "");
+        bubble.innerHTML = renderQuoteLike(raw);
+
+        // repor copiar
+        const copy = document.createElement("span");
+        copy.className="copy-btn";
+        copy.textContent="copiar";
+        copy.onclick=()=>navigator.clipboard.writeText(raw);
+        bubble.appendChild(copy);
       });
-      obs.observe(messages, { childList:true, subtree:true });
-    }catch(e){
-      // Se falhar, não bloqueia o chat
-      console.warn("Alma Markdown hotfix falhou:", e);
+    } catch(e){
+      console.warn("quote-ui-hotfix falhou:", e);
     }
   }
 
-  boot();
-})();
-</script>  
+  // Monkeypatch renderMsgs para pós-processar sempre
+  if (typeof window.renderMsgs === "function" && !window.__alma_renderMsgs_patched_quote){
+    window.__alma_renderMsgs_patched_quote = true;
+    const _renderMsgs = window.renderMsgs;
+    window.renderMsgs = function(){
+      _renderMsgs.apply(this, arguments);
+      postProcessActiveSession();
+    };
+  }
 
+  // Também corre já (para o histórico carregado)
+  postProcessActiveSession();
+
+  // E observa novas mensagens (seguro caso alguma coisa renderize sem passar pelo renderMsgs)
+  const messages = document.getElementById("messages");
+  if (messages){
+    const obs = new MutationObserver(()=>postProcessActiveSession());
+    obs.observe(messages, { childList:true, subtree:true });
+  }
+})();
+</script>
 
   
 </body>
