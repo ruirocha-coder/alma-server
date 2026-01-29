@@ -6274,6 +6274,323 @@ except Exception:
 # FIM HOTFIX EXTRA
 # =============================================================================
 
+# =============================================================================
+# HOTFIX — Fallback Semântico (LLM) para ORÇAMENTOS: listar SEMPRE TODAS as variantes
+# - Se detetar intenção de orçamento/cotação/preço e NÃO houver SKU explícito:
+#   1) Faz pesquisa LARGA no catálogo (OR por tokens) para obter candidatos
+#   2) Pede ao LLM para escolher as famílias corretas
+#   3) Injeta um bloco com TODAS as variantes dessas famílias (para o user escolher SKU)
+# - Não mexe no hotfix base de links no fim (isso fica como está).
+# =============================================================================
+
+import re, json
+from typing import Any, Dict, List, Optional, Tuple
+
+# -----------------------------
+# 1) Detectores simples
+# -----------------------------
+
+def _hf_budget_intent(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    return any(k in t for k in (
+        "orçament", "orcament", "cotação", "cotacao", "preço", "preco",
+        "proforma", "valor", "valores", "quanto custa", "preçário", "precario"
+    ))
+
+def _hf_has_explicit_sku(text: str) -> bool:
+    """
+    Se o utilizador já deu SKU/ref explícito, NÃO forçamos variantes.
+    - cobre ORK.03.01, LIN0030, 740021316-2-AR, etc.
+    - cobre "SKU: XXX" e "(XXX)" comum no teu UI
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    if re.search(r"\bSKU\s*:\s*[A-Z0-9][A-Z0-9._\-]{2,}\b", t, flags=re.I):
+        return True
+
+    # padrão SKU-ish (letras/números com . _ -) ou numérico >=5
+    if re.search(r"\b([A-Z]{2,}[A-Z0-9._\-]{2,}|[0-9]{5,}(?:-[A-Z0-9]{1,6})?)\b", t, flags=re.I):
+        # cuidado: isto apanha muita coisa; mas em modo orçamento preferimos NÃO ser agressivos.
+        # Só consideramos "explícito" se estiver isolado (ex.: "ORK.03.01") ou entre parênteses.
+        if re.search(r"\(([A-Z0-9][A-Z0-9._\-]{2,})\)", t, flags=re.I):
+            return True
+        if re.search(r"^\s*([A-Z0-9][A-Z0-9._\-]{2,})\s*$", t, flags=re.I):
+            return True
+
+    return False
+
+def _hf_tokens(text: str) -> List[str]:
+    t = (text or "").lower()
+    # tokens de 3+ chars, remove ruído comum pt
+    raw = re.findall(r"[a-z0-9áàâãéêíóôõúç]{3,}", t, flags=re.I)
+    stop = {
+        "para","com","sem","uma","um","uns","umas","de","do","da","dos","das",
+        "por","favor","quero","queria","faz","fazer","gera","gerar","orçamento","orcamento",
+        "cotação","cotacao","preço","preco","valores","valor","proforma","completo","final",
+        "preciso","precisava","e","ou","mais","menos","tambem","também","isto","isso"
+    }
+    out = []
+    seen = set()
+    for w in raw:
+        if w in stop:
+            continue
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out[:10]
+
+
+# -----------------------------
+# 2) Catálogo: pesquisa LARGA (OR) para candidatos
+# -----------------------------
+
+def _hf_catalog_candidates(ns: str, question: str, limit: int = 80) -> List[Dict[str, Any]]:
+    toks = _hf_tokens(question)
+    if not toks:
+        return []
+
+    # OR largo no nome (e summary se existir)
+    # NOTA: não usamos AND rígido, porque o objetivo é “não falhar” com linguagem natural.
+    where = []
+    params: List[Any] = [ns]
+
+    for tok in toks:
+        where.append("LOWER(name) LIKE ?")
+        params.append(f"%{tok}%")
+
+    # se existir a coluna summary, também ajuda
+    try:
+        with _catalog_conn() as c:
+            cols = _table_cols(c)
+            if "summary" in cols:
+                for tok in toks:
+                    where.append("LOWER(summary) LIKE ?")
+                    params.append(f"%{tok}%")
+
+            if not where:
+                return []
+
+            q = f"""
+                SELECT namespace, name, ref, price, url, variant_attrs, summary
+                FROM catalog_items
+                WHERE namespace=?
+                  AND ({' OR '.join(where)})
+                LIMIT {int(limit)}
+            """
+            rows = c.execute(q, params).fetchall()
+            return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+
+def _hf_parent_key(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    return u.split("#", 1)[0].strip()
+
+
+def _hf_group_families(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Agrupa por família (parent url). Devolve “families” com 1 exemplar + contagem.
+    """
+    fam: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        pk = _hf_parent_key(r.get("url") or "")
+        if not pk:
+            continue
+        if pk not in fam:
+            fam[pk] = {
+                "parent_url": pk,
+                "name": r.get("name") or "",
+                "ref_example": r.get("ref") or "",
+                "n": 1
+            }
+        else:
+            fam[pk]["n"] += 1
+
+    # ordena: mais variantes primeiro (melhor sinal de “família”)
+    out = list(fam.values())
+    out.sort(key=lambda x: int(x.get("n") or 0), reverse=True)
+    return out[:30]
+
+
+def _hf_fetch_all_variants_for_parent(ns: str, parent_url: str) -> List[Dict[str, Any]]:
+    if not parent_url:
+        return []
+    try:
+        with _catalog_conn() as c:
+            rows = c.execute("""
+                SELECT name, ref, price, url, variant_attrs, summary
+                FROM catalog_items
+                WHERE namespace=?
+                  AND url LIKE ?
+                ORDER BY ref ASC
+            """, (ns, parent_url + "%")).fetchall()
+            return [dict(r) for r in rows] if rows else []
+    except Exception:
+        return []
+
+
+# -----------------------------
+# 3) LLM: escolher famílias corretas a partir dos candidatos
+# -----------------------------
+
+def _hf_llm_choose_families(question: str, families: List[Dict[str, Any]]) -> List[str]:
+    """
+    Devolve lista de parent_url selecionados.
+    """
+    if not families:
+        return []
+
+    # prompt curto e MUITO rígido no output
+    fam_lines = []
+    for i, f in enumerate(families, 1):
+        fam_lines.append(f"{i}. {f.get('name','')} | parent={f.get('parent_url','')} | exemplo_ref={f.get('ref_example','')} | variantes={f.get('n',0)}")
+
+    prompt = (
+        "Tarefa: O utilizador quer um ORÇAMENTO. A partir da lista de famílias de produto abaixo, "
+        "seleciona as famílias que melhor correspondem ao pedido do utilizador.\n\n"
+        "REGRAS:\n"
+        "- Responde APENAS em JSON válido.\n"
+        "- Formato: {\"selected_parents\": [\"<parent_url>\", ...]}\n"
+        "- Seleciona no máximo 6 famílias.\n"
+        "- Se estiver ambíguo, seleciona as 1-3 mais prováveis.\n\n"
+        f"PEDIDO DO UTILIZADOR:\n{question}\n\n"
+        "FAMÍLIAS CANDIDATAS:\n" + "\n".join(fam_lines)
+    )
+
+    try:
+        raw = grok_chat([
+            {"role": "system", "content": "Responde sempre em JSON válido, sem texto extra."},
+            {"role": "user", "content": prompt},
+        ])
+        data = json.loads(raw.strip())
+        parents = data.get("selected_parents") or []
+        out = []
+        seen = set()
+        for p in parents:
+            p = (p or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out[:6]
+    except Exception:
+        return []
+
+
+# -----------------------------
+# 4) Construir bloco “TODAS as variantes”
+# -----------------------------
+
+def _hf_variants_block(ns: str, question: str) -> str:
+    rows = _hf_catalog_candidates(ns, question, limit=120)
+    families = _hf_group_families(rows)
+    chosen = _hf_llm_choose_families(question, families) if families else []
+
+    # fallback: se LLM falhar, usa as top 2 famílias por “n”
+    if not chosen and families:
+        chosen = [f.get("parent_url") for f in families[:2] if f.get("parent_url")]
+
+    if not chosen:
+        return ""
+
+    lines: List[str] = []
+    lines.append("LISTA COMPLETA DE VARIANTES (ORÇAMENTO):")
+    lines.append("Regra: se o utilizador NÃO indicou SKU, tens de listar TODAS as variantes abaixo e pedir confirmação do SKU antes de fixar no orçamento.\n")
+
+    for p in chosen:
+        vars_ = _hf_fetch_all_variants_for_parent(ns, p)
+        if not vars_:
+            continue
+
+        # título da família (usa o nome mais comum)
+        fam_name = (vars_[0].get("name") or "").strip() or "Produto"
+        lines.append(f"Produto: {fam_name}")
+        lines.append("Variantes disponíveis (escolhe o SKU):")
+        for v in vars_:
+            ref = (v.get("ref") or "").strip()
+            name = (v.get("name") or "").strip()
+            var  = (v.get("variant_attrs") or "").strip()
+            pr   = v.get("price")
+            pr_s = f"{float(pr):.2f}€" if isinstance(pr, (int, float)) else ""
+            # linha “limpa”: nome + variante + SKU + preço
+            label = name
+            if var and var.lower() not in (name or "").lower():
+                label = f"{label} — {var}"
+            if ref:
+                label = f"{label} | SKU: {ref}"
+            if pr_s:
+                label = f"{label} | {pr_s}"
+            lines.append(f"- {label}")
+        lines.append("")  # espaço entre famílias
+
+    return "\n".join([l for l in lines if l is not None]).strip()
+
+
+# -----------------------------
+# 5) Patch: build_messages (apenas em modo orçamento e sem SKU explícito)
+# -----------------------------
+
+try:
+    _hf_prev_build_messages = build_messages
+except Exception:
+    _hf_prev_build_messages = None
+
+def build_messages(user_id: str, question: str, namespace: Optional[str]):
+    # chama o build_messages atual (o teu pipeline existente)
+    if not _hf_prev_build_messages:
+        raise RuntimeError("build_messages original não encontrado")
+
+    messages, new_facts, rag_used, rag_hits = _hf_prev_build_messages(user_id, question, namespace)
+
+    try:
+        ns = (namespace or DEFAULT_NAMESPACE).strip()
+        q  = (question or "").strip()
+
+        # Só atua em intenção de orçamento/preço/cotação
+        if not _hf_budget_intent(q):
+            return messages, new_facts, rag_used, rag_hits
+
+        # Se já houver SKU explícito, não forçar variantes (deixa fixar no orçamento)
+        if _hf_has_explicit_sku(q):
+            return messages, new_facts, rag_used, rag_hits
+
+        # Gerar bloco robusto de variantes (LLM + catálogo)
+        vb = _hf_variants_block(ns, q)
+        if not vb:
+            return messages, new_facts, rag_used, rag_hits
+
+        # Inserir antes da última mensagem user
+        # (preserva a ordem: missão/facts/memória/etc..., depois este bloco, depois user)
+        insert_at = max(0, len(messages) - 1)
+        messages.insert(insert_at, {"role": "system", "content": vb})
+
+        # Reforço operacional (evita respostas “não encontrei”)
+        messages.insert(insert_at + 1, {"role": "system", "content": (
+            "REGRA (ORÇAMENTO): Se o utilizador não deu SKU, NÃO fixes itens. "
+            "Lista TODAS as variantes disponíveis (do bloco acima) e pede que ele confirme os SKUs e quantidades."
+        )})
+
+    except Exception:
+        pass
+
+    return messages, new_facts, rag_used, rag_hits
+
+
+try:
+    log.info("[hotfix-semantic-budget] ativo: fallback semântico com LLM + listagem completa de variantes em modo orçamento (sem SKU).")
+except Exception:
+    pass
+
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
