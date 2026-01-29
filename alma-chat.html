@@ -886,6 +886,281 @@ if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
   }
 })();
 </script>
+
+  <!-- =========================================================
+     ALMA HOTFIX v1 (TUDO-EM-UM)
+     Objetivo:
+     - Renderizar tabelas ASCII/pipe ("| a | b |") como <table> bonita
+     - Preservar quebras de linha (sem “compactar”)
+     - Remover o “ver produto” no cabeçalho (linhas isoladas no topo)
+     - Linkificar URLs e [texto](url) (sem depender do linkify antigo)
+     - Não usar CDNs, não usar libs externas
+     Como aplicar:
+     1) Cola ESTE BLOCO no FINAL do ficheiro (antes de </body>)
+     2) Se tiveres hotfixes antigos (marked/DOMPurify ou linkify_v3), podes deixá-los:
+        este hotfix desativa-os e impõe o renderer.
+     ========================================================= -->
+
+<style id="alma-hotfix-v1-css">
+  /* Garantir que o texto mantém quebras */
+  .msg .bubble{
+    white-space: pre-wrap !important;
+    word-break: break-word;
+  }
+
+  /* Parágrafos/headers gerados pelo renderer */
+  .alma-p{ margin: 6px 0; }
+  .alma-h{
+    font-weight: 800;
+    margin: 10px 0 6px;
+  }
+
+  /* Tabelas bonitas */
+  .alma-table-wrap{
+    overflow-x: auto;
+    margin: 10px 0;
+  }
+  .alma-table{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: .95rem;
+  }
+  .alma-table th,
+  .alma-table td{
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 8px 10px;
+    vertical-align: top;
+  }
+  .alma-table th{
+    background: rgba(255,255,255,0.05);
+    font-weight: 800;
+  }
+  .alma-table tr:nth-child(even) td{
+    background: rgba(255,255,255,0.03);
+  }
+
+  /* Links coerentes */
+  .msg .bubble a{
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+</style>
+
+<script id="alma-hotfix-v1-js">
+(function(){
+  if (window.__alma_hotfix_v1) return;
+  window.__alma_hotfix_v1 = true;
+
+  // Desativar hotfixes antigos que “estragam” (se existirem)
+  window.__alma_markdown_hotfix_v1 = true; // impede o teu marked/DOMPurify de correr
+  window.__alma_linkify_v3 = true;         // impede o linkify antigo de correr
+
+  /* ---------- Helpers ---------- */
+  function escapeHtml(s){
+    return (s||"")
+      .replace(/&/g,"&amp;")
+      .replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;")
+      .replace(/'/g,"&#39;");
+  }
+
+  function trimUrl(u){
+    return (u || "").replace(/[)\]\}>,.;:!?]+$/g, "");
+  }
+
+  function linkifyHtml(html){
+    // Converte [texto](url), (url) e url solta em <a>
+    // Nota: assume que html já está escapado (ou é HTML nosso controlado)
+    // Vamos atuar só em texto (não dentro de tags) usando regex simples:
+    // Para robustez, fazemos isto ANTES de inserir <br>, e após escapes.
+
+    // 1) [texto](url)
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function(_, txt, url){
+      url = trimUrl(url);
+      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+escapeHtml(txt)+'</a>';
+    });
+
+    // 2) (url)
+    html = html.replace(/\((https?:\/\/[^\s)]+)\)/g, function(_, url){
+      url = trimUrl(url);
+      return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>';
+    });
+
+    // 3) url solta (evitar apanhar já dentro de href="...")
+    html = html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, function(_, lead, raw){
+      const url = trimUrl(raw);
+      const tail = raw.slice(url.length);
+      return lead + '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>' + escapeHtml(tail);
+    });
+
+    return html;
+  }
+
+  // Deteta bloco tipo tabela pipe com linha separadora (|---|---|)
+  function isPipeTableBlock(lines){
+    if (lines.length < 2) return false;
+    const hasPipes = /\|/.test(lines[0]);
+
+    const sepLike = (lines[1]||"").replace(/\s/g,"");
+    const isSep = /^(\|?-{3,}\|)+-?\|?$/.test(sepLike) || /^-+\|?-+/.test(sepLike);
+
+    return hasPipes && isSep;
+  }
+
+  function splitTableRow(line){
+    let t = (line||"").trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|")) t = t.slice(0,-1);
+    return t.split("|").map(c => c.trim());
+  }
+
+  function renderPipeTable(lines){
+    const headerCells = splitTableRow(lines[0]);
+    const bodyLines = lines.slice(2);
+
+    let html = '<div class="alma-table-wrap"><table class="alma-table">';
+    html += '<thead><tr>' + headerCells.map(c=>'<th>'+escapeHtml(c)+'</th>').join("") + '</tr></thead>';
+    html += '<tbody>';
+
+    for(const ln of bodyLines){
+      if(!ln || !ln.trim()) continue;
+      const cells = splitTableRow(ln);
+      while (cells.length < headerCells.length) cells.push("");
+      html += '<tr>' + cells.slice(0, headerCells.length).map(c=>'<td>'+escapeHtml(c)+'</td>').join("") + '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  // Remove o “ver produto” isolado no cabeçalho (link random)
+  // Heurística: se o conteúdo começa por "ver produto" / "- ver produto" numa linha sozinha -> remove essa linha
+  function stripHeaderVerProduto(text){
+    const t = (text||"").replace(/\r\n/g,"\n");
+    const lines = t.split("\n");
+    while(lines.length){
+      const first = (lines[0]||"").trim().toLowerCase();
+      if (first === "ver produto" || first === "- ver produto" || first === "— ver produto" || first === "– ver produto"){
+        lines.shift();
+        // também limpa uma linha vazia a seguir
+        if (lines[0] && !lines[0].trim()) lines.shift();
+        continue;
+      }
+      break;
+    }
+    return lines.join("\n");
+  }
+
+  function renderAlmaContent(raw){
+    // 1) limpar cabeçalho indevido
+    const cleaned = stripHeaderVerProduto(raw);
+
+    // 2) normalizar quebras
+    const text = (cleaned||"").replace(/\r\n/g,"\n");
+
+    // 3) blocos por parágrafos (linhas vazias)
+    const blocks = text.split(/\n{2,}/);
+
+    const out = [];
+    for(const block of blocks){
+      const lines = block.split("\n");
+
+      // tabela?
+      if (isPipeTableBlock(lines)){
+        out.push(renderPipeTable(lines));
+        continue;
+      }
+
+      // normal: escapar, markdown simples, linkify, headings, <br>
+      let html = escapeHtml(block);
+
+      // markdown simples
+      html = html
+        .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+        .replace(/__(.+?)__/g, "<u>$1</u>");
+
+      // headings (# Título)
+      html = html.replace(/^\s*#{1,6}\s+(.+)$/gm, "<div class=\"alma-h\">$1</div>");
+
+      // linkify
+      html = linkifyHtml(html);
+
+      // quebras
+      html = html.replace(/\n/g, "<br>");
+
+      out.push('<div class="alma-p">'+html+'</div>');
+    }
+
+    return out.join("");
+  }
+
+  /* ---------- Patch ao renderMsgs existente ---------- */
+  function patchRenderMsgs(){
+    if (typeof window.renderMsgs !== "function") return false;
+    if (window.__alma_renderMsgs_patched) return true;
+    window.__alma_renderMsgs_patched = true;
+
+    const original = window.renderMsgs;
+
+    window.renderMsgs = function(){
+      // corre o original para construir DOM e manter lógica da app
+      original();
+
+      // depois re-renderiza só os bubbles da Alma (sem mexer no user)
+      document.querySelectorAll(".msg.alma .bubble").forEach(bubble=>{
+        // já processado?
+        if (bubble.dataset && bubble.dataset.almaRendered === "1") return;
+
+        // obter raw do modelo a partir do texto (antes estava em innerHTML por replace)
+        // Melhor: usar o texto visível e reconstituir com \n (pre-wrap)
+        const raw = (bubble.innerText || "").replace(/\u00a0/g," ").trimEnd();
+
+        // remover copy-btn se tiver sido inserido no original
+        const copyBtn = bubble.querySelector(".copy-btn");
+        if (copyBtn) copyBtn.remove();
+
+        // renderizar bonito
+        bubble.innerHTML = renderAlmaContent(raw);
+
+        // repor copy
+        const copy = document.createElement("span");
+        copy.className = "copy-btn";
+        copy.textContent = "copiar";
+        copy.onclick = ()=>navigator.clipboard.writeText(raw);
+        bubble.appendChild(copy);
+
+        bubble.dataset.almaRendered = "1";
+      });
+    };
+
+    return true;
+  }
+
+  /* ---------- Observa novas mensagens e reaplica ---------- */
+  function observeNewMessages(){
+    const messages = document.getElementById("messages");
+    if (!messages) return;
+
+    const obs = new MutationObserver(()=>{
+      // Sempre que algo muda, garante patch e re-render
+      patchRenderMsgs();
+      if (typeof window.renderMsgs === "function") window.renderMsgs();
+    });
+
+    obs.observe(messages, { childList:true, subtree:true });
+  }
+
+  // Boot
+  patchRenderMsgs();
+  observeNewMessages();
+
+  // aplica já (histórico existente)
+  try{ if (typeof window.renderMsgs === "function") window.renderMsgs(); }catch(e){}
+})();
+</script>
   
 </body>
 </html>
