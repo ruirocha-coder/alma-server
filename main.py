@@ -7051,54 +7051,143 @@ try:
     app.add_middleware(_AskAnswerCleanerMiddleware)
 except Exception:
     pass
-
-# ============================================================
-# HOTFIX — limpar "tabelas ASCII" no /ask sem mexer no frontend
-# Colar NO FIM do main.py
-# Requer: remover hotfix anterior de middleware (se existir).
-# ============================================================
-
 import re
 from fastapi.routing import APIRoute
 
-def _clean_budget_ascii(text: str) -> str:
+_BUDGET_TRIGGER_RE = re.compile(r"^\s*(nota:\s*)?(orçamento|orcamento|cotação|cotacao|preço|preco)\b", re.I)
+
+def _beautify_budget_text(text: str) -> str:
     if not text:
         return text
 
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
+    # Só mexe se parecer mesmo um bloco de orçamento
+    if not _BUDGET_TRIGGER_RE.search(t):
+        return t
+
+    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+
+    # 1) remover linhas separadoras tipo ---- |---|
+    lines = [ln for ln in lines if not re.fullmatch(r"[-|–—\s]{4,}", ln)]
+
+    # 2) juntar tudo num texto base (muitos outputs vêm semi-colados)
+    base = " ".join(lines)
+    base = re.sub(r"\s{2,}", " ", base).strip()
+
+    # 3) tirar URLs do “cabeçalho” (antes de Links dos produtos) e empurrar para a secção Links
+    # apanha todos os URLs
+    urls = re.findall(r"https?://[^\s\]]+", base)
+    # tenta separar a partir de "Links dos produtos"
+    parts = re.split(r"\bLinks dos produtos\s*:\s*", base, flags=re.I)
+    head = parts[0].strip()
+    tail = parts[1].strip() if len(parts) > 1 else ""
+
+    # remove URLs do head
+    head = re.sub(r"https?://[^\s\]]+", "", head).strip()
+    head = re.sub(r"\s{2,}", " ", head)
+
+    # 4) extrair TOTAL
+    total = None
+    m_total = re.search(r"\bTotal\s*:\s*([0-9][0-9\.\s]*,[0-9]{2}\s*€|[0-9][0-9\.\s]*\s*€)", base, flags=re.I)
+    if m_total:
+        total = m_total.group(1).replace(" ", "")
+
+    # 5) tentar extrair itens (linhas com SKU e preço)
+    # Ex.: "... (SKU: 741050527-MI) ... 1739.00€ Quantidade: 1 Subtotal: 1739.00€"
+    items = []
+    item_re = re.compile(
+        r"(?P<name>.+?)\s*\(SKU:\s*(?P<sku>[A-Za-z0-9\-_]+)\)\s*.*?"
+        r"(?:Preço\s+unitário.*?:\s*(?P<unit>[0-9\.,]+€))?.*?"
+        r"(?:Quantidade:\s*(?P<qty>\d+))?.*?"
+        r"(?:Subtotal:\s*(?P<sub>[0-9\.,]+€))?",
+        re.I
+    )
+    m_item = item_re.search(base)
+    if m_item:
+        name = m_item.group("name").strip(" -—:")
+        sku  = m_item.group("sku")
+        unit = (m_item.group("unit") or "").strip()
+        qty  = (m_item.group("qty") or "").strip()
+        sub  = (m_item.group("sub") or "").strip()
+
+        # fallback: se não veio unit/sub, tenta apanhar o primeiro preço após SKU
+        if not unit or not sub:
+            after = base[m_item.end():]
+            prices = re.findall(r"\b[0-9][0-9\.,]*€\b", after)
+            if prices:
+                if not unit:
+                    unit = prices[0]
+                if len(prices) > 1 and not sub:
+                    sub = prices[1]
+
+        items.append({"name": name, "sku": sku, "unit": unit, "qty": qty, "sub": sub})
+
+    # 6) montar links: usa os do tail se existirem; senão usa os urls apanhados
+    link_lines = []
+    link_src = tail if tail else " ".join(urls)
+    # apanha pares "Nome — URL" se existirem
+    pair_re = re.compile(r"([A-Za-zÀ-ÿ0-9][^h]{3,}?)\s*(https?://[^\s]+)")
+    pairs = pair_re.findall(link_src)
+    if pairs:
+        for label, url in pairs:
+            lbl = re.sub(r"\s{2,}", " ", label).strip(" -—:•")
+            link_lines.append(f"- {lbl}: {url}")
+    else:
+        # fallback: só URLs, 1 por linha
+        seen = set()
+        for u in re.findall(r"https?://[^\s]+", link_src):
+            u = u.rstrip(").,;:!?\u2014\u2013")
+            if u in seen:
+                continue
+            seen.add(u)
+            link_lines.append(f"- {u}")
+
+    # 7) construir output final (por linhas)
     out = []
-    for raw in text.split("\n"):
-        line = raw.rstrip()
-        s = line.strip()
+    out.append("**Orçamento**")
+    if items:
+        out.append("")
+        out.append("**Itens:**")
+        for it in items:
+            bits = [it["name"]]
+            if it["sku"]:
+                bits.append(f"(SKU: {it['sku']})")
+            line = " ".join(bits)
+            extras = []
+            if it["unit"]:
+                extras.append(f"Preço unit.: {it['unit']}")
+            if it["qty"]:
+                extras.append(f"Qtd.: {it['qty']}")
+            if it["sub"]:
+                extras.append(f"Subtotal: {it['sub']}")
+            if extras:
+                line += " — " + " | ".join(extras)
+            out.append(f"- {line}")
 
-        # remove separadores tipo ---- |----| etc
-        if re.fullmatch(r"[-|–—\s]{4,}", s or ""):
-            continue
+    if total:
+        out.append("")
+        out.append(f"**Total:** {total}")
 
-        # remove header de tabela típico (desde que tenha pipes)
-        low = s.lower()
-        if ("|" in s) and any(k in low for k in ("item", "preço", "preco", "quantidade", "subtotal", "sku")):
-            continue
+    # notas fixas (curtas)
+    out.append("")
+    out.append("_Preço com IVA incluído; portes não incluídos._")
 
-        # converter linhas com muitos pipes em texto legível
-        if s.count("|") >= 2:
-            s = re.sub(r"\s*\|\s*", " — ", s).strip()
-            s = re.sub(r"\s{2,}", " ", s).strip()
+    if link_lines:
+        out.append("")
+        out.append("**Links dos produtos:**")
+        out.extend(link_lines)
 
-        # remover "ver produto" solto (o link fica em baixo de qualquer forma)
-        s = re.sub(r"(\s*[—-]\s*)?\bver\s+produto\b", "", s, flags=re.I).strip()
+    out.append("")
+    out.append("Indique se deseja alterar quantidades, adicionar itens (com SKU) ou finalizar o pedido.")
 
-        out.append(s if s else "")
-
-    cleaned = "\n".join(out)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-    return cleaned
+    # garantir quebras limpas
+    final = "\n".join(out)
+    final = re.sub(r"\n{3,}", "\n\n", final).strip()
+    return final
 
 
 def _wrap_fastapi_route(app, path="/ask"):
-    # encontra a rota /ask
     route = None
     for r in app.routes:
         if isinstance(r, APIRoute) and r.path == path:
@@ -7107,35 +7196,21 @@ def _wrap_fastapi_route(app, path="/ask"):
     if not route:
         return False
 
-    original_endpoint = route.endpoint
-    original_call = route.dependant.call  # <- crucial no FastAPI
-
-    async def wrapped_endpoint(request):
-        result = await original_endpoint(request)
-
-        # o teu /ask devolve dict {"answer": "..."}
-        if isinstance(result, dict) and "answer" in result:
-            result["answer"] = _clean_budget_ascii(result.get("answer") or "")
-        return result
+    original_call = route.dependant.call
 
     async def wrapped_call(**kwargs):
-        # chama o original (que chama o endpoint) e aplica limpeza
         result = await original_call(**kwargs)
         if isinstance(result, dict) and "answer" in result:
-            result["answer"] = _clean_budget_ascii(result.get("answer") or "")
+            result["answer"] = _beautify_budget_text(result.get("answer") or "")
         return result
 
-    # aplica o wrap de forma compatível com FastAPI
-    route.endpoint = wrapped_endpoint
     route.dependant.call = wrapped_call
-
     return True
 
 
 try:
     _wrap_fastapi_route(app, "/ask")
 except Exception:
-    # não deixar cair o servidor por causa do hotfix
     pass
 
 # ---------------------------------------------------------------------------------------
