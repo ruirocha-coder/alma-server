@@ -6687,122 +6687,223 @@ except Exception:
 # =============================================================================
 
 # =============================================================================
-# HOTFIX ÚNICO — normalizar texto de orçamento (sem tabelas, com quebras)
-# Colar NO FIM do main.py. Remove hotfixes anteriores para não haver conflito.
+# HOTFIX BACKEND — Formatter único e estável para respostas /ask (SEM middleware)
+# Colar no FIM do main.py (depois das rotas existirem), antes do __main__.
 # =============================================================================
 
-import re, json
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+import re
+from typing import Any, Callable, Optional
+from functools import wraps
 
-_BUDGET_HINT = re.compile(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao)\b", re.I)
+_BUDGET_HINT = re.compile(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao|proforma)\b", re.I)
 
-def _normalize_budget_text(t: str) -> str:
+def _is_budget_text(t: str) -> bool:
+    if not t:
+        return False
+    tt = t.lower()
+    return bool(_BUDGET_HINT.search(t)) or ("total:" in tt and "€" in tt)
+
+def _strip_ver_produto(t: str) -> str:
     if not t:
         return t
 
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    # remove "— [ver produto](...)" / "[ver produto](...)" / "ver produto" isolado
+    t = re.sub(r"\s*—\s*\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)", "", t, flags=re.I)
+    t = re.sub(r"(?im)^\s*\[?\s*ver\s+produto\s*\]?\s*\([^)]+\)\s*$\n?", "", t)
+    t = re.sub(r"(?im)^\s*ver\s+produto\s*$\n?", "", t)
 
-    # Se não parecer orçamento, só limpar um pouco e devolver
-    if not _BUDGET_HINT.search(t):
-        t = re.sub(r"\n{3,}", "\n\n", t).strip()
-        return t
-
-    # 1) remover headings markdown "###"
-    t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)      # no início de linha
-    t = re.sub(r"\s*#{1,6}\s*", " ", t)          # no meio (caso venha "Itens: - ### Orçamento")
-
-    # 2) remover lixo de "tabela ASCII" e traços
-    lines = []
-    for raw in t.split("\n"):
-        s = raw.strip()
-
-        # linhas só de separadores
-        if re.fullmatch(r"[-|–—\s]{4,}", s or ""):
-            continue
-
-        # cabeçalhos típicos de tabela
-        low = s.lower()
-        if ("|" in s) and any(k in low for k in ("item", "preço", "preco", "quantidade", "subtotal", "sku")):
-            continue
-
-        # pipes em excesso -> trocar por " · "
-        if s.count("|") >= 2:
-            s = s.replace("|", " · ")
-            s = re.sub(r"\s{2,}", " ", s).strip()
-
-        lines.append(s)
-
-    t = " ".join([x for x in lines if x])  # muitos modelos mandam tudo “colado”
-    t = re.sub(r"\s{2,}", " ", t).strip()
-
-    # 3) pequenas correções de estrutura
-    # "Itens: -" -> "Itens:\n-"
-    t = re.sub(r"\bItens\s*:\s*-\s*", "Itens:\n- ", t, flags=re.I)
-
-    # Forçar quebras antes de secções
-    for k in ["Orçamento", "Total:", "Links dos produtos:", "Próxima ação:", "Próxima ação", "Indique se deseja"]:
-        t = re.sub(rf"\s*({re.escape(k)})\s*", r"\n\1 ", t, flags=re.I)
-
-    # 4) URLs: pôr 1 por linha (e limpar pontuação final)
-    def _url_linebreak(m):
-        u = m.group(0).rstrip(").,;:!?\u2014\u2013")
-        return "\n- " + u
-
-    # garantir que "Links dos produtos:" existe se houver urls
-    urls = re.findall(r"https?://[^\s]+", t)
-    if urls and not re.search(r"\bLinks dos produtos\s*:", t, flags=re.I):
-        t += "\nLinks dos produtos:"
-
-    # depois de "Links dos produtos:" transformar urls em lista
-    # primeiro: garantir newline a seguir ao título
-    t = re.sub(r"(?i)\bLinks dos produtos\s*:\s*", "Links dos produtos:\n", t)
-    t = re.sub(r"https?://[^\s]+", _url_linebreak, t)
-
-    # 5) limpar duplicações e espaços
+    # limpa excesso de linhas vazias
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
-
-    # 6) toque final: se não houver quebras nenhumas, cria um mínimo
-    if "\n" not in t:
-        t = re.sub(r"\s+(Total:)", r"\n\1", t, flags=re.I)
-        t = re.sub(r"\s+(Links dos produtos:)", r"\n\1\n", t, flags=re.I)
-        t = re.sub(r"\s+(Próxima ação:)", r"\n\1\n", t, flags=re.I)
-
     return t
 
+def _normalize_newlines(t: str) -> str:
+    t = (t or "").replace("\r\n", "\n").replace("\r", "\n")
+    # evita parágrafos gigantes colados
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t
 
-class _AskBudgetNormalizeMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        resp = await call_next(request)
+def _force_section_breaks(t: str) -> str:
+    # põe secções em linha própria
+    t = re.sub(r"\s+(Total\s*:)", r"\n\1", t, flags=re.I)
+    t = re.sub(r"\s+(Links\s+dos\s+produtos\s*:)", r"\n\n\1\n", t, flags=re.I)
+    return t
 
-        if request.url.path != "/ask":
-            return resp
+def _pipes_to_bullets(t: str) -> str:
+    """
+    Converte linhas tipo tabela pipe em bullets legíveis:
+      | Item | Preço | Qtd | Subtotal |
+    vira:
+      • Item — Preço — Qtd — Subtotal
+    Remove também separadores tipo |---|---|
+    """
+    out = []
+    for ln in (t or "").split("\n"):
+        s = ln.strip()
 
-        ctype = (resp.headers.get("content-type") or "").lower()
-        if "application/json" not in ctype:
-            return resp
+        # remove separadores de tabela
+        if s and ("|" in s) and re.fullmatch(r"[\|\s:\-]{6,}", s):
+            continue
 
-        body = b""
-        async for chunk in resp.body_iterator:
-            body += chunk
+        pipe_count = ln.count("|")
+        if pipe_count >= 2:
+            parts = [p.strip() for p in ln.split("|") if p.strip()]
+            if len(parts) >= 2:
+                out.append("• " + " — ".join(parts))
+                continue
 
+        out.append(ln)
+    return "\n".join(out)
+
+def _extract_urls(t: str) -> list[str]:
+    return re.findall(r"https?://[^\s<>()]+", t or "")
+
+def _dedupe_preserve(seq: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        k = x.strip()
+        if not k:
+            continue
+        lk = k.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        out.append(k)
+    return out
+
+def _format_budget(t: str) -> str:
+    """
+    Orçamento: título bold, total destacado, links no fim 1 por linha.
+    Não inventa links: apenas reorganiza.
+    """
+    t = _normalize_newlines(t)
+    t = _strip_ver_produto(t)
+    t = _force_section_breaks(t)
+    t = _pipes_to_bullets(t)
+
+    lines = [ln.rstrip() for ln in t.split("\n")]
+
+    # título: primeira linha que contenha "Orçamento" vira bold (sem estragar o resto)
+    for i, ln in enumerate(lines):
+        if re.search(r"\b(orç(?:a|ã)mento|orcamento)\b", ln, flags=re.I):
+            lines[i] = f"**{ln.strip()}**"
+            break
+
+    # total: qualquer linha "Total:" fica bold
+    for i, ln in enumerate(lines):
+        if re.match(r"(?i)^\s*total\s*:", ln.strip()):
+            lines[i] = f"**{ln.strip()}**"
+
+    # recolher URLs e removê-las do corpo para meter no fim “limpo”
+    urls = _dedupe_preserve([u.rstrip(").,;:!?\u2014\u2013") for u in _extract_urls(t)])
+
+    body_lines = []
+    in_links_section = False
+    for ln in lines:
+        low = ln.strip().lower()
+
+        if re.match(r"(?i)^\s*links\s+dos\s+produtos\s*:", ln.strip()):
+            in_links_section = True
+            continue
+
+        if in_links_section:
+            # ignora linhas dentro da secção de links (vamos reconstruir)
+            continue
+
+        # remove urls embutidas no corpo (ficam no fim)
+        ln2 = re.sub(r"https?://[^\s<>()]+", "", ln).rstrip()
+        # limpa sobras feias
+        ln2 = re.sub(r"\s{2,}", " ", ln2).rstrip()
+        body_lines.append(ln2)
+
+    body = "\n".join(body_lines).strip()
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    # reconstruir links no fim, 1 por linha
+    if urls:
+        links_block = ["", "Links dos produtos:"]
+        for u in urls[:60]:
+            links_block.append(u)
+        body = body.rstrip() + "\n" + "\n".join(links_block)
+
+    # garantir final limpo
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    return body
+
+def _format_generic(t: str) -> str:
+    t = _normalize_newlines(t)
+    t = _strip_ver_produto(t)
+    t = _pipes_to_bullets(t)
+    t = _force_section_breaks(t)
+
+    # garantir que urls ficam em linha própria (sem mexer no conteúdo)
+    t = re.sub(r"([^\n])\s*(https?://)", r"\1\n\2", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+def _format_answer(answer: str) -> str:
+    if not answer:
+        return answer
+    try:
+        if _is_budget_text(answer):
+            return _format_budget(answer)
+        return _format_generic(answer)
+    except Exception:
+        # fallback absoluto: nunca falhar
+        return _normalize_newlines(answer).strip()
+
+def _wrap_all_post_ask_routes_with_formatter() -> int:
+    """
+    Apanha TODAS as rotas POST /ask (mesmo duplicadas) e envolve para:
+    - correr endpoint original
+    - se resp for dict e tiver 'answer' (ou 'response'): formatar
+    """
+    wrapped = 0
+    for r in getattr(app, "routes", []):
         try:
-            payload = json.loads(body.decode("utf-8"))
+            if getattr(r, "path", None) != "/ask":
+                continue
+            methods = getattr(r, "methods", set()) or set()
+            if "POST" not in methods:
+                continue
+
+            ep = getattr(r, "endpoint", None)
+            if not callable(ep):
+                continue
+            if getattr(ep, "_alma_fmt_wrapped_v1", False):
+                continue
+
+            @wraps(ep)
+            async def _wrapped(*args: Any, __ep: Callable = ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if isinstance(resp, dict):
+                        if isinstance(resp.get("answer"), str):
+                            resp["answer"] = _format_answer(resp["answer"])
+                        elif isinstance(resp.get("response"), str):
+                            resp["response"] = _format_answer(resp["response"])
+                    return resp
+                except Exception:
+                    return resp
+
+            _wrapped._alma_fmt_wrapped_v1 = True
+            r.endpoint = _wrapped
+            wrapped += 1
         except Exception:
-            # se vier estranho, devolve como texto
-            return JSONResponse({"answer": body.decode("utf-8", errors="ignore")}, status_code=resp.status_code)
+            continue
 
-        if isinstance(payload, dict) and isinstance(payload.get("answer"), str):
-            payload["answer"] = _normalize_budget_text(payload["answer"])
+    try:
+        log.info(f"[alma-backend-render-hotfix] wrapped POST /ask routes: {wrapped}")
+    except Exception:
+        pass
+    return wrapped
 
-        return JSONResponse(payload, status_code=resp.status_code)
+# ativa o hotfix
+_wrap_all_post_ask_routes_with_formatter()
 
-
-try:
-    # IMPORTANTE: este add_middleware deve ser o ÚLTIMO do ficheiro.
-    app.add_middleware(_AskBudgetNormalizeMiddleware)
-except Exception:
-    pass
+# =============================================================================
+# FIM HOTFIX
+# =============================================================================
 
 # ---------------------------------------------------------------------------------------
 # Local run
