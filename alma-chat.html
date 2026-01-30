@@ -2,9 +2,8 @@
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
-  <title>Alma - chat</title>
+  <title>Alma - chat (raw)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
   <style>
     :root{
       --bg:#0a0a0b;
@@ -22,7 +21,7 @@
     html,body{height:100%}
     body{
       margin:0; background:var(--bg); color:var(--fg);
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
       display:flex; overflow:hidden;
     }
 
@@ -46,13 +45,17 @@
       box-shadow: var(--shadow);
       object-fit:cover;
     }
-    .session-search{ padding:10px 12px; border-bottom:1px solid var(--border); }
+
+    .session-search{
+      padding:10px 12px; border-bottom:1px solid var(--border);
+    }
     .session-search input{
       width:100%; padding:10px 12px; border-radius:8px;
       border:1px solid var(--border); background:#0e0e11; color:var(--fg);
       outline:none;
     }
     .session-search input::placeholder{ color:#8a8a92; }
+
     .side-actions{
       display:flex; gap:10px; align-items:center;
       color:var(--fg-dim); padding:10px 12px;
@@ -63,6 +66,7 @@
       cursor:pointer; font-size:1rem; padding:4px 6px;
     }
     .side-actions button:hover{ color:var(--accent); }
+
     .sessions{ flex:1; overflow:auto; padding:10px; }
     .session{
       padding:10px 12px; border:1px solid var(--border);
@@ -84,9 +88,16 @@
     .session .del:hover{ color:#ff6363; }
 
     /* Main */
-    .main{ flex:1; display:flex; flex-direction:column; min-height:0; }
+    .main{
+      flex:1;
+      display:flex;
+      flex-direction:column;
+      min-height:0;
+    }
+
     .messages{
-      flex:1; overflow:auto;
+      flex:1;
+      overflow:auto;
       padding:18px 20px 24px;
       background: radial-gradient(1200px 600px at 80% -10%, rgba(212,160,23,.05), transparent 60%);
       min-height:0;
@@ -98,49 +109,27 @@
       padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
       font-size:1rem; line-height:1.55;
       border:1px solid rgba(255,255,255,0.06);
-      max-width:min(90%, 720px);
+
+      /* CRÍTICO: mostrar exactamente o texto que vem do backend */
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .msg.user{ justify-content:flex-start; }
-    .msg.user .bubble{ background:var(--bubble-user); white-space:pre-wrap; word-break:break-word; }
+    .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
 
     .msg.alma{ justify-content:flex-end; }
-    .msg.alma .bubble{ background:var(--bubble-alma); margin-left:auto; }
+    .msg.alma .bubble{
+      background:var(--bubble-alma);
+      margin-left:auto;
+      max-width:min(90%, 720px);
+      text-align:left;
+    }
 
     .copy-btn{
       position:absolute; right:12px; bottom:8px;
       font-size:.78rem; color:#bdbdc6; cursor:pointer; user-select:none;
     }
     .copy-btn:hover{ color:var(--accent); }
-
-    .bubble a{
-      color: var(--accent);
-      text-decoration: underline;
-      text-underline-offset: 3px;
-      cursor: pointer;
-    }
-
-    /* Budget micro-UI */
-    .alma-block{ white-space:normal; word-break:break-word; }
-    .alma-line{ margin: 2px 0; }
-    .alma-title{
-      font-weight:800;
-      margin: 0 0 8px 0;
-    }
-    .alma-total{
-      margin-top:8px;
-      padding-top:8px;
-      border-top: 1px solid rgba(255,255,255,0.10);
-      font-weight:800;
-    }
-    .alma-section{
-      margin-top:10px;
-      padding-top:8px;
-      border-top: 1px solid rgba(255,255,255,0.10);
-      font-weight:700;
-    }
-    .alma-links{ margin-top:6px; }
-    .alma-links .alma-linkline{ margin: 2px 0; }
-    .alma-dim{ color: rgba(243,243,243,0.80); }
 
     /* Input */
     .input-bar{
@@ -168,7 +157,7 @@
     .send-btn:hover{ filter:brightness(1.05); }
     .send-btn:active{ transform:translateY(1px); }
 
-    /* Scrollbars */
+    /* Scrollbars discretos */
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
@@ -200,7 +189,6 @@
     }
   </style>
 </head>
-
 <body>
   <aside class="sidebar">
     <div class="side-header">
@@ -231,12 +219,11 @@
   </main>
 
 <script>
-/* =========================
-   Estado local
-========================= */
+/* ---------- Estado local ---------- */
 let sessions = JSON.parse(localStorage.getItem("alma_sessions")||"[]");
 let activeId = sessions.length ? sessions[0].id : null;
 
+/* ---------- Util ---------- */
 function saveSessions(){ localStorage.setItem("alma_sessions", JSON.stringify(sessions)); }
 function byId(id){ return document.getElementById(id); }
 function snippetFrom(text, n=48){
@@ -244,9 +231,7 @@ function snippetFrom(text, n=48){
   return s.length>n ? s.slice(0,n-1)+"…" : s || "Nova sessão";
 }
 
-/* =========================
-   Sessões
-========================= */
+/* ---------- Sessões ---------- */
 function newSession(){
   const id = "s"+Date.now();
   const sess = { id, title:"Nova sessão", msgs:[], createdAt: Date.now() };
@@ -313,205 +298,7 @@ function renderSessions(){
   });
 }
 
-function updateSessionTitleFromFirstUserMsg(sess){
-  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
-  if(firstUser){
-    sess.title = snippetFrom(firstUser.content, 50);
-  }
-}
-
-/* =========================
-   Renderer (ÚNICO)
-   - Preserva linhas
-   - Linkifica
-   - Se for orçamento: título bold + total destacado + links no fim 1/linha
-========================= */
-
-function escapeHtml(s){
-  return (s||"")
-    .replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;")
-    .replace(/'/g,"&#39;");
-}
-
-function trimUrl(u){
-  return (u||"").replace(/[)\]\}>,.;:!?]+$/g, "");
-}
-
-function linkifyTextToHtml(s){
-  // trabalha em texto já escapado (ou seja: não introduz HTML do modelo)
-  // [texto](url)
-  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, txt, url) => {
-    url = trimUrl(url);
-    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(txt)}</a>`;
-  });
-  // urls soltas
-  s = s.replace(/(^|[\s>])((https?:\/\/)[^\s<]+)/g, (m, lead, raw) => {
-    const url = trimUrl(raw);
-    const tail = raw.slice(url.length);
-    return `${lead}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${escapeHtml(tail)}`;
-  });
-  return s;
-}
-
-function simpleInlineMarkdown(s){
-  // s está escapado -> ok substituir tokens por tags seguras
-  s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-  s = s.replace(/__(.+?)__/g, "<u>$1</u>");
-  return s;
-}
-
-function looksLikeBudget(raw){
-  const t = (raw||"").toLowerCase();
-  return t.includes("orçamento") || t.includes("orcamento") || t.includes("total:");
-}
-
-function normalizeRawText(raw){
-  let t = (raw||"").replace(/\r\n/g,"\n").replace(/\r/g,"\n");
-
-  // NÃO “compactar” para uma linha. Só melhorar quebras quando o backend vem colado.
-  // 1) Força newline antes de “Total:” e “Links dos produtos:”
-  t = t.replace(/\s+(Total:)/gi, "\n$1");
-  t = t.replace(/\s+(Links dos produtos:)/gi, "\n\n$1\n");
-
-  // 2) Se “Links dos produtos:” veio no meio, tenta garantir que começa em linha própria
-  t = t.replace(/(Links dos produtos:)\s*/gi, "$1\n");
-
-  // 3) URLs: garantir 1 por linha quando aparecem “coladas”
-  //   Ex: "... 7400... https://... - ... https://..."
-  //   Coloca newline antes de http(s) se não estiver já no início de linha
-  t = t.replace(/([^\n])\s*(https?:\/\/)/g, "$1\n$2");
-
-  // 4) Bullets: garantir que "- " começa em linha própria se estiver colado
-  t = t.replace(/([^\n])\s+-\s+/g, "$1\n- ");
-
-  // Limpa excesso de linhas vazias
-  t = t.replace(/\n{3,}/g, "\n\n").trim();
-  return t;
-}
-
-function renderBudgetHtml(raw){
-  const t = normalizeRawText(raw);
-  const lines = t.split("\n").map(x => x.trimEnd());
-
-  // separar blocos
-  let title = "";
-  let totalLine = "";
-  let normalLines = [];
-  let linksLines = [];
-
-  let inLinks = false;
-
-  for(let i=0;i<lines.length;i++){
-    const line = lines[i];
-    const low = line.trim().toLowerCase();
-
-    if(!title && low.startsWith("orçamento")){
-      title = line.trim();
-      continue;
-    }
-
-    if(low.startsWith("links dos produtos:")){
-      inLinks = true;
-      continue;
-    }
-
-    if(low.startsWith("total:")){
-      totalLine = line.trim();
-      continue;
-    }
-
-    if(inLinks){
-      if(!line.trim()) continue;
-
-      // se for só um label sem url, deixa (há casos em que vem "Mono Cadeira — 100010")
-      // se contiver url, deixa também
-      linksLines.push(line.trim());
-    }else{
-      normalLines.push(line);
-    }
-  }
-
-  // pós-processar links: meter cada URL em linha própria e limpar pontuação final
-  const finalLinks = [];
-  for(const ln of linksLines){
-    // se a linha contém url e texto, deixa como está mas separa
-    const parts = ln.split(/\s+/);
-    if(parts.some(p => /^https?:\/\//i.test(p))){
-      // reconstroi com urls separadas em linha própria
-      let buf = [];
-      let urls = [];
-      for(const p of parts){
-        if(/^https?:\/\//i.test(p)) urls.push(trimUrl(p));
-        else buf.push(p);
-      }
-      const label = buf.join(" ").replace(/\s+-\s+$/,"").trim();
-      if(label) finalLinks.push("- " + label);
-      for(const u of urls) finalLinks.push("  " + u);
-    }else{
-      finalLinks.push("- " + ln);
-    }
-  }
-
-  // HTML
-  let html = `<div class="alma-block">`;
-
-  if(title){
-    html += `<div class="alma-title">${simpleInlineMarkdown(linkifyTextToHtml(escapeHtml(title)))}</div>`;
-  }
-
-  for(const ln of normalLines){
-    if(!ln || !ln.trim()){
-      html += `<div class="alma-line">&nbsp;</div>`;
-      continue;
-    }
-    const safe = escapeHtml(ln);
-    let out = simpleInlineMarkdown(safe);
-    out = linkifyTextToHtml(out);
-    html += `<div class="alma-line">${out}</div>`;
-  }
-
-  if(totalLine){
-    const safe = escapeHtml(totalLine);
-    let out = simpleInlineMarkdown(safe);
-    out = linkifyTextToHtml(out);
-    html += `<div class="alma-total">${out}</div>`;
-  }
-
-  if(finalLinks.length){
-    html += `<div class="alma-section">Links dos produtos</div>`;
-    html += `<div class="alma-links">`;
-    for(const ln of finalLinks){
-      const safe = escapeHtml(ln);
-      let out = simpleInlineMarkdown(safe);
-      out = linkifyTextToHtml(out);
-      html += `<div class="alma-linkline">${out}</div>`;
-    }
-    html += `</div>`;
-  }
-
-  html += `</div>`;
-  return html;
-}
-
-function renderAlmaHtml(raw){
-  // orçamento -> layout especial
-  if(looksLikeBudget(raw)) return renderBudgetHtml(raw);
-
-  // texto normal: preservar linhas e linkificar
-  const t = normalizeRawText(raw);
-  const safe = escapeHtml(t);
-  const md = simpleInlineMarkdown(safe);
-  const linked = linkifyTextToHtml(md);
-  // preservar quebras
-  return `<div class="alma-block">${linked.replace(/\n/g,"<br>")}</div>`;
-}
-
-/* =========================
-   Mensagens
-========================= */
+/* ---------- Mensagens (RAW: sem markdown, sem linkify, sem replace) ---------- */
 function renderMsgs(){
   const s = sessions.find(x=>x.id===activeId);
   const box = byId("messages");
@@ -525,10 +312,10 @@ function renderMsgs(){
     const bubble=document.createElement("div");
     bubble.className="bubble";
 
-    if(m.role === "user"){
-      bubble.textContent = m.content || "";
-    }else{
-      bubble.innerHTML = renderAlmaHtml(m.content || "");
+    // CRÍTICO: texto puro
+    bubble.textContent = (m.content||"");
+
+    if(m.role==="alma"){
       const copy=document.createElement("span");
       copy.className="copy-btn";
       copy.textContent="copiar";
@@ -543,9 +330,12 @@ function renderMsgs(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* =========================
-   Enviar
-========================= */
+function updateSessionTitleFromFirstUserMsg(sess){
+  const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
+  if(firstUser) sess.title = snippetFrom(firstUser.content, 50);
+}
+
+/* ---------- Enviar ---------- */
 async function sendMsg(){
   const inp = byId("prompt");
   const txt = (inp.value||"").trim();
@@ -557,6 +347,7 @@ async function sendMsg(){
 
   s.msgs.push({role:"user", content:txt});
   if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
+
   saveSessions();
   renderSessions();
   renderMsgs();
@@ -567,20 +358,22 @@ async function sendMsg(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
+
+    // se o backend devolver algo não-JSON, isto vai rebentar e cai no catch
     const j = await res.json();
-    const ans = j.answer || j.response || JSON.stringify(j);
-    s.msgs.push({role:"alma", content: ans});
+    const ans = (j && (j.answer ?? j.response)) ?? JSON.stringify(j);
+
+    s.msgs.push({role:"alma", content: String(ans)});
   }catch(err){
-    s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
+    s.msgs.push({role:"alma", content: "ERRO no frontend (raw): "+ String(err)});
   }finally{
     saveSessions();
     renderMsgs();
   }
 }
 
-/* Boot */
+/* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
-
 </body>
 </html>
