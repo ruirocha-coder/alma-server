@@ -6905,6 +6905,264 @@ _wrap_all_post_ask_routes_with_formatter()
 # FIM HOTFIX
 # =============================================================================
 
+# ========= POST-PROCESS HOTFIX =========
+# (colar no final do main.py)
+
+import re
+from typing import List, Tuple
+
+def _trim_url(u: str) -> str:
+    return re.sub(r"[)\]\}>,.;:!?]+$", "", (u or "").strip())
+
+def _dedupe_keep_order(items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    seen = set()
+    out = []
+    for label, url in items:
+        key = (label.strip(), url.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label.strip(), url.strip()))
+    return out
+
+def _extract_md_links(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Remove [texto](url) do corpo, devolvendo (texto_sem_links_md, links[(texto,url)]).
+    Mantém o texto "texto" no corpo apenas se não for claramente um 'ver produto'.
+    """
+    links = []
+
+    def repl(m):
+        label = (m.group(1) or "").strip()
+        url = _trim_url(m.group(2) or "")
+        if url:
+            links.append((label or url, url))
+        # remove do corpo para irmos pôr no fim (fica mais limpo)
+        return label if (label and label.lower() not in {"ver produto", "ver", "produto"}) else ""
+
+    new_text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", repl, text)
+    return new_text, links
+
+def _extract_bare_urls(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Extrai URLs soltas. Se na mesma linha existir um label (texto antes/ao lado), tenta capturar.
+    """
+    links = []
+    lines = text.split("\n")
+    new_lines = []
+
+    url_re = re.compile(r"(https?://[^\s<]+)")
+
+    for ln in lines:
+        found = url_re.findall(ln)
+        if not found:
+            new_lines.append(ln)
+            continue
+
+        # tira URLs da linha e tenta obter label
+        clean_ln = url_re.sub("", ln).strip()
+        clean_ln = re.sub(r"[-–—•]+$", "", clean_ln).strip()
+
+        for u in found:
+            url = _trim_url(u)
+            label = clean_ln
+            # se não houver label útil, usa o próprio url
+            if not label or len(label) < 3:
+                label = url
+            links.append((label, url))
+
+        # remove a linha original (para não ficar tudo duplicado no corpo)
+        # mas se a linha tinha conteúdo relevante além de urls, mantém-no
+        if clean_ln and len(clean_ln) > 3:
+            new_lines.append(clean_ln)
+
+    return "\n".join(new_lines), links
+
+def _has_md_table(text: str) -> bool:
+    # típico: linha header com | e linha separadora com ---|---.
+    return bool(re.search(r"^\s*\|.*\|\s*$", text, flags=re.M)) and bool(
+        re.search(r"^\s*\|?\s*:?-{2,}\s*\|", text, flags=re.M)
+    )
+
+def _md_table_to_text(text: str) -> str:
+    """
+    Converte a primeira tabela markdown que encontrar para blocos de texto.
+    Mantém o resto do texto.
+    """
+    lines = text.split("\n")
+    out = []
+    i = 0
+
+    while i < len(lines):
+        ln = lines[i]
+
+        # deteta início de tabela
+        if re.match(r"^\s*\|.*\|\s*$", ln):
+            # tenta ler header + separador + rows
+            header = ln
+            if i + 1 < len(lines) and re.search(r"-{2,}", lines[i + 1]):
+                sep = lines[i + 1]
+                # parse colunas do header
+                cols = [c.strip() for c in header.strip().strip("|").split("|")]
+                i += 2
+                rows = []
+                while i < len(lines) and re.match(r"^\s*\|.*\|\s*$", lines[i]):
+                    row_cols = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                    # normaliza tamanho
+                    while len(row_cols) < len(cols):
+                        row_cols.append("")
+                    rows.append(dict(zip(cols, row_cols)))
+                    i += 1
+
+                # converter rows -> texto
+                for r in rows:
+                    item = r.get("Item", "") or r.get("item", "") or ""
+                    pu = r.get("Preço unitário (IVA incluído)", "") or r.get("Preço unitário", "") or ""
+                    qtd = r.get("Quantidade", "") or ""
+                    sub = r.get("Subtotal", "") or ""
+
+                    block = []
+                    if item:
+                        block.append(f"- {item}")
+                    if pu:
+                        block.append(f"  Preço unitário (IVA incl.): {pu}")
+                    if qtd:
+                        block.append(f"  Quantidade: {qtd}")
+                    if sub:
+                        block.append(f"  Subtotal: {sub}")
+                    out.append("\n".join(block) if block else "")
+                continue  # já incrementámos i dentro do while
+            else:
+                # linha com pipes mas sem separador -> não é tabela real
+                out.append(ln)
+                i += 1
+                continue
+
+        out.append(ln)
+        i += 1
+
+    return "\n".join(out)
+
+def postprocess_answer(answer: str) -> str:
+    if answer is None:
+        return ""
+
+    # se vier dict/obj por acidente
+    if not isinstance(answer, str):
+        answer = str(answer)
+
+    t = answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # 1) tirar heading markdown (### etc.) para ficar clean no raw
+    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.M)
+
+    # 2) converter tabela markdown (caso SKU directo)
+    if _has_md_table(t):
+        t = _md_table_to_text(t)
+
+    # 3) separar “Total:” numa linha própria (quando vem colado)
+    t = re.sub(r"\s+(Total\s*:)", r"\n\n\1", t, flags=re.I)
+
+    # 4) normalizar “Links dos produtos:” (garante quebra)
+    t = re.sub(r"\s*(Links dos produtos\s*:)\s*", r"\n\nLinks dos produtos:\n", t, flags=re.I)
+
+    # 5) extrair links markdown e urls soltas para meter no fim (um por linha)
+    t, md_links = _extract_md_links(t)
+    t, bare_links = _extract_bare_urls(t)
+    links = _dedupe_keep_order(md_links + bare_links)
+
+    # 6) limpar bold markdown (mantém só texto)
+    t = t.replace("**", "")
+
+    # 7) limpar espaços e excesso de linhas vazias
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    # 8) reconstruir secção Links no fim, sempre 1 por linha
+    # remove qualquer secção “Links dos produtos:” antiga do corpo (porque vamos garantir uma final)
+    t = re.sub(r"\n\nLinks dos produtos:\n(?:.*\n?)*$", "", t, flags=re.I).strip()
+
+    if links:
+        t += "\n\nLinks dos produtos:\n"
+        for label, url in links:
+            label = re.sub(r"\s+", " ", label).strip(" -–—•")
+            url = _trim_url(url)
+            # se label for igual ao url, não repete
+            if label and label != url:
+                t += f"- {label}\n  {url}\n"
+            else:
+                t += f"- {url}\n"
+        t = t.rstrip()
+
+    return t
+
+# =============================================================================
+# MINI-HOTFIX — postprocess_answer aplicado ao /ask (só em respostas de orçamento)
+# Colar NO FIM do main.py (depois de definires app e as rotas)
+# =============================================================================
+
+import re
+from typing import Any
+
+# --- Se não tens este helper, cria-o aqui (leve e seguro) ---
+_BUDGET_HINT_RE = re.compile(r"\b(orç(?:a|ã)mento|orcamento|cotação|cotacao|total\s*:|links dos produtos\s*:)\b", re.I)
+
+def _looks_like_budget_answer(t: str) -> bool:
+    return bool(_BUDGET_HINT_RE.search(t or ""))
+
+# --- PATCH: envolver o endpoint /ask para pós-processar a resposta ---
+try:
+    _route_ask = None
+    for r in getattr(app, "routes", []):
+        if getattr(r, "path", None) == "/ask" and "POST" in (getattr(r, "methods", set()) or set()):
+            _route_ask = r
+            break
+
+    if _route_ask and callable(getattr(_route_ask, "endpoint", None)):
+        _prev_ep = _route_ask.endpoint
+
+        # evita embrulhar 2x (muito importante)
+        if not getattr(_prev_ep, "_hf_postprocess_wrapped_v1", False):
+
+            async def _ask_wrapped(*args: Any, __ep=_prev_ep, **kwargs: Any):
+                resp = await __ep(*args, **kwargs)
+                try:
+                    if not isinstance(resp, dict):
+                        return resp
+
+                    key = "answer" if "answer" in resp else ("response" if "response" in resp else None)
+                    if not key:
+                        return resp
+
+                    ans = resp.get(key) or ""
+                    if not isinstance(ans, str) or not ans.strip():
+                        return resp
+
+                    # só mexe se parecer orçamento (para não estragar conversas normais)
+                    if not _looks_like_budget_answer(ans):
+                        return resp
+
+                    # aplica o teu núcleo
+                    resp[key] = postprocess_answer(ans)
+                    return resp
+                except Exception:
+                    return resp
+
+            _ask_wrapped._hf_postprocess_wrapped_v1 = True
+            _route_ask.endpoint = _ask_wrapped
+
+            try:
+                log.info("[mini-hotfix] /ask wrapped: postprocess_answer ativo (só orçamentos).")
+            except Exception:
+                pass
+
+except Exception as e:
+    try:
+        log.warning(f"[mini-hotfix] falhou a aplicar wrapper ao /ask: {e}")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------------------
 # Local run
 # ---------------------------------------------------------------------------------------
