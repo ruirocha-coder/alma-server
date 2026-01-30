@@ -6905,6 +6905,7 @@ _wrap_all_post_ask_routes_with_formatter()
 # FIM HOTFIX
 # =============================================================================
 
+
 # ========= POST-PROCESS HOTFIX =========
 # (colar no final do main.py)
 
@@ -7089,6 +7090,140 @@ def postprocess_answer(answer: str) -> str:
             url = _trim_url(url)
             # se label for igual ao url, não repete
             if label and label != url:
+                t += f"- {label}\n  {url}\n"
+            else:
+                t += f"- {url}\n"
+        t = t.rstrip()
+
+    return t
+
+# ========= POST-PROCESS HOTFIX v2 (clean links + remove [ver produto]) =========
+import re
+from typing import List, Tuple
+
+_URL_TAIL_TRIM_RE = re.compile(r"[)\]\}>,.;:!?]+$")
+
+def _trim_url(u: str) -> str:
+    return _URL_TAIL_TRIM_RE.sub("", (u or "").strip())
+
+def _dedupe_keep_order(items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for label, url in items:
+        label = (label or "").strip()
+        url = (url or "").strip()
+        key = (label, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label, url))
+    return out
+
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+_BARE_URL_RE = re.compile(r"(https?://[^\s<]+)")
+
+def _extract_md_links(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Remove [label](url) do corpo e devolve links.
+    Se label for 'ver produto' (ou variações), remove do corpo SEM manter label.
+    """
+    links: List[Tuple[str, str]] = []
+
+    def repl(m):
+        label = (m.group(1) or "").strip()
+        url = _trim_url(m.group(2) or "")
+        if url:
+            links.append((label or url, url))
+
+        lab = label.lower().strip()
+        if lab in {"ver produto", "ver", "produto"}:
+            return ""  # remove mesmo
+        return label  # mantém label normal no texto (sem link)
+
+    new_text = _MD_LINK_RE.sub(repl, text)
+    return new_text, links
+
+def _extract_bare_urls(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Extrai URLs soltas. Se na mesma linha houver "label" (texto sem o URL), usa-o.
+    Remove o URL do corpo (para o pôr no fim), mas mantém a parte textual relevante.
+    """
+    links: List[Tuple[str, str]] = []
+    lines = text.split("\n")
+    new_lines: List[str] = []
+
+    for ln in lines:
+        found = _BARE_URL_RE.findall(ln)
+        if not found:
+            new_lines.append(ln)
+            continue
+
+        clean_ln = _BARE_URL_RE.sub("", ln).strip()
+        clean_ln = re.sub(r"[-–—•|]+$", "", clean_ln).strip()
+
+        for u in found:
+            url = _trim_url(u)
+            label = clean_ln
+            if not label or len(label) < 3:
+                label = url
+            links.append((label, url))
+
+        # mantém texto útil (sem URL) para não “comer” conteúdo
+        if clean_ln and len(clean_ln) > 3:
+            new_lines.append(clean_ln)
+
+    return "\n".join(new_lines), links
+
+# remove "— [ver produto](...)" em cabeçalhos/linhas
+_VER_PROD_INLINE_RE = re.compile(
+    r"\s*[-–—]\s*\[(?:ver\s+produto|ver|produto)\]\(https?://[^\s)]+\)\s*",
+    flags=re.I
+)
+
+def postprocess_answer(answer: str) -> str:
+    if answer is None:
+        return ""
+
+    if not isinstance(answer, str):
+        answer = str(answer)
+
+    t = answer.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # 0) remover "— [ver produto](...)" em qualquer lado (especialmente cabeçalhos)
+    t = _VER_PROD_INLINE_RE.sub(" ", t)
+
+    # 1) (opcional) tirar markdown heading "### "
+    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.M)
+
+    # 2) garantir que "Total:" e "Links dos produtos:" ficam em linha própria
+    t = re.sub(r"\s+(Total\s*:)", r"\n\n\1", t, flags=re.I)
+    t = re.sub(r"\s*(Links dos produtos\s*:)\s*", r"\n\nLinks dos produtos:\n", t, flags=re.I)
+
+    # 3) extrair links markdown + urls soltas
+    t, md_links = _extract_md_links(t)
+    t, bare_links = _extract_bare_urls(t)
+    links = _dedupe_keep_order(md_links + bare_links)
+
+    # 4) limpar bold markdown
+    t = t.replace("**", "")
+
+    # 5) limpar espaços/linhas vazias
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    # 6) remover qualquer secção "Links dos produtos:" já existente no corpo (vamos reconstruir)
+    t = re.sub(r"\n\nLinks dos produtos:\n(?:.*\n?)*$", "", t, flags=re.I).strip()
+
+    # 7) reconstruir links no fim (1 por linha + url por baixo)
+    if links:
+        t += "\n\nLinks dos produtos:\n"
+        for label, url in links:
+            label = re.sub(r"\s+", " ", (label or "")).strip(" -–—•|")
+            url = _trim_url(url)
+            if not url:
+                continue
+            # não repetir label se for igual ao url
+            if label and label != url and label.lower() not in {"ver produto", "ver", "produto"}:
                 t += f"- {label}\n  {url}\n"
             else:
                 t += f"- {url}\n"
