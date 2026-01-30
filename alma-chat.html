@@ -375,5 +375,143 @@ async function sendMsg(){
 /* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
+
+<script>
+/* ===========================
+   HOTFIX FRONTEND: linkify + bold headings + highlight prices/totals
+   - cola NO FIM do HTML (depois do teu <script> principal)
+   =========================== */
+
+(function () {
+  // Se não existir renderMsgs, não faz nada
+  if (typeof window.renderMsgs !== "function") return;
+
+  function escapeHtml(s) {
+    return (s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function trimUrl(u) {
+    return (u ?? "").replace(/[)\]\}>,.;:!?]+$/g, "");
+  }
+
+  // Linkify markdown [texto](url) e urls soltas
+  function linkifyEscapedHtml(escaped) {
+    // 1) markdown links: [texto](https://...)
+    escaped = escaped.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, txt, url) => {
+      url = trimUrl(url);
+      // txt já está escapado porque "escaped"
+      return `<a href="${url}" target="_blank" rel="noopener noreferrer">${txt}</a>`;
+    });
+
+    // 2) urls soltas
+    escaped = escaped.replace(/(^|[\s>])((https?:\/\/)[^\s<]+)/g, (m, lead, raw) => {
+      const url = trimUrl(raw);
+      const tail = raw.slice(url.length);
+      return `${lead}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${escapeHtml(tail)}`;
+    });
+
+    return escaped;
+  }
+
+  function stylizeLinesToHtml(rawText) {
+    const raw = (rawText ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+    const lines = raw.split("\n");
+    const out = [];
+
+    for (let ln of lines) {
+      const original = ln;
+      const t = ln.trim();
+
+      // linha vazia
+      if (!t) {
+        out.push("");
+        continue;
+      }
+
+      // remove "— [ver produto](...)" inline (se aparecer)
+      ln = ln.replace(/\s*[-–—]\s*\[(?:ver\s+produto|ver|produto)\]\((https?:\/\/[^\s)]+)\)\s*/ig, " ");
+
+      // deteta heading markdown
+      let isHeading = /^#{1,6}\s+/.test(t) || /^orçamento\b/i.test(t);
+
+      // deteta total e preços
+      let isTotal = /^\s*\*{0,2}\s*total\s*:/.test(t.toLowerCase());
+      let isPriceLine = /\bpreço\b/i.test(t) && /€/.test(t);
+
+      // limpa markdown heading ### (só para visual)
+      if (/^#{1,6}\s+/.test(t)) {
+        ln = ln.replace(/^\s*#{1,6}\s+/, "");
+      }
+
+      // trabalha sempre em html escapado
+      let html = escapeHtml(ln);
+
+      // bold markdown **..** (depois de escape)
+      html = html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+
+      // linkify em cima do html escapado
+      html = linkifyEscapedHtml(html);
+
+      // aplica destaques
+      if (isHeading) {
+        html = `<div style="font-weight:800; margin: 0 0 6px 0;">${html}</div>`;
+      } else if (isTotal) {
+        html = `<div style="font-weight:800; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,.12);">${html}</div>`;
+      } else if (isPriceLine) {
+        html = `<div style="font-weight:700;">${html}</div>`;
+      } else {
+        html = `<div>${html}</div>`;
+      }
+
+      out.push(html);
+    }
+
+    // junta mantendo linhas vazias
+    return out
+      .map(x => x === "" ? `<div style="height:8px"></div>` : x)
+      .join("");
+  }
+
+  // Wrapper ao renderMsgs existente
+  const _renderMsgsPrev = window.renderMsgs;
+  if (_renderMsgsPrev._hf_linkify_wrapped) return;
+
+  window.renderMsgs = function () {
+    _renderMsgsPrev();
+
+    // Depois do render normal, percorre bubbles da Alma e aplica formatação
+    try {
+      const msgBox = document.getElementById("messages");
+      if (!msgBox) return;
+
+      const almaRows = msgBox.querySelectorAll(".msg.alma .bubble");
+      almaRows.forEach(bubble => {
+        // se já formatado, não repetir
+        if (bubble.getAttribute("data-hf-formatted") === "1") return;
+
+        // tenta recuperar o texto bruto: preferimos textContent (o raw)
+        const raw = bubble.textContent || "";
+        bubble.innerHTML = `<div class="alma-block">${stylizeLinesToHtml(raw)}</div>`;
+        bubble.setAttribute("data-hf-formatted", "1");
+      });
+    } catch (e) {
+      // não rebentar o chat por causa do hotfix
+      console.warn("hotfix linkify/format falhou:", e);
+    }
+  };
+
+  window.renderMsgs._hf_linkify_wrapped = true;
+
+  // Re-render imediato
+  try { window.renderMsgs(); } catch(e) {}
+})();
+</script>  
+  
 </body>
 </html>
