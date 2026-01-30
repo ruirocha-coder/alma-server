@@ -2,7 +2,7 @@
 <html lang="pt">
 <head>
   <meta charset="utf-8"/>
-  <title>Alma - chat (raw)</title>
+  <title>Alma - chat</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root{
@@ -12,7 +12,7 @@
       --fg:#f3f3f3;
       --fg-dim:#cfcfd3;
       --border:#26262b;
-      --accent:#d4a017;
+      --accent:#d4a017; /* amarelo torrado */
       --bubble-user:#1b1b21;
       --bubble-alma:#23232a;
       --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25);
@@ -46,9 +46,7 @@
       object-fit:cover;
     }
 
-    .session-search{
-      padding:10px 12px; border-bottom:1px solid var(--border);
-    }
+    .session-search{ padding:10px 12px; border-bottom:1px solid var(--border); }
     .session-search input{
       width:100%; padding:10px 12px; border-radius:8px;
       border:1px solid var(--border); background:#0e0e11; color:var(--fg);
@@ -88,20 +86,15 @@
     .session .del:hover{ color:#ff6363; }
 
     /* Main */
-    .main{
-      flex:1;
-      display:flex;
-      flex-direction:column;
-      min-height:0;
-    }
+    .main{ flex:1; display:flex; flex-direction:column; min-height:0; }
 
     .messages{
-      flex:1;
-      overflow:auto;
+      flex:1; overflow:auto;
       padding:18px 20px 24px;
       background: radial-gradient(1200px 600px at 80% -10%, rgba(212,160,23,.05), transparent 60%);
+      scroll-behavior:smooth;
       min-height:0;
-      padding-bottom: 110px;
+      padding-bottom:110px;
     }
 
     .msg{ position:relative; max-width:980px; margin:0 auto 12px auto; display:flex; }
@@ -109,20 +102,15 @@
       padding:12px 16px; border-radius:14px; box-shadow: var(--shadow);
       font-size:1rem; line-height:1.55;
       border:1px solid rgba(255,255,255,0.06);
-
-      /* CRÍTICO: mostrar exactamente o texto que vem do backend */
-      white-space: pre-wrap;
-      word-break: break-word;
+      word-break:break-word;
     }
     .msg.user{ justify-content:flex-start; }
-    .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); }
+    .msg.user .bubble{ background:var(--bubble-user); max-width:min(90%, 720px); white-space:pre-wrap; }
 
     .msg.alma{ justify-content:flex-end; }
     .msg.alma .bubble{
       background:var(--bubble-alma);
-      margin-left:auto;
-      max-width:min(90%, 720px);
-      text-align:left;
+      margin-left:auto; max-width:min(90%, 720px);
     }
 
     .copy-btn{
@@ -131,7 +119,7 @@
     }
     .copy-btn:hover{ color:var(--accent); }
 
-    /* Input */
+    /* Composer */
     .input-bar{
       position:sticky; bottom:0; z-index:5;
       padding:12px;
@@ -157,10 +145,25 @@
     .send-btn:hover{ filter:brightness(1.05); }
     .send-btn:active{ transform:translateY(1px); }
 
-    /* Scrollbars discretos */
+    /* Scrollbars */
     .sessions::-webkit-scrollbar, .messages::-webkit-scrollbar { width:10px; }
     .sessions::-webkit-scrollbar-thumb, .messages::-webkit-scrollbar-thumb { background:#2a2a31; border-radius:10px; }
     .sessions::-webkit-scrollbar-track, .messages::-webkit-scrollbar-track { background:transparent; }
+
+    /* Alma renderer (bonito, mas simples) */
+    .alma-p{ margin:6px 0; }
+    .alma-h{ font-weight:800; margin:10px 0 6px; }
+    .alma-hr{ height:1px; background:rgba(255,255,255,0.10); margin:10px 0; border:0; }
+    .alma-list{ margin:6px 0 6px 18px; padding:0; }
+    .alma-list li{ margin:4px 0; }
+    .alma-kv{ margin:6px 0; }
+    .alma-note{ color:rgba(243,243,243,0.85); font-style:italic; margin:6px 0; }
+
+    .bubble a{
+      color:var(--accent);
+      text-decoration:underline;
+      text-underline-offset:3px;
+    }
 
     /* Responsivo */
     @media (max-width: 1024px){
@@ -170,9 +173,7 @@
     }
     @media (max-width: 820px){
       body{ flex-direction:column; }
-      .sidebar{
-        width:100%; max-width:none; border-right:none; border-bottom:1px solid var(--border);
-      }
+      .sidebar{ width:100%; max-width:none; border-right:none; border-bottom:1px solid var(--border); }
       .sessions{ max-height:40vh; }
       .messages{ padding:14px; padding-bottom:130px; }
       .input-bar{ padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
@@ -265,7 +266,6 @@ function renderSessions(){
   sessions.forEach(s=>{
     const match = !q || (s.title||"").toLowerCase().includes(q);
     if(!match) return;
-
     const div = document.createElement("div");
     div.className = "session"+(s.id===activeId?" active":"");
     div.onclick = ()=>{ activeId=s.id; renderSessions(); renderMsgs(); };
@@ -298,7 +298,190 @@ function renderSessions(){
   });
 }
 
-/* ---------- Mensagens (RAW: sem markdown, sem linkify, sem replace) ---------- */
+/* =========================================================
+   Renderer ÚNICO (sem libs, sem tabelas)
+   - preserva quebras
+   - não inventa links
+   - “Links dos produtos:” fica sempre bem, mesmo colado
+   - linhas com pipes viram texto legível (não tabela)
+   ========================================================= */
+
+function escapeHtml(s){
+  return (s||"")
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#39;");
+}
+
+function trimUrl(u){
+  return (u||"").replace(/[)\]\}>,.;:!?]+$/g,"");
+}
+
+function looksBudget(text){
+  const t=(text||"").toLowerCase();
+  return t.includes("orçamento") || t.includes("orcamento") || t.includes("cotação") || t.includes("cotacao") || t.includes("total:");
+}
+
+/* Normaliza o bloco “Links dos produtos:” mesmo quando vem colado */
+function normalizeLinksSection(raw){
+  let t=(raw||"");
+  // força newline depois do cabeçalho
+  t = t.replace(/(Links dos produtos\s*:)\s*/ig, "$1\n");
+
+  // casos colados tipo: "https://... - Nome — SKU"
+  // transformamos em:
+  // - Nome — SKU
+  //   https://...
+  t = t.replace(/(https?:\/\/[^\s]+)\s*[-–—]\s*([^\n]+)/g, (m, url, rest)=>{
+    url = trimUrl(url);
+    rest = (rest||"").trim();
+    return "- " + rest + "\n  " + url;
+  });
+
+  // linhas com "  https://..." já ok; URLs soltas em linhas -> mete bullet se estiver dentro da secção
+  const lines = t.replace(/\r\n/g,"\n").split("\n");
+  const out=[];
+  let inLinks=false;
+
+  for(const line of lines){
+    const s=line.trim();
+    if(!s){
+      out.push("");
+      continue;
+    }
+    if(/^Links dos produtos\s*:/i.test(s)){
+      inLinks=true;
+      out.push("Links dos produtos:");
+      continue;
+    }
+    if(inLinks){
+      // se aparecer uma secção nova, sai
+      if(/^(total:|nota:|itens:|próxima|indique|observa|condições)/i.test(s)){
+        inLinks=false;
+        out.push(line);
+        continue;
+      }
+      // url solta -> vira "  url" (mantém associado ao item anterior se existir)
+      if(/^https?:\/\//i.test(s)){
+        out.push("  " + trimUrl(s));
+        continue;
+      }
+      out.push(line);
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/* Linhas tipo tabela com pipes -> ficam legíveis */
+function dePipe(text){
+  const lines=(text||"").replace(/\r\n/g,"\n").split("\n");
+  const out=[];
+  for(const ln of lines){
+    const s=ln.trim();
+    // remove separadores de tabela
+    if(s && s.includes("|") && /^(\|?\s*:?-{2,}\s*)+$/.test(s.replace(/[|]/g,"|"))){
+      continue;
+    }
+    const pipeCount=(ln.match(/\|/g)||[]).length;
+    if(pipeCount>=2){
+      const parts = ln.split("|").map(x=>x.trim()).filter(Boolean);
+      if(parts.length>=2){
+        out.push("• " + parts.join(" — "));
+        continue;
+      }
+    }
+    out.push(ln);
+  }
+  return out.join("\n");
+}
+
+/* Linkifica apenas URLs reais (sem mexer no resto) */
+function linkifyHtml(html){
+  // (não mexe em tags porque nós controlamos o HTML que geramos)
+  return html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, (m, lead, raw)=>{
+    const url = trimUrl(raw);
+    const tail = raw.slice(url.length);
+    return lead + `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>` + escapeHtml(tail);
+  });
+}
+
+/* Render adaptativo */
+function renderAlma(raw){
+  let t = (raw||"").replace(/\r\n/g,"\n").trimEnd();
+
+  // limpa o “ver produto” solto no topo (caso apareça)
+  t = t.replace(/^(?:\s*(?:[-–—]\s*)?ver produto\s*)\n+/i, "");
+
+  // conserta bloco links + "pipes"
+  t = normalizeLinksSection(t);
+  t = dePipe(t);
+
+  // blocos por parágrafos
+  const blocks = t.split(/\n{2,}/);
+  const parts = [];
+
+  for(const block of blocks){
+    const b = block.trimEnd();
+    if(!b) continue;
+
+    // headings simples
+    if(/^\s*#{1,6}\s+/.test(b)){
+      const title = b.replace(/^\s*#{1,6}\s+/,"").trim();
+      parts.push(`<div class="alma-h">${escapeHtml(title)}</div>`);
+      continue;
+    }
+
+    // separador
+    if(/^\s*[-–—]{3,}\s*$/.test(b)){
+      parts.push(`<hr class="alma-hr">`);
+      continue;
+    }
+
+    // lista (linhas que começam por - ou •)
+    const lines = b.split("\n");
+    const isList = lines.filter(x=>x.trim()).every(x => /^(\s*[-•]\s+)/.test(x));
+    if(isList){
+      const items = lines
+        .map(x=>x.replace(/^(\s*[-•]\s+)/,"").trim())
+        .filter(Boolean)
+        .map(x=>`<li>${linkifyHtml(escapeHtml(x))}</li>`)
+        .join("");
+      parts.push(`<ul class="alma-list">${items}</ul>`);
+      continue;
+    }
+
+    // nota (iva/portes)
+    if(/iva/i.test(b) && /portes?/i.test(b)){
+      parts.push(`<div class="alma-note">${linkifyHtml(escapeHtml(b))}</div>`);
+      continue;
+    }
+
+    // parágrafo normal (preserva \n com <br>)
+    let html = escapeHtml(b);
+
+    // bold/underline simples
+    html = html
+      .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+      .replace(/__(.+?)__/g, "<u>$1</u>");
+
+    // quebra de linha
+    html = html.replace(/\n/g,"<br>");
+
+    // linkify no fim
+    html = linkifyHtml(html);
+
+    parts.push(`<div class="alma-p">${html}</div>`);
+  }
+
+  // Se for orçamento e veio tudo “muito junto”, ainda assim fica legível pelos <div> e <br>.
+  return parts.join("");
+}
+
+/* ---------- Mensagens ---------- */
 function renderMsgs(){
   const s = sessions.find(x=>x.id===activeId);
   const box = byId("messages");
@@ -312,18 +495,24 @@ function renderMsgs(){
     const bubble=document.createElement("div");
     bubble.className="bubble";
 
-    // CRÍTICO: texto puro
-    bubble.textContent = (m.content||"");
-
-    if(m.role==="alma"){
-      const copy=document.createElement("span");
-      copy.className="copy-btn";
-      copy.textContent="copiar";
-      copy.onclick=()=>navigator.clipboard.writeText(m.content||"");
-      row.appendChild(copy);
+    if(m.role==="user"){
+      bubble.textContent = (m.content||"");
+      row.appendChild(bubble);
+      box.appendChild(row);
+      return;
     }
 
+    // Alma: renderer único
+    const raw = (m.content||"");
+    bubble.innerHTML = renderAlma(raw);
+
+    const copy=document.createElement("span");
+    copy.className="copy-btn";
+    copy.textContent="copiar";
+    copy.onclick=()=>navigator.clipboard.writeText(raw);
     row.appendChild(bubble);
+    row.appendChild(copy);
+
     box.appendChild(row);
   });
 
@@ -332,7 +521,9 @@ function renderMsgs(){
 
 function updateSessionTitleFromFirstUserMsg(sess){
   const firstUser = (sess.msgs||[]).find(m=>m.role==="user");
-  if(firstUser) sess.title = snippetFrom(firstUser.content, 50);
+  if(firstUser){
+    sess.title = snippetFrom(firstUser.content, 50);
+  }
 }
 
 /* ---------- Enviar ---------- */
@@ -347,7 +538,6 @@ async function sendMsg(){
 
   s.msgs.push({role:"user", content:txt});
   if((s.title||"Nova sessão")==="Nova sessão") updateSessionTitleFromFirstUserMsg(s);
-
   saveSessions();
   renderSessions();
   renderMsgs();
@@ -358,14 +548,11 @@ async function sendMsg(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ question: txt, user_id: activeId })
     });
-
-    // se o backend devolver algo não-JSON, isto vai rebentar e cai no catch
     const j = await res.json();
-    const ans = (j && (j.answer ?? j.response)) ?? JSON.stringify(j);
-
-    s.msgs.push({role:"alma", content: String(ans)});
+    const ans = j.answer || JSON.stringify(j);
+    s.msgs.push({role:"alma", content: ans});
   }catch(err){
-    s.msgs.push({role:"alma", content: "ERRO no frontend (raw): "+ String(err)});
+    s.msgs.push({role:"alma", content: "Desculpa — não consegui responder agora. ("+err+")"});
   }finally{
     saveSessions();
     renderMsgs();
@@ -375,5 +562,6 @@ async function sendMsg(){
 /* ---------- Boot ---------- */
 if(!activeId){ newSession(); } else { renderSessions(); renderMsgs(); }
 </script>
+
 </body>
 </html>
