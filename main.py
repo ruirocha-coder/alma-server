@@ -7297,185 +7297,148 @@ except Exception as e:
     except Exception:
         pass
 
-# =======================================================
-# HOTFIX FINAL — Variantes sempre + Remoção robusta de tabelas
-# Colar NO FIM do main.py
-# =======================================================
+# =========================
+# HOTFIX FINAL (robusto)
+# - evita crash por assinatura errada de build_messages
+# - variantes: remove "sku/ref/referência/código" dos termos (não pode ir ao AND do SQL)
+# - remove tabelas markdown (pipes) da resposta final
+# =========================
 
-import re
-from typing import Optional
+try:
+    _ALMA_HOTFIX_FINAL_APPLIED
+except NameError:
+    _ALMA_HOTFIX_FINAL_APPLIED = True
 
-# ---------- 1) Variantes: devolver mesmo sem "intenção", quando o match é "focado" ----------
-def build_catalog_variants_block(question: str, namespace: Optional[str] = None,
-                                 limit_families: int = 5, limit_variants: int = 60) -> str:
-    """
-    Lista variantes (itens com URL parent#sku=...) agrupadas por produto, SEM exigir palavras "variantes".
-    Heurística anti-ruído:
-      - só ativa quando o match ao catálogo for "focado" (poucos seeds)
-      - só retorna quando existirem >=2 variantes na família
-    """
-    ns = (namespace or DEFAULT_NAMESPACE).strip()
-    q_raw = (question or "").strip()
-    q = q_raw.lower()
+    import re
+    import inspect
 
-    # Se for demasiado genérico, não tenta.
-    if len(q_raw) < 2:
+    # ---------- (1) build_messages: wrapper tolerante ----------
+    _build_messages_impl = globals().get("build_messages")
+
+    if callable(_build_messages_impl):
+        def build_messages(user_id, question=None, namespace=None, *args, **kwargs):
+            """
+            Wrapper tolerante:
+            - tenta (user_id, question, namespace)
+            - se rebentar por assinatura (1-2 args), cai para (user_id, question)
+            """
+            try:
+                return _build_messages_impl(user_id, question, namespace, *args, **kwargs)
+            except TypeError:
+                # fallback para versões antigas/patchadas que só aceitam (user_id, question)
+                return _build_messages_impl(user_id, question)
+
+        # garantir que o nome global aponta para o wrapper
+        globals()["build_messages"] = build_messages
+
+
+    # ---------- (2) Variantes: stopwords + limpeza ----------
+    _orig_build_catalog_variants_block = globals().get("build_catalog_variants_block")
+
+    def build_catalog_variants_block(question: str, namespace=None) -> str:
+        """
+        Versão corrigida:
+        - evita que tokens como 'sku'/'ref' entrem no AND (matavam a pesquisa)
+        """
+        qlow = (question or "").lower()
+        if not any(k in qlow for k in ("variantes", "variante", "cores", "cor", "acabamentos", "acabamento", "opções", "opcoes", "modelos")):
+            # mantêm compatibilidade: se não é pedido de variantes, devolve vazio
+            return ""
+
+        # termos extraídos (mantendo hífen)
+        terms = re.findall(r"[\wÀ-ÿ\-]+", qlow)
+
+        # stopwords: NÃO podem ir para o AND do SQL
+        STOP = {
+            "a","o","os","as","de","do","da","dos","das","e","ou","para","por","com",
+            "um","uma","uns","umas","no","na","nos","nas",
+            "variantes","variante","cor","cores","acabamento","acabamentos","opções","opcoes","modelos","modelo",
+            # >>> o que estava a destruir a pesquisa:
+            "sku","ref","refs","referencia","referência","codigo","código",
+        }
+
+        # filtra termos inúteis
+        terms = [t for t in terms if t and t not in STOP and len(t) >= 2]
+
+        # se sobrou pouco, tenta aproveitar números/hífens do texto original
+        if not terms:
+            # tenta apanhar um padrão tipo 740021316-2
+            m = re.search(r"\d[\d\-]{4,}", qlow)
+            if m:
+                terms = [m.group(0)]
+
+        if not terms:
+            return ""
+
+        # usa a tua função original, se existir, mas sem "sku/ref" a contaminar
+        # (reconstrói uma pergunta “limpa” só com os termos relevantes)
+        q_clean = " ".join(terms)
+        if callable(_orig_build_catalog_variants_block):
+            try:
+                return _orig_build_catalog_variants_block(q_clean, namespace)
+            except TypeError:
+                # algumas versões podem ter assinatura diferente
+                return _orig_build_catalog_variants_block(q_clean)
+
         return ""
+
+    globals()["build_catalog_variants_block"] = build_catalog_variants_block
+
+
+    # ---------- (3) Remover tabelas markdown na resposta ----------
+    _orig_postprocess_answer = globals().get("postprocess_answer")
+
+    def _strip_markdown_tables(text: str) -> str:
+        if not text:
+            return text
+        lines = text.splitlines()
+        out = []
+        in_table = False
+
+        for ln in lines:
+            s = ln.strip()
+
+            # detecta header/rows de tabela markdown
+            is_table_row = s.startswith("|") and s.endswith("|") and ("|" in s[1:-1])
+            is_sep = bool(re.match(r"^\|\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$", s))
+
+            if is_table_row or is_sep:
+                in_table = True
+                # transforma linha de tabela em texto legível (sem pipes), ignorando separadores
+                if not is_sep and is_table_row:
+                    cols = [c.strip() for c in s.strip("|").split("|")]
+                    cols = [c for c in cols if c]
+                    if cols:
+                        out.append(" • ".join(cols))
+                continue
+
+            # saiu da tabela
+            if in_table and not is_table_row and not is_sep:
+                in_table = False
+
+            out.append(ln)
+
+        # limpa múltiplas linhas vazias geradas
+        cleaned = "\n".join(out)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    def postprocess_answer(answer: str, *args, **kwargs) -> str:
+        # se houver postprocess anterior, aplica-o primeiro
+        if callable(_orig_postprocess_answer):
+            try:
+                answer = _orig_postprocess_answer(answer, *args, **kwargs)
+            except TypeError:
+                answer = _orig_postprocess_answer(answer)
+
+        return _strip_markdown_tables(answer)
+
+    globals()["postprocess_answer"] = postprocess_answer
 
     try:
-        with _catalog_conn() as c:
-            like = f"%{_sanitize_like(q_raw)}%"
-
-            # Seeds: tenta encontrar poucos itens relevantes
-            cur = c.execute(
-                """
-                SELECT name, url
-                  FROM catalog_items
-                 WHERE namespace=?
-                   AND (name LIKE ? OR summary LIKE ? OR ref LIKE ?)
-                 ORDER BY updated_at DESC
-                 LIMIT ?
-                """,
-                (ns, like, like, like, max(8, limit_families * 2)),
-            )
-            seeds = [dict(r) for r in cur.fetchall()]
-            if not seeds:
-                return ""
-
-            # Se vierem muitos seeds, é search genérico -> não injecta variantes
-            # (evita despejar variantes de meia loja)
-            if len(seeds) > 8 and len(q_raw.split()) <= 2:
-                return ""
-
-            variants_lines = ["Variantes no catálogo interno (agrupadas por produto):"]
-            seen_parents = set()
-            families_added = 0
-
-            for s in seeds:
-                url = (s.get("url") or "").strip()
-                parent = url.split("#")[0] if url else ""
-                if not parent or parent in seen_parents:
-                    continue
-                seen_parents.add(parent)
-
-                # Variantes: URLs no formato parent#sku=...
-                cur2 = c.execute(
-                    """
-                    SELECT name, ref, price, url, variant_attrs
-                      FROM catalog_items
-                     WHERE namespace=?
-                       AND url LIKE ?
-                     ORDER BY updated_at DESC
-                     LIMIT ?
-                    """,
-                    (ns, parent + "#sku=%", limit_variants),
-                )
-                vars_ = [dict(r) for r in cur2.fetchall()]
-                if len(vars_) < 2:
-                    # ou não tem variantes, ou só 1 -> não compensa
-                    continue
-
-                families_added += 1
-                if families_added > limit_families:
-                    break
-
-                variants_lines.append(f"\n• Produto: {s.get('name') or parent}")
-                for v in vars_:
-                    ref = v.get("ref") or "(sem dado)"
-                    price = v.get("price")
-                    price_txt = f"{price:.2f}€" if isinstance(price, (int, float)) else "(sem preço)"
-                    var_txt = (v.get("variant_attrs") or "").strip()
-                    name_v = (v.get("name") or "").strip()
-                    show = var_txt if var_txt else name_v if name_v else "(variante)"
-                    variants_lines.append(
-                        f"  - Variante: {show} • SKU: {ref} • Preço: {price_txt} • Link: {v.get('url') or '(sem URL)'}"
-                    )
-
-            if len(variants_lines) == 1:
-                return ""
-            return "\n".join(variants_lines)
-
-    except Exception as e:
-        log.warning(f"[catalog variants hotfix] falhou: {e}")
-        return ""
-
-
-# ---------- 2) Remover tabelas markdown de forma mais agressiva ----------
-def _strip_markdown_tables_hard(text: str) -> str:
-    """
-    Remove blocos de tabelas markdown, incluindo variações:
-      - linhas com pipes (|) e separador ---|--- (com ou sem pipes nas pontas)
-      - tabelas dentro de blocos de texto
-    """
-    if not text:
-        return text
-
-    lines = text.splitlines()
-    out = []
-    i = 0
-
-    def is_sep(line: str) -> bool:
-        s = line.strip()
-        # separador típico: ---|:---:|---  (com ou sem pipes)
-        return bool(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", s))
-
-    def looks_like_row(line: str) -> bool:
-        s = line.strip()
-        # row com pipes, pelo menos 2 colunas
-        return ("|" in s) and (s.count("|") >= 2) and (len(s) >= 3)
-
-    while i < len(lines):
-        line = lines[i]
-
-        # Detetar início de tabela: header row + separator row
-        if i + 1 < len(lines) and looks_like_row(line) and is_sep(lines[i + 1]):
-            # pular header + sep
-            i += 2
-            # pular rows enquanto parecerem rows
-            while i < len(lines) and looks_like_row(lines[i]):
-                i += 1
-            # não adiciona nada (remove o bloco)
-            continue
-
-        out.append(line)
-        i += 1
-
-    return "\n".join(out)
-
-
-# Guarda a versão atual para não perder outras limpezas já existentes
-_prev_postprocess_answer = _postprocess_answer
-
-def _postprocess_answer(answer: str) -> str:
-    """
-    Mantém as limpezas existentes e adiciona stripping agressivo de tabelas markdown.
-    """
-    a = _prev_postprocess_answer(answer)
-    a = _strip_markdown_tables_hard(a)
-    return a
-
-
-# ---------- 3) Garantir que as variantes entram no prompt sempre que existirem ----------
-_prev_build_messages = build_messages
-
-def build_messages(question: str, namespace: Optional[str] = None):
-    """
-    Reusa o build_messages atual, mas injeta SEMPRE o bloco de variantes quando existir.
-    Não depende de 'intenção' (variantes/orçamento).
-    """
-    msgs = _prev_build_messages(question, namespace)
-
-    # Se já existe um bloco de variantes, não duplica
-    joined = "\n".join([(m.get("content") or "") for m in msgs if isinstance(m, dict)])
-    if "Variantes no catálogo interno" in joined:
-        return msgs
-
-    vb = build_catalog_variants_block(question, namespace)
-    if vb:
-        # Injecta como system (mais "forte" que user)
-        msgs.insert(1, {"role": "system", "content": vb})
-
-    return msgs
+        log.info("[hotfix-final-v4] ativo: build_messages wrapper + variantes sem 'sku/ref' + strip markdown tables.")
+    except Exception:
+        pass
 
 
 
