@@ -1,10 +1,10 @@
 # main.py
 import os
-import asyncio
 from typing import List, Dict
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import httpx
@@ -67,7 +67,6 @@ Nota:
 preço com IVA incluído; portes não incluídos.
 
 Se aplicável podes incluir:
-
 [ver produto](URL)
 
 É melhor dar uma resposta útil do que bloquear.
@@ -172,29 +171,38 @@ async def rag_search(question: str) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# Grok call
+# Grok call (SAFE)
 # --------------------------------------------------------------------------------------
 
 async def call_grok(messages: List[Dict[str, str]]) -> str:
-    url = "https://api.x.ai/v1/chat/completions"
+    if not XAI_API_KEY:
+        return "Erro: XAI_API_KEY não está configurada no servidor."
 
+    url = "https://api.x.ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": XAI_MODEL,
         "messages": messages,
         "temperature": 0.2,
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=payload)
 
-    return data["choices"][0]["message"]["content"]
+        # não deixar isto rebentar o /ask
+        if r.status_code != 200:
+            body = r.text[:800]
+            return f"Erro ao chamar o Grok (HTTP {r.status_code}). Detalhe: {body}"
+
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        return f"Erro técnico ao chamar o Grok: {type(e).__name__}: {e}"
 
 
 # --------------------------------------------------------------------------------------
@@ -218,7 +226,7 @@ async def build_messages(user_id: str, question: str):
 
 
 # --------------------------------------------------------------------------------------
-# Routes
+# Routes (SAFE JSON)
 # --------------------------------------------------------------------------------------
 
 @app.get("/")
@@ -228,10 +236,23 @@ async def root():
 
 @app.post("/ask")
 async def ask(req: AskRequest):
-    messages = await build_messages(req.user_id, req.question)
-    answer = await call_grok(messages)
-    await store_memory(req.user_id, answer)
-    return {"answer": answer}
+    try:
+        messages = await build_messages(req.user_id, req.question)
+        answer = await call_grok(messages)
+
+        # só grava memória se houver resposta “normal”
+        if answer and not answer.startswith("Erro"):
+            await store_memory(req.user_id, answer)
+
+        # DEVOLVE SEMPRE JSON
+        return JSONResponse(status_code=200, content={"answer": answer})
+
+    except Exception as e:
+        # DEVOLVE SEMPRE JSON, mesmo em falha
+        return JSONResponse(
+            status_code=200,
+            content={"answer": f"Erro interno no /ask: {type(e).__name__}: {e}"}
+        )
 
 
 # -----------------------------------------------------------------------------------
