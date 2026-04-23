@@ -1,4 +1,4 @@
-# main.py v4 — Alma Server -
+# main.py v4 – Alma Server
 
 # Arquitetura limpa: site-first via tool use, RAG como suplemento, histórico multi-turn,
 
@@ -111,9 +111,9 @@ A tua missão é apoiar a direção (Rui Rocha) e a equipa com respostas claras,
 
 FONTES E PRIORIDADE
 
-1. search_site — fonte principal para produtos, preços e disponibilidade (usa SEMPRE primeiro).
-1. fetch_page — lê uma página específica quando tiveres o URL.
-1. search_internal_docs — documentação interna: políticas, guias, condições especiais (não está no site).
+1. search_site – fonte principal para produtos, preços e disponibilidade (usa SEMPRE primeiro).
+1. fetch_page – lê uma página específica quando tiveres o URL.
+1. search_internal_docs – documentação interna: políticas, guias, condições especiais (não está no site).
 
 REGRAS
 
@@ -132,7 +132,7 @@ ESTILO
 ORÇAMENTOS
 Formato obrigatório:
 
-Produto: [nome] — SKU: [ref]
+Produto: [nome] – SKU: [ref]
 Preço unitário: [valor] (IVA incluído)
 Quantidade: [n]
 Subtotal: [valor]
@@ -246,7 +246,7 @@ except Exception as e:
 
 # –––––––––––––––––––––––––––––––––––––––––––
 
-# Site scraping — fonte primária de produtos e preços
+# Site scraping – fonte primária de produtos e preços
 
 # –––––––––––––––––––––––––––––––––––––––––––
 
@@ -542,7 +542,7 @@ if not quote_mode and QDRANT_URL:
         messages.append({
             "role": "system",
             "content": (
-                f"Documentação interna (RAG — NÃO usar para preços; "
+                f"Documentação interna (RAG -- NÃO usar para preços; "
                 f"apenas para políticas e guias internos):\n{rag_content}"
             )
         })
