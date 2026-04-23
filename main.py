@@ -1,4 +1,4 @@
-# main.py v4 — Alma Server
+# main.py v4 — Alma Server -
 
 # Arquitetura limpa: site-first via tool use, RAG como suplemento, histórico multi-turn,
 
