@@ -33,7 +33,7 @@ log = logging.getLogger("alma")
 # Config
 # -------------------------------------------------------------------
 XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
-XAI_MODEL   = os.getenv("XAI_MODEL", "grok-2-latest")
+XAI_MODEL   = os.getenv("XAI_MODEL", "grok-4.3")
 APP_VERSION = os.getenv("APP_VERSION", "alma-server/v4")
 
 ALLOWED_ORIGINS = os.getenv(
