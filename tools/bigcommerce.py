@@ -42,3 +42,26 @@ def resumo_vendas(dias: int = 30):
     n = len(orders)
     return {"periodo_dias": dias, "total_eur": round(total, 2),
             "n_encomendas": n, "ticket_medio": round(total / n, 2) if n else 0}
+    TOOLS_CEO = [
+    {
+        "name": "procurar_produtos",
+        "description": "Pesquisa produtos no catálogo BigCommerce por palavra-chave. Devolve preço de venda, preço de custo, stock e URL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "termo": {"type": "string"},
+                "limite": {"type": "integer", "default": 10}
+            },
+            "required": ["termo"]
+        }
+    },
+    {
+        "name": "resumo_vendas",
+        "description": "Resumo de vendas: total, número de encomendas e ticket médio nos últimos N dias.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"dias": {"type": "integer", "default": 30}},
+            "required": []
+        }
+    }
+]
